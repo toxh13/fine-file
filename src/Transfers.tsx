@@ -6,7 +6,13 @@ import "./components.css";
 
 type Toast = (text: string, kind?: "info" | "error") => void;
 
-const OP_LABEL: Record<JobInfo["op"], string> = { copy: "복사", move: "이동", relocate: "다른 드라이브로 옮기기", restore: "되돌리기" };
+const OP_LABEL: Record<JobInfo["op"], string> = {
+  copy: "복사",
+  move: "이동",
+  relocate: "다른 드라이브로 옮기기",
+  restore: "되돌리기",
+  link: "하드 링크로 합치기",
+};
 
 const STATE_LABEL: Record<JobInfo["state"], string> = {
   running: "진행 중",
@@ -106,8 +112,43 @@ function untidyText(j: JobInfo): string {
   return parts.join(" ");
 }
 
+// ops.rs's reason for a duplicate made into a hard link whose old copy (`.<name>.ff-link`, hidden)
+// did not go to the Recycle Bin: the link is there, the copy is left for the user to remove.
+const LINK_LEFT = "합쳤지만";
+
+/** Old copies a hard-link job left in place (see LINK_LEFT), of those `errors` lists. */
+const linkLeft = (j: JobInfo) => (j.op === "link" ? j.errors.filter(([, why]) => why.startsWith(LINK_LEFT)).length : 0);
+
+/**
+ * Copies a hard-link job merged: those it went through, less those that went wrong (a copy left
+ * in place, LINK_LEFT, was merged all the same).
+ */
+const linkMerged = (j: JobInfo) => Math.max(0, j.done_items - (errorCount(j) - linkLeft(j)));
+
+/** What a hard-link job frees: the old copies in the Recycle Bin (`done_bytes` is what it read). */
+const linkFreed = (j: JobInfo) => `휴지통을 비우면 ${formatSize(j.freed_bytes ?? 0)} 비어요`;
+
+/** A hard-link job's end. */
+function announceLink(j: JobInfo, toast: Toast) {
+  const errors = errorCount(j);
+  const left = linkLeft(j);
+  const freed = linkFreed(j);
+  if (j.state === "done" && errors === 0) {
+    toast(`하드 링크로 합쳤어요: 파일 ${linkMerged(j).toLocaleString()}개 · ${freed}`);
+  } else if (j.state === "done") {
+    const parts = [`하드 링크로 합쳤어요: 파일 ${linkMerged(j).toLocaleString()}개 · ${freed}.`];
+    if (left > 0) parts.push(`남은 사본 ${left.toLocaleString()}개는 휴지통에 넣지 못해서 숨김 파일로 남아 있어요.`);
+    if (errors > left) parts.push(`${(errors - left).toLocaleString()}개는 합치지 못했어요.`);
+    parts.push("자세한 내용은 작업 목록에 있어요");
+    toast(parts.join(" "), "error");
+  } else if (j.state === "failed") {
+    toast(`하드 링크로 합치기 실패: ${j.errors[0]?.[1] ?? "알 수 없는 오류"}`, "error");
+  }
+}
+
 /** One toast when a job ends; a cancel is the user's own doing and needs none. */
 function announce(j: JobInfo, toast: Toast) {
+  if (j.op === "link") return announceLink(j, toast);
   const op = OP_LABEL[j.op];
   const errors = errorCount(j);
   if (j.state === "done" && errors === 0) {
@@ -378,19 +419,33 @@ function JobRow({ j, cancelling, errorsOpen, lost, onLostAnswer, onCancel, onDis
     ]
       .filter(Boolean)
       .join(" · ");
+  } else if (j.state === "done" && j.op === "link") {
+    meta = `파일 ${linkMerged(j).toLocaleString()}개 합침 · ${linkFreed(j)}`;
   } else if (j.state === "done") {
     meta = `${j.done_items.toLocaleString()}개 항목 · ${formatSize(j.done_bytes)}`;
+  } else if (j.op === "link" && (j.freed_bytes ?? 0) > 0) {
+    // Cancelled (or stopped) part way: the copies merged until then are in the Recycle Bin already.
+    meta = `${items}에서 멈췄어요 · ${linkFreed(j)}`;
   } else {
     meta = `${items}에서 멈췄어요`;
   }
   return (
     <div className={`job ${j.state}`}>
       <div className="job-top">
-        <span className="job-title" title={j.dest}>
-          {OP_LABEL[j.op]} → {baseName(j.dest) || j.dest}
+        <span className="job-title" title={j.dest || undefined}>
+          {/* A hard-link job has no destination; its folder, when it names one, is where it works. */}
+          {j.op === "link"
+            ? j.dest
+              ? `${OP_LABEL[j.op]} · ${baseName(j.dest) || j.dest}`
+              : OP_LABEL[j.op]
+            : `${OP_LABEL[j.op]} → ${baseName(j.dest) || j.dest}`}
         </span>
         <span className="job-state">
-          {untidy(j) ? "완료 · 확인 필요" : j.state === "done" && errors > 0 ? "일부 실패" : STATE_LABEL[j.state]}
+          {untidy(j) || (j.state === "done" && errors > 0 && linkLeft(j) === errors)
+            ? "완료 · 확인 필요"
+            : j.state === "done" && errors > 0
+              ? "일부 실패"
+              : STATE_LABEL[j.state]}
         </span>
         {active ? (
           <button className="transfers-btn" disabled={cancelling} onClick={onCancel}>

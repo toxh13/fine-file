@@ -182,6 +182,18 @@ fn report(id: u64) -> Result<DupReport, String> {
     Ok(DupReport { id, state: state.into(), groups, wasted, scanned_files, detail })
 }
 
+/// The groups found so far by the job `id`, or by every job kept (the
+/// newest job's first), for merging copies into hard links (ops.rs,
+/// `start_dup_link`). Each job's groups are unsorted.
+pub(crate) fn found(id: Option<u64>) -> Result<Vec<DupGroup>, String> {
+    let reg = registry();
+    let jobs: Vec<&Job> = reg.jobs.iter().rev().filter(|j| id.is_none_or(|id| j.id == id)).collect();
+    if jobs.is_empty() {
+        return Err(NO_JOB.into());
+    }
+    Ok(jobs.into_iter().flat_map(|j| j.groups.iter().cloned()).collect())
+}
+
 /// Bytes a group would free if one copy were kept.
 fn wasted_by(g: &DupGroup) -> u64 {
     g.size.saturating_mul(g.files.len().saturating_sub(1) as u64)
@@ -655,22 +667,25 @@ struct Probe {
 /// id (ReFS, Dev Drives: the 64-bit index is not unique there), or the
 /// 64-bit file index where that is all there is (marked, so the two kinds
 /// never match). As in `win::same_entry`.
-type FileKey = (u64, [u8; 16]);
+pub(crate) type FileKey = (u64, [u8; 16]);
 
 /// A candidate (its index) and which file it names.
 type Named = (usize, Option<FileKey>);
 
 /// What an open handle says about its file.
-struct Facts {
-    attrs: u32,
-    size: u64,
-    modified: i64,
+pub(crate) struct Facts {
+    pub(crate) attrs: u32,
+    pub(crate) size: u64,
+    /// FILETIME
+    pub(crate) modified: i64,
     /// None when the file system gives no usable id (some network servers
     /// give 0 for every file).
-    key: Option<FileKey>,
+    pub(crate) key: Option<FileKey>,
+    /// Names (hard links) the file has.
+    pub(crate) links: u32,
 }
 
-fn facts(file: &File) -> Option<Facts> {
+pub(crate) fn facts(file: &File) -> Option<Facts> {
     let h = file.as_raw_handle() as HANDLE;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
@@ -689,12 +704,12 @@ fn facts(file: &File) -> Option<Facts> {
         long[..8].copy_from_slice(&index.to_le_bytes());
         (index != 0).then_some((info.dwVolumeSerialNumber as u64 | (1 << 63), long))
     };
-    Some(Facts { attrs: info.dwFileAttributes, size, modified, key })
+    Some(Facts { attrs: info.dwFileAttributes, size, modified, key, links: info.nNumberOfLinks })
 }
 
 /// Not downloaded yet from a cloud-sync provider (or moved off to slower
 /// storage): reading it fetches it.
-fn online_only(attrs: u32) -> bool {
+pub(crate) fn online_only(attrs: u32) -> bool {
     attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE) != 0
 }
 

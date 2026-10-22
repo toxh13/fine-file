@@ -2,14 +2,20 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
+  LINK_MAX,
+  opEvents,
+  ops,
   v04,
   v04Events,
+  v082,
   type Category,
   type DriveInfo,
   type DupFile,
   type DupGroup,
+  type DupLinkGroup,
   type DupProgress,
   type DupReport,
+  type JobInfo,
 } from "./api";
 import { driveKey, formatDate, formatSize, normalizePath } from "./format";
 import "./components.css";
@@ -139,18 +145,63 @@ const NOT_IN_SCAN =
 
 // Files a program needs where they are: the backend's DupFile.category (classify.rs) says so for
 // Windows, program, game and development-tool folders, also their cache folders, and app data
-// (counted as "program"). Two equal DLLs in two games are both in use: auto-select leaves such
-// files alone, and the trash prompt says when some were ticked by hand.
+// (counted as "program"). Two equal model files of two programs are both in use: auto-select leaves
+// such files alone unless the user turns that on, and the trash prompt asks once more for them.
 const APP_CATEGORIES = new Set<Category>(["system", "program", "game", "dev"]);
 
 /** Whether a file is in a Windows, program, game, development-tool or app-data folder. */
 const inAppFolder = (f: DupFile): boolean => APP_CATEGORIES.has(f.category);
 
+/** Windows' own folders: never picked by auto-select (even when program folders are), never linked. */
+const inWindows = (f: DupFile): boolean => f.category === "system";
+
+/**
+ * In a drive's Recycle Bin: a file already deleted. The results leave such files out, so that a
+ * group's "kept" copy is never one that emptying the bin (or Windows clearing old items) destroys.
+ */
+const inBin = (p: string): boolean => /^[a-z]:\\\$recycle\.bin(\\|$)/i.test(p.replace(/^\\\\\?\\/, ""));
+
 const APP_NOTE =
-  "Windows·프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일이에요. 지우면 그 프로그램이 동작하지 않을 수 있어서 자동 선택에서 빠져요";
+  "프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일이에요. 지우면 그 프로그램이 동작하지 않을 수 있어서, 따로 켜지 않으면 자동 선택에서 빠져요. 두 프로그램이 각자 쓰는 파일이면 휴지통 대신 \"하드 링크로 합치기\"가 안전해요(고르지 않았어도 합칠지 물어요)";
+
+const WINDOWS_NOTE = "Windows 폴더 안의 파일이에요. 자동 선택에서 늘 빠지고, 하드 링크로 합치지도 않아요";
+
+/** ops.rs's reason for a duplicate made into a link whose old copy did not go to the Recycle Bin. */
+const LINK_LEFT = "합쳤지만";
 
 /** Groups drawn at first; more on request (a big drive can have thousands). */
 const GROUP_PAGE = 100;
+
+/**
+ * Paths per trash call: lib.rs trash_paths takes them one by one and says nothing until the end,
+ * so a big selection goes in parts, with progress and a cancel between them.
+ */
+const TRASH_CHUNK = 200;
+
+/** Files often edited in place, which hard links would tie together: the link prompt leaves them out unless ticked. */
+const EDITABLE = new Set<Category>(["document", "media"]);
+const editable = (f: DupFile): boolean => EDITABLE.has(f.category);
+
+/** The kinds the link prompt counts, by DupFile.category. */
+const KIND_LABEL: Record<Category, string> = {
+  system: "Windows 폴더",
+  program: "프로그램·앱 데이터 폴더",
+  game: "게임 폴더",
+  dev: "개발 도구 폴더",
+  cache: "캐시",
+  media: "사진·영상·음악",
+  document: "문서",
+  archive: "압축·설치 파일",
+  personal: "사용자 폴더의 다른 파일",
+  other: "그 밖의 파일",
+};
+
+/** What stays in each group under a rule, for the link prompt. */
+const RULE_KEEPS: Record<Rule, string> = {
+  newest: "가장 최신 파일",
+  oldest: "가장 오래된 파일",
+  shortest: "경로가 가장 짧은 파일",
+};
 
 type Rule = "newest" | "oldest" | "shortest";
 
@@ -164,10 +215,16 @@ function dirOf(p: string): string {
   return i < 0 ? "" : p.slice(0, i);
 }
 
-/** The copy a rule keeps; ties go to the one listed first. */
+/**
+ * The copy a rule keeps; ties go to the one listed first. Never one in Windows' folders while the
+ * group has another: auto-select picks none of those, so such a keeper would leave every live copy
+ * chosen (dups.rs lists equal times by path, and `C:\$...` comes before `C:\Users\...`).
+ */
 function keeperOf(g: DupGroup, rule: Rule): string {
-  let best = g.files[0];
-  for (const f of g.files) {
+  const live = g.files.filter((f) => !inWindows(f));
+  const pool = live.length ? live : g.files;
+  let best = pool[0];
+  for (const f of pool) {
     if (rule === "newest" ? f.modified > best.modified : rule === "oldest" ? f.modified < best.modified : f.path.length < best.path.length) {
       best = f;
     }
@@ -175,11 +232,56 @@ function keeperOf(g: DupGroup, rule: Rule): string {
   return best.path;
 }
 
+/**
+ * The program a file in a program's folder belongs to, as far as its path tells: the folder under
+ * AppData (a Store app's package without its publisher id), Program Files or ProgramData, a Steam
+ * game's folder, Windows; else the folder the file is in. For the trash prompt.
+ */
+function ownerOf(p: string): string {
+  const parts = p.split("\\");
+  const low = parts.map((s) => s.toLowerCase());
+  // A folder of the path, not the drive or the file itself.
+  const folder = (i: number) => (i > 0 && i < parts.length - 1 ? parts[i] : null);
+  const app = low.indexOf("appdata");
+  if (app > 0 && ["local", "roaming", "locallow"].includes(low[app + 1] ?? "")) {
+    const at = app + 2;
+    if (low[at] === "packages" && folder(at + 1)) return parts[at + 1].replace(/_[a-z0-9]{13}$/i, "");
+    if (folder(at)) return parts[at];
+  }
+  const steam = low.indexOf("steamapps");
+  if (steam > 0 && low[steam + 1] === "common" && folder(steam + 2)) return parts[steam + 2];
+  const prog = low.findIndex((s) => s === "program files" || s === "program files (x86)" || s === "programdata");
+  if (prog > 0 && folder(prog + 1)) return parts[prog + 1];
+  if (low[1] === "windows") return "Windows";
+  return baseName(dirOf(p)) || dirOf(p);
+}
+
+/** "VideoTranslator, OpenAI.Codex 외 2곳": the programs the most files belong to first. */
+function ownersText(paths: string[]): string {
+  const count = new Map<string, number>();
+  for (const p of paths) {
+    const o = ownerOf(p);
+    count.set(o, (count.get(o) ?? 0) + 1);
+  }
+  const names = [...count].sort((a, b) => b[1] - a[1]).map(([o]) => o);
+  const shown = names.slice(0, 3).join(", ");
+  return names.length > 3 ? `${shown} 외 ${(names.length - 3).toLocaleString()}곳` : shown;
+}
+
+/** Items of a job that went wrong; `errors` may hold only some of them (JobInfo.error_count). */
+const jobErrorCount = (j: JobInfo) => Math.max(j.error_count ?? 0, j.errors.length);
+
+const jobActive = (s: JobInfo["state"]) => s === "running" || s === "waiting";
+
 interface Notice {
   text: string;
   error?: boolean;
   /** Files that stayed, by reason. */
   failed?: [string, string[]][];
+  /** What is said of the files in `failed`; "옮기지 못했어요" when left out. */
+  failVerb?: string;
+  /** Duplicates made into links whose old copy (`.<name>.ff-link`) is still there, hidden. */
+  left?: string[];
 }
 
 /** What the trash button would send, and what the prompt says about it. */
@@ -188,8 +290,145 @@ interface Picked {
   bytes: number;
   /** Groups it takes files from. */
   groups: number;
-  /** Of `paths`, those in a program's folder (inAppFolder), all ticked by hand. */
-  app: number;
+  /** Of `paths`, those in a program's, game's, development tool's or app-data folder (not Windows'). */
+  app: string[];
+  /** Of `paths`, those in Windows' own folders (inWindows), only ever ticked by hand. */
+  windows: string[];
+  /** Of the groups, those not drawn now (below "묶음 더 보기"). */
+  unseen: number;
+}
+
+/** What goes into a hard-link plan besides the files chosen, as the link prompt's boxes say. */
+interface LinkOptions {
+  /** The rule of the auto-select the selection still is (its keeper stays), else null. */
+  rule: Rule | null;
+  /**
+   * Also the files not chosen in program and app-data folders (not Windows'), which auto-select
+   * leaves alone: two programs' copies of one model stay usable as links, so this is safe for them.
+   */
+  app: boolean;
+  /** Also documents and media (EDITABLE), which are often edited in place. */
+  editable: boolean;
+}
+
+/** What "하드 링크로 합치기" would do with the selection. */
+interface LinkPlan {
+  groups: DupLinkGroup[];
+  files: number;
+  /** What the Recycle Bin gets (the old copies), so what emptying it frees. */
+  bytes: number;
+  /** Of the groups, those not drawn now (below "묶음 더 보기"). */
+  unseen: number;
+  /** Files left out: in a Windows folder, or to be linked to a file in one. */
+  windows: number;
+  /** Files left out: on another drive than the file that stays. */
+  otherDrive: number;
+  /** Files not chosen in program folders that could be merged (in `files` with `app`), and their groups. */
+  appFiles: number;
+  appGroups: number;
+  /** Documents and media chosen that could be merged (in `files` with `editable`). */
+  editable: number;
+  /** Of `files`, how many of each kind (KIND_LABEL), most first. */
+  kinds: [string, number][];
+}
+
+/**
+ * The file a group keeps when merged: the rule's keeper while the selection is as auto-select
+ * made it; else the newest file not chosen (of all, when every one is), never one in Windows'
+ * folders. None when only such files could stay.
+ */
+function linkKeeper(g: DupGroup, selected: Set<string>, rule: Rule | null): DupFile | undefined {
+  if (rule) {
+    const k = keeperOf(g, rule);
+    const f = g.files.find((x) => x.path === k);
+    if (f && !selected.has(f.path) && !inWindows(f)) return f;
+  }
+  const free = g.files.filter((f) => !selected.has(f.path));
+  const pool = (free.length ? free : g.files).filter((f) => !inWindows(f));
+  return pool.length ? pool.reduce((b, f) => (f.modified > b.modified ? f : b)) : undefined;
+}
+
+/**
+ * The selection as hard links: each group keeps one file (linkKeeper) and each chosen one becomes
+ * a link to it. With `app`, so do the files not chosen in program folders (the ones auto-select
+ * skips), also in groups where nothing is chosen ("newest stays", or the rule's keeper). Documents
+ * and media only with `editable`. Groups with nothing to merge are left alone.
+ */
+function linkPlanOf(groups: DupGroup[], selected: Set<string>, drawn: number, o: LinkOptions): LinkPlan {
+  const plan: LinkPlan = {
+    groups: [],
+    files: 0,
+    bytes: 0,
+    unseen: 0,
+    windows: 0,
+    otherDrive: 0,
+    appFiles: 0,
+    appGroups: 0,
+    editable: 0,
+    kinds: [],
+  };
+  const kinds = new Map<string, number>();
+  groups.forEach((g, i) => {
+    const sel = g.files.filter((f) => selected.has(f.path));
+    // Not chosen, in a program's folder: what auto-select spares.
+    const spared = g.files.filter((f) => !selected.has(f.path) && inAppFolder(f) && !inWindows(f));
+    if (!sel.length && !spared.length) return;
+    const keep = linkKeeper(g, selected, o.rule);
+    if (!keep) {
+      plan.windows += sel.length >= g.files.length ? sel.length - 1 : sel.length;
+      return;
+    }
+    const others: string[] = [];
+    let extra = 0;
+    for (const f of [...sel, ...spared]) {
+      if (f === keep) continue;
+      const chosen = selected.has(f.path);
+      if (inWindows(f)) {
+        plan.windows++;
+        continue;
+      }
+      if (driveKey(f.path) !== driveKey(keep.path)) {
+        if (chosen || o.app) plan.otherDrive++;
+        continue;
+      }
+      if (!chosen) {
+        extra++;
+        if (!o.app) continue;
+      } else if (editable(f)) {
+        plan.editable++;
+        if (!o.editable) continue;
+      }
+      others.push(f.path);
+      const kind = KIND_LABEL[f.category] ?? KIND_LABEL.other;
+      kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+    }
+    if (extra) {
+      plan.appFiles += extra;
+      plan.appGroups++;
+    }
+    if (!others.length) return;
+    plan.groups.push({ keep: keep.path, others });
+    plan.files += others.length;
+    plan.bytes += others.length * g.size;
+    if (i >= drawn) plan.unseen++;
+  });
+  plan.kinds = [...kinds].sort((a, b) => b[1] - a[1]);
+  return plan;
+}
+
+/** A "하드 링크로 합치기" job this window shows: what was sent, to bring the list up to date at its end. */
+interface LinkRun {
+  /** The search whose results it changes. */
+  search: number | null;
+  groups: DupLinkGroup[];
+  /** Started before this window opened (an earlier one, another tab's): only its progress is shown. */
+  adopted?: boolean;
+}
+
+/** The link prompt as it opens: the rule of the selection, and whether its program-folder box starts ticked. */
+interface LinkAsk {
+  rule: Rule | null;
+  app: boolean;
 }
 
 export function Duplicates({
@@ -204,45 +443,78 @@ export function Duplicates({
   onReveal(path: string): void;
 }) {
   const [root, setRoot] = useState(scope);
+  /** The folder of the results shown (the box may have been changed since). */
+  const [searched, setSearched] = useState<string | null>(null);
   const [minSize, setMinSize] = useState(1 << 20);
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [progress, setProgress] = useState<DupProgress | null>(null);
   const [report, setReport] = useState<DupReport | null>(null);
-  /** The report's groups, less the files sent to the trash since. */
+  /** The report's groups, less the files sent to the trash or made into links since. */
   const [groups, setGroups] = useState<DupGroup[]>([]);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [limit, setLimit] = useState(GROUP_PAGE);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  /** What the last auto-select left out (groups not drawn, files in a program's folder). */
+  /** What the last auto-select left out (files in a program's or Windows' folder). */
   const [autoNote, setAutoNote] = useState<string | null>(null);
+  /** The rule of the selection, while it is as auto-select made it (no box ticked by hand since). */
+  const [autoRule, setAutoRule] = useState<Rule | null>(null);
+  /** Auto-select picks files in program and app-data folders too (never Windows' own). */
+  const [withApp, setWithApp] = useState(false);
   const [confirm, setConfirm] = useState<Picked | null>(null);
+  const [linkConfirm, setLinkConfirm] = useState<LinkAsk | null>(null);
   const [trashing, setTrashing] = useState(false);
+  /** How far the trash has got (files sent of all), while it goes, and whether it was asked to stop. */
+  const [trashDone, setTrashDone] = useState<{ done: number; total: number } | null>(null);
+  const [trashStopping, setTrashStopping] = useState(false);
+  /** Files of the results left out for being in a Recycle Bin already (inBin). */
+  const [binned, setBinned] = useState(0);
+  /** A "하드 링크로 합치기" job runs; its last progress event once one came. */
+  const [linking, setLinking] = useState(false);
+  const [linkJob, setLinkJob] = useState<JobInfo | null>(null);
+  const [linkCancelling, setLinkCancelling] = useState(false);
 
   /** The search shown; null until its id comes back. */
   const job = useRef<number | null>(null);
   const last = useRef<DupProgress | null>(null);
   /** The end shown was assumed at a cancel; the search's own last event has not come yet. */
   const assumed = useRef(false);
-  /** Files of this search sent to the trash, kept out of results loaded again. */
+  /** Files of this search sent to the trash or made into links, kept out of results loaded again. */
   const trashed = useRef(new Set<string>());
   /** Events that came before the id did (a small search can be over by then). */
   const starting = useRef(false);
   const early = useRef(new Map<number, DupProgress>());
   const listening = useRef<Promise<void>>(Promise.resolve());
   const alive = useRef(true);
+  /** The link job: what it was sent, and its id once that comes back (events before it wait in linkSeen). */
+  const linkRun = useRef<LinkRun | null>(null);
+  const linkId = useRef<number | null>(null);
+  /** The newest event of each link job since this opened, its end over anything else. */
+  const linkSeen = useRef(new Map<number, JobInfo>());
+  const jobListening = useRef<Promise<void>>(Promise.resolve());
+  /** The trash under way was asked to stop after the part it is at. */
+  const trashStop = useRef(false);
 
   const loadResults = (id: number) => {
     v04.dupResults(id).then(
       (r) => {
         if (!alive.current || job.current !== id) return;
         setReport(r);
+        let bin = 0;
         setGroups(
           r.groups
-            .map((g) => ({ ...g, files: g.files.filter((f) => !trashed.current.has(f.path)) }))
+            .map((g) => ({
+              ...g,
+              files: g.files.filter((f) => {
+                if (!inBin(f.path)) return !trashed.current.has(f.path);
+                bin++;
+                return false;
+              }),
+            }))
             .filter((g) => g.files.length >= 2),
         );
+        setBinned(bin);
       },
       (err) => {
         if (alive.current && job.current === id) setError(String(err));
@@ -307,16 +579,57 @@ export function Duplicates({
     };
   }, []);
 
+  // The link job's progress (ops.rs "job-progress", op "link"). Closing the window leaves it
+  // running: the job list shows it and says how it ended.
+  useEffect(() => {
+    let dead = false;
+    let off: UnlistenFn | null = null;
+    jobListening.current = opEvents
+      .jobProgress((j) => {
+        if (!dead) onJobRef.current(j);
+      })
+      .then(
+        (f) => (dead ? f() : void (off = f)),
+        () => {},
+      );
+    // A merge started before this opened (by this window closed since, or another tab's) still
+    // runs: it is shown as this window's own, so nothing here searches, trashes or merges the
+    // same files under it until it ends. Asked once the events are heard, so its end is not missed.
+    jobListening.current
+      .then(() => ops.jobs())
+      .then((list) => {
+        if (dead || linkRun.current) return;
+        const j = list.filter((x) => x.op === "link" && jobActive(x.state)).sort((a, b) => b.id - a.id)[0];
+        if (!j) return;
+        // An event that came meanwhile is newer than the list.
+        const now = linkSeen.current.get(j.id) ?? j;
+        if (!jobActive(now.state)) return;
+        linkRun.current = { search: null, groups: [], adopted: true };
+        linkId.current = j.id;
+        setLinking(true);
+        setLinkJob(now);
+        setLinkCancelling(false);
+      })
+      .catch(() => {});
+    return () => {
+      dead = true;
+      off?.();
+    };
+  }, []);
+
   const start = async () => {
     const target = normalizePath(root);
-    if (!target || running) return;
+    if (!target || running || linking || trashing) return;
     setError(null);
     setNotice(null);
     setAutoNote(null);
+    setAutoRule(null);
     setReport(null);
     setGroups([]);
+    setBinned(0);
     setSelected(new Set());
     setLimit(GROUP_PAGE);
+    setSearched(target);
     setRunning(true);
     job.current = null;
     last.current = null;
@@ -375,7 +688,9 @@ export function Duplicates({
     );
   };
 
-  const toggle = (g: DupGroup, path: string) =>
+  // By hand, any file may be ticked (one in a program's folder too: the trash prompt asks again).
+  const toggle = (g: DupGroup, path: string) => {
+    setAutoRule(null);
     setSelected((s) => {
       const n = new Set(s);
       if (n.has(path)) {
@@ -387,6 +702,7 @@ export function Duplicates({
       }
       return n;
     });
+  };
 
   const shown = groups.slice(0, limit);
 
@@ -397,32 +713,50 @@ export function Duplicates({
     return s;
   }, [groups]);
 
-  // Only the groups drawn, so one click never sends to the trash what the user has not seen;
-  // and never a file a program needs where it is.
-  const autoSelect = (rule: Rule) => {
+  // Over all the groups found, also those not drawn yet ("묶음 더 보기" only pages the list; the
+  // footer counts the whole selection, the prompts say how much of it is not drawn). Never a
+  // file in Windows' folders, and a file in a program's folder only when `app` says so.
+  const autoSelect = (rule: Rule, app = withApp) => {
     const n = new Set<string>();
     let spared = 0;
-    for (const g of shown) {
+    let windows = 0;
+    let appPicked = 0;
+    for (const g of groups) {
       const keep = keeperOf(g, rule);
       for (const f of g.files) {
         if (f.path === keep) continue;
-        if (appFiles.has(f.path)) spared++;
-        else n.add(f.path);
+        if (inWindows(f)) windows++;
+        else if (!inAppFolder(f)) n.add(f.path);
+        else if (!app) spared++;
+        else {
+          n.add(f.path);
+          appPicked++;
+        }
       }
     }
     setSelected(n);
+    setAutoRule(rule);
     const notes: string[] = [];
-    if (groups.length > shown.length) {
-      notes.push(
-        `보이는 ${shown.length.toLocaleString()}묶음에서만 골랐어요. 나머지 ${(groups.length - shown.length).toLocaleString()}묶음은 "묶음 더 보기"로 펼친 뒤에 다시 누르면 골라요.`,
-      );
-    }
     if (spared > 0) {
       notes.push(
-        `Windows·프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일 ${spared.toLocaleString()}개는 지우면 그 프로그램이 동작하지 않을 수 있어서 고르지 않았어요. 필요하면 직접 고르세요.`,
+        `프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일 ${spared.toLocaleString()}개는 지우면 그 프로그램이 동작하지 않을 수 있어서 고르지 않았어요. 휴지통으로 같이 보내려면 위의 "프로그램·앱 데이터 폴더 안 파일도 자동으로 고르기"를 켜세요. 두 프로그램이 각자 쓰는 파일(모델·설치 파일 등)이면 고르지 않은 채로 "하드 링크로 합치기"를 누르세요. 이 파일들도 같이 합칠지 묻고, 합쳐도 두 경로 모두 그대로 열려요.`,
       );
     }
+    if (appPicked > 0) {
+      notes.push(
+        `프로그램·앱 데이터 폴더 안의 파일 ${appPicked.toLocaleString()}개도 골랐어요. 휴지통으로 옮기기 전에 한 번 더 물어요.`,
+      );
+    }
+    if (windows > 0) {
+      notes.push(`Windows 폴더 안의 파일 ${windows.toLocaleString()}개는 고르지 않았어요. 필요하면 직접 고르세요.`);
+    }
     setAutoNote(notes.length ? notes.join(" ") : null);
+  };
+
+  const clearSelection = () => {
+    setSelected(new Set());
+    setAutoNote(null);
+    setAutoRule(null);
   };
 
   const sizes = useMemo(() => {
@@ -434,63 +768,232 @@ export function Duplicates({
   /** What the trash would get: never every copy of a group, whatever the selection says. */
   const picked = useMemo((): Picked => {
     const paths: string[] = [];
+    const app: string[] = [];
+    const windows: string[] = [];
     let bytes = 0;
     let touched = 0;
-    let app = 0;
-    for (const g of groups) {
+    let unseen = 0;
+    groups.forEach((g, i) => {
       const sel = g.files.filter((f) => selected.has(f.path));
-      if (!sel.length || sel.length >= g.files.length) continue;
+      if (!sel.length || sel.length >= g.files.length) return;
       touched++;
+      if (i >= limit) unseen++;
       for (const f of sel) {
         paths.push(f.path);
-        if (appFiles.has(f.path)) app++;
+        if (inWindows(f)) windows.push(f.path);
+        else if (inAppFolder(f)) app.push(f.path);
       }
       bytes += sel.length * g.size;
-    }
-    return { paths, bytes, groups: touched, app };
-  }, [groups, selected, appFiles]);
+    });
+    return { paths, bytes, groups: touched, app, windows, unseen };
+  }, [groups, selected, limit]);
+
+  // Whether "하드 링크로 합치기" has anything to offer: with every box of its prompt ticked.
+  const linkAny = useMemo(
+    () => linkPlanOf(groups, selected, limit, { rule: autoRule, app: true, editable: true }).files > 0,
+    [groups, selected, limit, autoRule],
+  );
 
   const wasted = groups.reduce((s, g) => s + g.size * (g.files.length - 1), 0);
   const fileCount = groups.reduce((s, g) => s + g.files.length, 0);
 
+  // Hard links need NTFS: a drive known to be something else (exFAT, FAT32) gets no link button.
+  const fs = drives.find((d) => driveKey(d.letter) === driveKey(searched ?? root))?.fs ?? "";
+  const linkable = !fs || fs.toUpperCase() === "NTFS";
+
+  /** Takes files out of the list (gone to the trash, or links now), and out of the selection. */
+  const dropFiles = (gone: Set<string>) => {
+    for (const p of gone) trashed.current.add(p);
+    // A group down to one file is no longer a duplicate.
+    setGroups((gs) =>
+      gs.map((g) => ({ ...g, files: g.files.filter((f) => !gone.has(f.path)) })).filter((g) => g.files.length >= 2),
+    );
+    setSelected((s) => new Set([...s].filter((p) => !gone.has(p))));
+    setAutoRule(null);
+  };
+
+  // In parts of TRASH_CHUNK, each taken out of the list as it is done, with a cancel between them.
+  // Closing the window stops it after the part it is at too: nobody would see how it ended.
   const doTrash = async (c: Picked) => {
     setConfirm(null);
-    if (trashing) return;
+    if (trashing || linking) return;
     setTrashing(true);
+    setTrashStopping(false);
+    trashStop.current = false;
+    setTrashDone({ done: 0, total: c.paths.length });
+    setNotice(null);
+    const moved: string[] = [];
+    const failed: [string, string][] = [];
+    let sent = 0;
+    let error: string | null = null;
     try {
-      const r = await api.trash(c.paths);
-      if (!alive.current) return;
-      const moved = new Set(r.moved);
-      for (const p of r.moved) trashed.current.add(p);
-      // A group down to one file is no longer a duplicate.
-      const left = groups
-        .map((g) => ({ ...g, files: g.files.filter((f) => !moved.has(f.path)) }))
-        .filter((g) => g.files.length >= 2);
-      const still = new Set(left.flatMap((g) => g.files.map((f) => f.path)));
-      setGroups(left);
-      setSelected((s) => new Set([...s].filter((p) => still.has(p))));
-      const bytes = r.moved.reduce((s, p) => s + (sizes.get(p) ?? 0), 0);
-      const byReason = new Map<string, string[]>();
-      for (const [p, why] of r.failed) {
-        const list = byReason.get(why);
-        if (list) list.push(p);
-        else byReason.set(why, [p]);
+      while (sent < c.paths.length && !trashStop.current && alive.current) {
+        const part = c.paths.slice(sent, sent + TRASH_CHUNK);
+        const r = await api.trash(part);
+        sent += part.length;
+        moved.push(...r.moved);
+        failed.push(...r.failed);
+        if (!alive.current) return;
+        dropFiles(new Set(r.moved));
+        setTrashDone({ done: sent, total: c.paths.length });
       }
-      setNotice({
-        text: r.moved.length
-          ? `휴지통으로 ${r.moved.length.toLocaleString()}개 옮겼어요 · ${formatSize(bytes)}`
-          : "휴지통으로 옮긴 파일이 없어요",
-        error: r.failed.length > 0,
-        failed: [...byReason],
-      });
     } catch (err) {
-      if (alive.current) setNotice({ text: String(err), error: true });
-    } finally {
-      if (alive.current) setTrashing(false);
+      error = String(err);
+    }
+    if (!alive.current) return;
+    setTrashing(false);
+    setTrashDone(null);
+    setTrashStopping(false);
+    const bytes = moved.reduce((s, p) => s + (sizes.get(p) ?? 0), 0);
+    const byReason = new Map<string, string[]>();
+    for (const [p, why] of failed) {
+      const list = byReason.get(why);
+      if (list) list.push(p);
+      else byReason.set(why, [p]);
+    }
+    const parts = [
+      moved.length
+        ? `휴지통으로 ${moved.length.toLocaleString()}개 옮겼어요 · ${formatSize(bytes)}`
+        : "휴지통으로 옮긴 파일이 없어요",
+    ];
+    const rest = c.paths.length - sent;
+    if (error) parts.push(`나머지 ${(c.paths.length - moved.length - failed.length).toLocaleString()}개는 옮기지 못했어요: ${error}`);
+    else if (rest > 0) parts.push(`취소해서 나머지 ${rest.toLocaleString()}개는 그대로 두었어요(아직 골라 둔 채예요)`);
+    setNotice({ text: parts.join(". "), error: failed.length > 0 || error !== null, failed: [...byReason] });
+  };
+
+  const stopTrash = () => {
+    trashStop.current = true;
+    setTrashStopping(true);
+  };
+
+  const doLink = async (plan: LinkPlan) => {
+    setLinkConfirm(null);
+    if (trashing || linkRun.current || !plan.groups.length) return;
+    linkRun.current = { search: job.current, groups: plan.groups };
+    linkId.current = null;
+    setLinking(true);
+    setLinkJob(null);
+    setLinkCancelling(false);
+    setNotice(null);
+    try {
+      await jobListening.current;
+      const id = await v082.startDupLink(plan.groups, job.current);
+      if (!alive.current) return;
+      linkId.current = id;
+      // Events that came before the id did.
+      const ev = linkSeen.current.get(id);
+      if (ev) onJob(ev);
+    } catch (err) {
+      linkRun.current = null;
+      if (!alive.current) return;
+      setLinking(false);
+      setNotice({ text: `하드 링크로 합치지 못했어요: ${err}`, error: true });
     }
   };
 
+  const cancelLink = () => {
+    const id = linkId.current;
+    if (id === null || linkCancelling) return;
+    setLinkCancelling(true);
+    ops.cancelJob(id).catch((err) => {
+      setLinkCancelling(false);
+      setNotice({ text: String(err), error: true });
+    });
+  };
+
+  /** The link job ended: the files it made into links leave the list, and the notice says how it went. */
+  const endLink = (j: JobInfo) => {
+    const run = linkRun.current;
+    linkRun.current = null;
+    linkId.current = null;
+    setLinking(false);
+    setLinkJob(null);
+    setLinkCancelling(false);
+    if (!run) return;
+    const left = j.errors.filter(([, why]) => why.startsWith(LINK_LEFT)).map(([p]) => p);
+    const failed = j.errors.filter(([, why]) => !why.startsWith(LINK_LEFT));
+    const bad = new Set(failed.map(([p]) => p));
+    // Which files are links now is known when every problem is listed: a copy it could not link
+    // is named in `errors` (each copy of a group whose kept file could not be used, too), one
+    // merged whose old copy stayed is named by that copy (`.name.ff-link`). Done, that is every
+    // copy sent less those. Failed, ops.rs merged none (it fails a job only when every copy was
+    // turned down), unless it stopped on a fault of its own, named at no copy: so known when
+    // every copy sent is among the refusals. Cancelled, some may be links and the list stays as
+    // it was: linking a file again does nothing, and sending one of two links to the trash still
+    // loses nothing.
+    const listed = jobErrorCount(j) <= j.errors.length;
+    const refusedAll = run.groups.every((g) => g.others.every((o) => bad.has(o)));
+    const known = !run.adopted && listed && (j.state === "done" || (j.state === "failed" && refusedAll));
+    const merged = new Set<string>();
+    if (known) {
+      for (const g of run.groups) {
+        if (bad.has(g.keep)) continue;
+        for (const o of g.others) if (!bad.has(o)) merged.add(o);
+      }
+      if (merged.size && run.search === job.current) dropFiles(merged);
+    }
+    // What the Recycle Bin got (not the copies left in place, nor files that were one already).
+    const bytes = j.freed_bytes ?? [...merged].reduce((s, p) => s + (sizes.get(p) ?? 0), 0);
+    const freed = bytes > 0 ? ` · 휴지통을 비우면 ${formatSize(bytes)} 비어요` : "";
+    const byReason = new Map<string, string[]>();
+    for (const [p, why] of failed) {
+      const list = byReason.get(why);
+      if (list) list.push(p);
+      else byReason.set(why, [p]);
+    }
+    const again = '목록을 맞추려면 "다시 찾기"를 눌러 주세요.';
+    let text: string;
+    if (run.adopted) {
+      // Started before this opened: its files are not those of the list here (searched after it).
+      const how = j.state === "cancelled" ? "를 취소했어요" : j.state === "failed" ? "가 실패했어요" : "가 끝났어요";
+      text = `전에 시작한 하드 링크로 합치기${how}${freed}. 자세한 내용은 작업 목록에 있어요.`;
+      if (report) text += ` ${again}`;
+    } else if (j.state === "cancelled") {
+      text = `하드 링크로 합치기를 취소했어요. 그때까지 합친 파일은 합친 채로 두었어요(두 위치 모두 그대로 열려요)${freed}. ${again}`;
+    } else if (j.state === "failed" && known) {
+      text = "하드 링크로 합친 파일이 없어요. 고른 파일을 모두 아래 이유로 합치지 못했어요(파일은 그대로예요)";
+    } else if (j.state === "failed") {
+      text = `하드 링크로 다 합치지 못했어요. 그때까지 합친 파일은 합친 채로 두었어요${freed}. ${again}`;
+    } else if (!known) {
+      text = `하드 링크로 합쳤어요${freed}. 합치지 못한 파일이 많아서 다 보여 드릴 수 없어요. ${again}`;
+    } else if (merged.size) {
+      text = `하드 링크로 ${merged.size.toLocaleString()}개를 합쳤어요${freed}`;
+    } else {
+      text = "하드 링크로 합친 파일이 없어요";
+    }
+    setNotice({
+      text,
+      // A cancel is the user's own doing.
+      error: j.state === "failed" || j.errors.length > 0,
+      failed: [...byReason],
+      failVerb: "합치지 못했어요",
+      left,
+    });
+  };
+
+  const onJob = (j: JobInfo) => {
+    if (j.op !== "link") return;
+    const had = linkSeen.current.get(j.id);
+    if (!had || jobActive(had.state)) linkSeen.current.set(j.id, j);
+    // Before the id came back, the event waits in linkSeen.
+    if (!linkRun.current || linkId.current === null || j.id !== linkId.current) return;
+    if (jobActive(j.state)) setLinkJob(j);
+    else endLink(j);
+  };
+  const onJobRef = useRef(onJob);
+  useEffect(() => {
+    onJobRef.current = onJob;
+  });
+
   const frac = progress && progress.total > 0 ? Math.min(1, progress.done / progress.total) : null;
+  const linkFrac = !linkJob
+    ? null
+    : linkJob.total_bytes > 0
+      ? Math.min(1, linkJob.done_bytes / linkJob.total_bytes)
+      : linkJob.total_items > 0
+        ? Math.min(1, linkJob.done_items / linkJob.total_items)
+        : null;
   // How the search ended, once the results are in: stopped before the end, and the files it did
   // not compare (changed since the scan, unreadable, online-only), which the report leaves out.
   const partial = !!report && !!progress && progress.phase !== "done";
@@ -502,6 +1005,84 @@ export function Duplicates({
       : report.state === "done" || report.state === "cancelled"
         ? report.detail
         : progress.detail;
+  const busy = trashing || linking;
+
+  const linkBox = linking && (
+    <div className="dup-notice dup-linking">
+      <div className="dup-linking-head">
+        <b>하드 링크로 합치는 중…</b>
+        {linkJob && linkJob.total_items > 0 && (
+          <span className="muted">
+            {linkJob.done_items.toLocaleString()} / {linkJob.total_items.toLocaleString()}
+          </span>
+        )}
+        <span className="spacer" />
+        <button className="btn small" disabled={!linkJob || linkCancelling} onClick={cancelLink}>
+          {linkCancelling ? "취소하는 중…" : "취소"}
+        </button>
+      </div>
+      <div className={`job-bar${linkFrac === null ? " unknown" : ""}`}>
+        <span style={linkFrac === null ? undefined : { width: `${linkFrac * 100}%` }} />
+      </div>
+      {linkJob?.current && (
+        <div className="job-current" title={linkJob.current}>
+          {baseName(linkJob.current)}
+        </div>
+      )}
+      <div className="muted">
+        {linkRun.current?.adopted
+          ? "이 창을 열기 전에 시작한 작업이에요. 끝날 때까지는 찾거나 휴지통으로 옮기거나 합칠 수 없어요."
+          : "창을 닫아도 계속돼요. 진행 상황은 작업 목록에도 나와요."}
+      </div>
+    </div>
+  );
+
+  const trashBox = trashDone && (
+    <div className="dup-notice dup-linking">
+      <div className="dup-linking-head">
+        <b>휴지통으로 옮기는 중…</b>
+        <span className="muted">
+          {trashDone.done.toLocaleString()} / {trashDone.total.toLocaleString()}
+        </span>
+        <span className="spacer" />
+        <button className="btn small" disabled={trashStopping} onClick={stopTrash}>
+          {trashStopping ? "멈추는 중…" : "취소"}
+        </button>
+      </div>
+      <div className="job-bar">
+        <span style={{ width: `${trashDone.total ? Math.min(1, trashDone.done / trashDone.total) * 100 : 0}%` }} />
+      </div>
+      <div className="muted">
+        {TRASH_CHUNK.toLocaleString()}개씩 옮겨요. 취소하거나 창을 닫으면 지금 옮기는 {TRASH_CHUNK.toLocaleString()}개까지만
+        옮기고 멈춰요.
+      </div>
+    </div>
+  );
+
+  const noticeBox = notice && (
+    <div className={`dup-notice${notice.error ? " error" : ""}`}>
+      <div>{notice.text}</div>
+      {notice.failed?.map(([why, paths]) => (
+        <div key={why} className="dup-notice-why">
+          {paths.length.toLocaleString()}개는 {notice.failVerb ?? "옮기지 못했어요"}: {why}
+        </div>
+      ))}
+      {notice.left && notice.left.length > 0 && (
+        <div className="dup-notice-why">
+          합쳤지만 남은 사본(.이름.ff-link) {notice.left.length.toLocaleString()}개를 휴지통에 넣지 못했어요. 숨김 파일로 남아
+          있으니 직접 지워 주세요:
+          <ul className="dup-notice-paths">
+            {notice.left.slice(0, 5).map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+            {notice.left.length > 5 && (
+              <li className="muted">외 {(notice.left.length - 5).toLocaleString()}개 (작업 목록에 있어요)</li>
+            )}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <Dialog className="v04-dialog dups" title="중복 파일 찾기" onClose={onClose}>
@@ -538,7 +1119,14 @@ export function Duplicates({
           type={running ? "button" : "submit"}
           className={`btn${running ? "" : " primary"}`}
           autoFocus
-          disabled={running ? cancelling || job.current === null : !normalizePath(root)}
+          title={
+            linking
+              ? "하드 링크로 합치는 동안에는 찾지 않아요"
+              : trashing
+                ? "휴지통으로 옮기는 동안에는 찾지 않아요"
+                : undefined
+          }
+          disabled={running ? cancelling || job.current === null : !normalizePath(root) || linking || trashing}
           onClick={running ? cancel : undefined}
         >
           {running ? (cancelling ? "취소하는 중…" : "취소") : report || progress ? "다시 찾기" : "찾기"}
@@ -547,6 +1135,9 @@ export function Duplicates({
 
       <div className="dlg-body">
         {error && <div className="v04-error">{error}</div>}
+        {/* Before any results: a merge started before this opened, and how it ended. */}
+        {!report && linkBox}
+        {!report && noticeBox}
 
         {!progress && !error && (
           <p className="muted v04-intro">
@@ -595,40 +1186,45 @@ export function Duplicates({
               </div>
             )}
             {skipped && <div className="dup-caveat">{skipped}. 이 파일들은 비교하지 않아서 결과에 들어 있지 않아요.</div>}
-
-            {notice && (
-              <div className={`dup-notice${notice.error ? " error" : ""}`}>
-                <div>{notice.text}</div>
-                {notice.failed?.map(([why, paths]) => (
-                  <div key={why} className="dup-notice-why">
-                    {paths.length.toLocaleString()}개는 옮기지 못했어요: {why}
-                  </div>
-                ))}
+            {binned > 0 && (
+              <div className="muted dup-binned">
+                휴지통 안에 있는 파일 {binned.toLocaleString()}개는 이미 지운 파일이라 결과에서 뺐어요.
               </div>
             )}
 
+            {linkBox}
+            {trashBox}
+            {noticeBox}
+
             {groups.length > 0 && (
               <div className="dup-tools">
-                <span className="muted">자동 선택</span>
-                <button className="btn" onClick={() => autoSelect("newest")}>
+                <span className="muted">자동 선택 (모든 묶음)</span>
+                <button className="btn" disabled={trashing} onClick={() => autoSelect("newest")}>
                   최신 하나만 남기기
                 </button>
-                <button className="btn" onClick={() => autoSelect("oldest")}>
+                <button className="btn" disabled={trashing} onClick={() => autoSelect("oldest")}>
                   가장 오래된 하나만 남기기
                 </button>
-                <button className="btn" onClick={() => autoSelect("shortest")}>
+                <button className="btn" disabled={trashing} onClick={() => autoSelect("shortest")}>
                   경로가 가장 짧은 것만 남기기
                 </button>
-                <button
-                  className="btn"
-                  disabled={!selected.size}
-                  onClick={() => {
-                    setSelected(new Set());
-                    setAutoNote(null);
-                  }}
-                >
+                <button className="btn" disabled={!selected.size || trashing} onClick={clearSelection}>
                   선택 해제
                 </button>
+                <label className="dup-check dup-with-app" title={APP_NOTE}>
+                  <input
+                    type="checkbox"
+                    checked={withApp}
+                    disabled={trashing}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      setWithApp(on);
+                      // A selection auto-select made follows the box at once.
+                      if (autoRule) autoSelect(autoRule, on);
+                    }}
+                  />
+                  프로그램·앱 데이터 폴더 안 파일도 자동으로 고르기 <span className="warn">(주의)</span>
+                </label>
               </div>
             )}
             {autoNote && groups.length > 0 && <div className="dup-caveat">{autoNote}</div>}
@@ -645,24 +1241,30 @@ export function Duplicates({
                   </header>
                   {g.files.map((f) => {
                     const on = selected.has(f.path);
-                    // The last copy not chosen stays: its box cannot be ticked.
+                    // The last copy not chosen stays: its box cannot be ticked. While the trash goes, the
+                    // selection is what it sends: no box changes.
                     const lastOne = !on && g.files.every((x) => x.path === f.path || selected.has(x.path));
                     return (
                       <div key={f.path} className={`dup-file${on ? " sel" : ""}`}>
                         <label className="dup-file-pick" title={lastOne ? "묶음마다 하나는 남겨요" : f.path}>
-                          <input type="checkbox" checked={on} disabled={lastOne} onChange={() => toggle(g, f.path)} />
+                          <input
+                            type="checkbox"
+                            checked={on}
+                            disabled={lastOne || trashing}
+                            onChange={() => toggle(g, f.path)}
+                          />
                           <span className="dup-file-name">
                             <span className="dup-file-base">{baseName(f.path)}</span>
                             <span className="dup-file-dir">{dirOf(f.path)}</span>
                           </span>
                         </label>
                         {appFiles.has(f.path) && (
-                          <span className="v04-tag app" title={APP_NOTE}>
-                            프로그램 폴더
+                          <span className="v04-tag app" title={inWindows(f) ? WINDOWS_NOTE : APP_NOTE}>
+                            {inWindows(f) ? "Windows 폴더" : "프로그램 폴더"}
                           </span>
                         )}
                         {on ? (
-                          <span className="v04-tag del">지울 파일</span>
+                          <span className="v04-tag del">고른 파일</span>
                         ) : (
                           anySel && <span className="v04-tag keep">남김</span>
                         )}
@@ -689,13 +1291,34 @@ export function Duplicates({
         {report && groups.length > 0 && (
           <span className="muted">
             {picked.paths.length.toLocaleString()}개 선택 · {formatSize(picked.bytes)}
+            {picked.groups > 0 && ` · 묶음 ${picked.groups.toLocaleString()}개`}
+            {picked.unseen > 0 && ` (아래쪽 안 보이는 ${picked.unseen.toLocaleString()}묶음 포함)`}
           </span>
         )}
         <span className="spacer" />
         {report && groups.length > 0 && (
           <button
+            className="btn"
+            disabled={!linkAny || busy || !linkable}
+            title={
+              !linkable
+                ? `하드 링크는 NTFS 드라이브에서만 만들 수 있어요 (이 드라이브: ${fs})`
+                : "고른 파일을 남기는 파일의 하드 링크로 바꿔요(고르지 않은 프로그램 폴더 안 파일도 합칠지 물어요). 두 위치 모두 그대로 쓸 수 있고 데이터는 한 번만 저장돼요"
+            }
+            onClick={() =>
+              linkAny &&
+              // Auto-select spared the program files: merging is what they were spared for. With
+              // nothing chosen, they are all there is to merge.
+              setLinkConfirm({ rule: autoRule, app: autoRule !== null || selected.size === 0 })
+            }
+          >
+            {linking ? "합치는 중…" : "하드 링크로 합치기"}
+          </button>
+        )}
+        {report && groups.length > 0 && (
+          <button
             className="btn danger"
-            disabled={!picked.paths.length || trashing}
+            disabled={!picked.paths.length || busy}
             onClick={() => picked.paths.length && setConfirm(picked)}
           >
             {trashing ? "옮기는 중…" : "선택 항목 휴지통으로"}
@@ -706,31 +1329,196 @@ export function Duplicates({
         </button>
       </div>
 
-      {confirm && (
-        <Dialog title="휴지통으로 옮길까요?" onClose={() => setConfirm(null)} onBackdrop={() => setConfirm(null)}>
-          <h3>휴지통으로 옮길까요?</h3>
-          <p>
-            묶음 {confirm.groups.toLocaleString()}개에서 파일 {confirm.paths.length.toLocaleString()}개 ·{" "}
-            {formatSize(confirm.bytes)}
-          </p>
-          {confirm.app > 0 && (
-            <p className="v04-error">
-              이 중 {confirm.app.toLocaleString()}개는 Windows·프로그램·게임·개발 도구·앱 데이터 폴더 안에 있어요. 지우면 그
-              프로그램이 동작하지 않을 수 있어요.
+      {confirm && <TrashConfirm c={confirm} onCancel={() => setConfirm(null)} onConfirm={() => doTrash(confirm)} />}
+      {linkConfirm && (
+        <LinkConfirm
+          groups={groups}
+          selected={selected}
+          drawn={limit}
+          ask={linkConfirm}
+          onCancel={() => setLinkConfirm(null)}
+          onConfirm={(plan) => doLink(plan)}
+        />
+      )}
+    </Dialog>
+  );
+}
+
+/**
+ * The trash prompt; files in Windows', a program's or app data's folder (only ever ticked by hand,
+ * or by auto-select once its box is on) need one more tick before the button works.
+ */
+function TrashConfirm({ c, onCancel, onConfirm }: { c: Picked; onCancel(): void; onConfirm(): void }) {
+  const [riskOk, setRiskOk] = useState(false);
+  const app = c.app.length;
+  const win = c.windows.length;
+  const risky = app + win > 0;
+  const which = [
+    win > 0 && `Windows 폴더 안 파일 ${win.toLocaleString()}개`,
+    app > 0 && `프로그램 폴더 안 파일 ${app.toLocaleString()}개`,
+  ]
+    .filter(Boolean)
+    .join("와 ");
+  return (
+    <Dialog className="dup-confirm" title="휴지통으로 옮길까요?" onClose={onCancel} onBackdrop={onCancel}>
+      <h3>휴지통으로 옮길까요?</h3>
+      <p>
+        묶음 {c.groups.toLocaleString()}개에서 파일 {c.paths.length.toLocaleString()}개 · {formatSize(c.bytes)}
+      </p>
+      {c.unseen > 0 && (
+        <p className="muted">
+          이 중 묶음 {c.unseen.toLocaleString()}개는 목록 아래쪽에 있어서 아직 보이지 않아요. "묶음 더 보기"로 확인할 수
+          있어요.
+        </p>
+      )}
+      {risky && (
+        <div className="v04-error dup-confirm-app">
+          {win > 0 && (
+            <p>
+              이 중 <b>{win.toLocaleString()}개</b>는 <b>Windows 폴더</b> 안에 있어요. 지우면 Windows가 제대로 동작하지 않거나
+              켜지지 않을 수 있어요. 무엇인지 모르는 파일이면 고르지 마세요.
             </p>
           )}
-          <p className="muted">
-            묶음마다 적어도 하나는 남겨요. 휴지통에서 언제든 되돌릴 수 있어요. 휴지통에 넣을 수 없는 파일(USB·네트워크
-            드라이브, 휴지통보다 큰 파일)은 지우지 않고 알려 드려요.
-          </p>
-          <div className="actions">
-            <button onClick={() => setConfirm(null)}>취소</button>
-            <button className="primary danger" autoFocus onClick={() => doTrash(confirm)}>
-              휴지통으로 이동
-            </button>
-          </div>
-        </Dialog>
+          {app > 0 && (
+            <>
+              <p>
+                이 중 <b>{app.toLocaleString()}개</b>는 프로그램·앱 데이터 폴더 안에 있어요 ({ownersText(c.app)}).
+              </p>
+              <p>
+                지우면 그 프로그램이 실행되지 않거나, 설정·저장한 데이터·내려받은 모델 같은 파일을 다시 받아야 할 수 있어요.
+                두 프로그램이 각자 쓰는 같은 파일이면 휴지통 대신 "하드 링크로 합치기"를 쓰세요.
+              </p>
+            </>
+          )}
+          <label className="dup-check">
+            <input type="checkbox" checked={riskOk} onChange={(e) => setRiskOk(e.target.checked)} />
+            알고 있어요. {which}도 휴지통으로 옮길게요
+          </label>
+        </div>
       )}
+      <p className="muted">
+        묶음마다 적어도 하나는 남겨요. 휴지통에서 언제든 되돌릴 수 있어요. 휴지통에 넣을 수 없는 파일(USB·네트워크 드라이브,
+        휴지통보다 큰 파일)은 지우지 않고 알려 드려요.
+      </p>
+      <div className="actions">
+        <button onClick={onCancel}>취소</button>
+        <button className="primary danger" autoFocus={!risky} disabled={risky && !riskOk} onClick={onConfirm}>
+          휴지통으로 이동
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * The "하드 링크로 합치기" prompt: what it does, in plain words, and what it frees. Its boxes add to
+ * the files chosen those auto-select spared in program folders, and the documents and media
+ * chosen (left out at first: merged, editing one copy changes the other).
+ */
+function LinkConfirm({
+  groups,
+  selected,
+  drawn,
+  ask,
+  onCancel,
+  onConfirm,
+}: {
+  groups: DupGroup[];
+  selected: Set<string>;
+  drawn: number;
+  ask: LinkAsk;
+  onCancel(): void;
+  onConfirm(plan: LinkPlan): void;
+}) {
+  const [app, setApp] = useState(ask.app);
+  const [edit, setEdit] = useState(false);
+  const plan = useMemo(
+    () => linkPlanOf(groups, selected, drawn, { rule: ask.rule, app, editable: edit }),
+    [groups, selected, drawn, ask.rule, app, edit],
+  );
+  const tooMany = plan.files > LINK_MAX;
+  const ok = plan.files > 0 && !tooMany;
+  const keeps = ask.rule ? RULE_KEEPS[ask.rule] : "고르지 않은 파일 중 가장 최신 파일";
+  return (
+    <Dialog className="dup-confirm" title="하드 링크로 합칠까요?" onClose={onCancel} onBackdrop={onCancel}>
+      <h3>하드 링크로 합칠까요?</h3>
+      {plan.files > 0 ? (
+        <p>
+          묶음 {plan.groups.length.toLocaleString()}개에서 파일 {plan.files.toLocaleString()}개를 남기는 파일과 합쳐요. 휴지통을
+          비우면 최대 <b>{formatSize(plan.bytes)}</b> 비어요(합치지 못한 파일은 빼고).
+        </p>
+      ) : (
+        <p>합칠 파일이 없어요. 아래 상자를 켜거나 다른 파일을 고르세요.</p>
+      )}
+      {plan.kinds.length > 0 && (
+        <p className="muted">합칠 파일: {plan.kinds.map(([k, n]) => `${k} ${n.toLocaleString()}개`).join(" · ")}</p>
+      )}
+      {plan.appFiles > 0 && (
+        <div className="dup-confirm-opt">
+          <label className="dup-check">
+            <input type="checkbox" checked={app} onChange={(e) => setApp(e.target.checked)} />
+            고르지 않은 프로그램·앱 데이터 폴더 안 파일 {plan.appFiles.toLocaleString()}개(묶음{" "}
+            {plan.appGroups.toLocaleString()}개)도 합치기
+          </label>
+          <p className="muted">
+            자동 선택이 지우지 않으려고 빼 둔 파일이에요(두 프로그램이 각자 받은 모델·설치 파일 같은). 합쳐도 두 경로 모두
+            그대로 열려서, 읽기만 하는 파일이면 프로그램도 그대로 동작해요. 묶음마다 {keeps}이 남아요. 끄면 이 파일들은
+            그대로 둬요.
+          </p>
+        </div>
+      )}
+      {plan.editable > 0 && (
+        <div className="v04-error dup-confirm-app">
+          <p>
+            고른 파일 중 <b>문서·사진·영상·음악 {plan.editable.toLocaleString()}개</b>는 {edit ? "같이 합쳐요" : "빼 두었어요"}.
+            합치면 한쪽을 고칠 때 다른 쪽도 같이 바뀌어요. 따로 고쳐 쓸 파일이면 휴지통으로 보내거나 그대로 두세요.
+          </p>
+          <label className="dup-check">
+            <input type="checkbox" checked={edit} onChange={(e) => setEdit(e.target.checked)} />
+            알고 있어요. 문서·사진·영상·음악 {plan.editable.toLocaleString()}개도 합칠게요
+          </label>
+        </div>
+      )}
+      <ul className="dup-confirm-list">
+        <li>두 위치 모두 그대로 쓸 수 있고, 데이터는 한 번만 저장돼요.</li>
+        <li>합치기 전에 두 파일의 내용을 처음부터 끝까지 다시 비교해요. 다르거나 찾은 뒤에 바뀐 파일은 건드리지 않아요.</li>
+        <li>합친 파일 자리에 있던 사본은 휴지통으로 가요. 휴지통을 비우면 공간이 생겨요.</li>
+        <li>같은 드라이브(NTFS)에 있는 파일끼리만 돼요.</li>
+        <li>
+          <b>합친 뒤에는 한쪽을 고치면 다른 쪽도 같이 바뀌어요.</b> 모델·설치 파일처럼 읽기만 하는 파일에 알맞아요.
+        </li>
+      </ul>
+      <p className="muted">
+        묶음마다 고르지 않은 파일이 남고, 합칠 파일은 그 파일을 가리키는 하드 링크가 돼요. 합친 파일의 날짜·속성은 남기는
+        파일의 것을 같이 써요.
+      </p>
+      {plan.unseen > 0 && (
+        <p className="muted">
+          이 중 묶음 {plan.unseen.toLocaleString()}개는 목록 아래쪽에 있어서 아직 보이지 않아요. "묶음 더 보기"로 확인할 수
+          있어요.
+        </p>
+      )}
+      {plan.windows > 0 && (
+        <p className="dup-caveat">
+          Windows 폴더 안의 파일(또는 그런 파일과 합쳐야 하는 파일) {plan.windows.toLocaleString()}개는 합치지 않아요.
+        </p>
+      )}
+      {plan.otherDrive > 0 && (
+        <p className="dup-caveat">남기는 파일과 드라이브가 다른 {plan.otherDrive.toLocaleString()}개는 합치지 않아요.</p>
+      )}
+      {tooMany && (
+        <p className="v04-error">
+          한 번에 합칠 수 있는 파일은 {LINK_MAX.toLocaleString()}개까지예요. 고른 파일을 줄인 뒤에 다시 눌러 주세요.
+        </p>
+      )}
+      <div className="actions">
+        <button onClick={onCancel} autoFocus={!ok}>
+          취소
+        </button>
+        <button className="primary" autoFocus={ok} disabled={!ok} onClick={() => onConfirm(plan)}>
+          합치기
+        </button>
+      </div>
     </Dialog>
   );
 }

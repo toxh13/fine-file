@@ -229,6 +229,8 @@ interface Busy {
   transfers: number;
   /** This window's relocations (and undos) not over yet. */
   relocations: number;
+  /** This window's merges of duplicates into hard links (Duplicates.tsx) not over yet. */
+  links: number;
   /** The ids of those jobs: the ones the user is told about (lib.rs update_prepare stops only these). */
   jobIds: number[];
   /** A plan is run or undone (by this window, unless others.plan)... */
@@ -249,6 +251,7 @@ async function busyNow(): Promise<Busy> {
   return {
     transfers: going.filter((j) => j.op === "copy" || j.op === "move").length,
     relocations: going.filter((j) => j.op === "relocate" || j.op === "restore").length,
+    links: going.filter((j) => j.op === "link").length,
     jobIds: going.map((j) => j.id),
     plan: running !== undefined,
     planId: running?.id ?? null,
@@ -257,7 +260,7 @@ async function busyNow(): Promise<Busy> {
 }
 
 /** Work of this window the update stops (as closing the window does) once the user agrees. */
-const stopsWork = (b: Busy) => b.transfers > 0 || b.relocations > 0 || (b.plan && !b.others.plan);
+const stopsWork = (b: Busy) => b.transfers > 0 || b.relocations > 0 || b.links > 0 || (b.plan && !b.others.plan);
 
 /** Why the update cannot be installed now: work in another window the installer would cut short. */
 const blockedBy = (b: Busy) => (b.others.plan ? PLAN_ELSEWHERE : b.others.relocation ? RELOCATION_ELSEWHERE : null);
@@ -545,6 +548,11 @@ function InstallConfirm({ version, busy, onCancel, onGo }: { version: string; bu
   if (busy.relocations > 0) {
     warns.push(
       "폴더를 다른 드라이브로 옮기거나 되돌리는 중이에요. 업데이트하면 취소해요(원본은 그대로 남아요). 이미 마지막 단계면 그 단계가 끝날 때까지 기다려요.",
+    );
+  }
+  if (busy.links > 0) {
+    warns.push(
+      `중복 파일을 하드 링크로 합치는 중이에요${busy.links > 1 ? ` (${busy.links}개)` : ""}. 업데이트하면 취소해요. 이미 합친 파일은 합친 채로 남고, 합치던 파일은 마저 합치거나 손대지 않은 채로 멈춰요.`,
     );
   }
   if (busy.plan && !busy.others.plan) {

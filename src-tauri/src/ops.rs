@@ -20,7 +20,10 @@
 //! too: it removes the original folder for good only once all of it is at
 //! the target, checked entry by entry, and the junction left in its place
 //! leads there; its undo does the same the other way round, and so does
-//! `recover` at the next start for one cut short by a crash.
+//! `recover` at the next start for one cut short by a crash. A merge of
+//! duplicates into hard links (v0.8.2, at the end of this file) removes
+//! nothing either: each copy it replaces goes to the Recycle Bin, and one cut
+//! short by a crash is put right at the next start too (`recover_links`).
 //!
 //! A file is copied under a hidden name of its own next to where it goes
 //! (`.name.ff-partial`) and gets its real name only once all of it is there,
@@ -33,15 +36,15 @@
 //! file APIs get `win::wide_path`, so a name ending in a dot or a space is
 //! that name and not its neighbour without the dot.
 
-use crate::win;
+use crate::{dups, win};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{DirEntry, File, Metadata, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -51,18 +54,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use windows_sys::core::{GUID, PWSTR};
 use windows_sys::Win32::Foundation::{
-    GlobalFree, ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_DISK_FULL, ERROR_FILENAME_EXCED_RANGE, ERROR_FILE_NOT_FOUND,
-    ERROR_FILE_TOO_LARGE, ERROR_HANDLE_DISK_FULL, ERROR_LOCK_VIOLATION, ERROR_NOT_SAME_DEVICE, ERROR_PATH_NOT_FOUND,
-    ERROR_PRIVILEGE_NOT_HELD, ERROR_REQUEST_ABORTED, ERROR_SHARING_VIOLATION, ERROR_WRITE_PROTECT, HANDLE, HGLOBAL, POINT,
+    GlobalFree, RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_DISK_FULL, ERROR_FILENAME_EXCED_RANGE,
+    ERROR_FILE_NOT_FOUND, ERROR_FILE_TOO_LARGE, ERROR_HANDLE_DISK_FULL, ERROR_INVALID_NAME, ERROR_LOCK_VIOLATION,
+    ERROR_NOT_SAME_DEVICE, ERROR_PATH_NOT_FOUND, ERROR_PRIVILEGE_NOT_HELD, ERROR_REQUEST_ABORTED, ERROR_SHARING_VIOLATION,
+    ERROR_WRITE_PROTECT, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL, INVALID_HANDLE_VALUE, NTSTATUS, POINT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CopyFileExW, CreateDirectoryW, CreateSymbolicLinkW, GetDriveTypeW, GetFileAttributesW, GetVolumeInformationW,
-    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, MoveFileExW, RemoveDirectoryW, SetFileAttributesW, DELETE,
+    CopyFileExW, CreateDirectoryW, CreateSymbolicLinkW, FileDispositionInfo, FileDispositionInfoEx, GetDriveTypeW,
+    GetFileAttributesW, GetVolumeInformationByHandleW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, MoveFileExW, ReOpenFile, RemoveDirectoryW, SetFileAttributesW, SetFileInformationByHandle, DELETE,
     FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
-    FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_ATTRIBUTE_TEMPORARY, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, INVALID_FILE_ATTRIBUTES, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-    SYMBOLIC_LINK_FLAG_DIRECTORY,
+    SYMBOLIC_LINK_FLAG_DIRECTORY, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::DataExchange::{
@@ -70,7 +77,7 @@ use windows_sys::Win32::System::DataExchange::{
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::UI::Shell::{
     DragQueryFileW, FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86,
     FOLDERID_Profile, FOLDERID_UserProfiles, FOLDERID_Windows, SHGetKnownFolderPath, DROPFILES,
@@ -146,7 +153,9 @@ const NO_PARTIAL_NAME: &str = "복사하는 동안 쓸 임시 이름을 고를 �
 #[derive(Serialize, Clone)]
 pub struct JobInfo {
     pub id: u64,
-    /// "copy", "move", "relocate" (`start_relocate`) or "restore" (`undo_relocate`)
+    /// "copy", "move", "relocate" (`start_relocate`), "restore"
+    /// (`undo_relocate`) or "link" (`start_dup_link`; also `recover_links`
+    /// at start, telling what it did with merges cut short)
     pub op: String,
     /// "running" | "waiting" (on a conflict) | "done" | "failed" | "cancelled"
     pub state: String,
@@ -165,6 +174,9 @@ pub struct JobInfo {
     /// How many items could not be copied or moved, also those past what
     /// `errors` lists.
     pub error_count: u64,
+    /// "link": bytes of the merged copies now in the Recycle Bin, which come
+    /// free once it is emptied. 0 for the other jobs.
+    pub freed_bytes: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -405,15 +417,28 @@ struct Settings {
     gap: Duration,
     /// Moves within a volume rename instead of copying, and a relocation
     /// must go to another volume. Off only in tests, which have no second
-    /// drive: then any two folders count as on two volumes.
+    /// drive: then any two folders count as on two volumes (and a merge into
+    /// hard links turns every copy down).
     rename: bool,
     /// Makes the junction a relocation leaves at the original's path
     /// (link, pointing to); tests make it fail.
     junction: fn(&Path, &Path) -> io::Result<()>,
+    /// Makes the hard link a merge puts in place of a copy (new name, the
+    /// open file that stays); tests make it fail.
+    hard_link: fn(&Path, &File) -> io::Result<()>,
+    /// Sends the old bytes of a merged copy to the Recycle Bin, once
+    /// `binless` found nothing in the way; tests keep the real bin out of it.
+    bin: fn(&Path) -> Result<(), String>,
 }
 
 impl Settings {
-    const APP: Settings = Settings { gap: Duration::from_millis(100), rename: true, junction: create_junction };
+    const APP: Settings = Settings {
+        gap: Duration::from_millis(100),
+        rename: true,
+        junction: create_junction,
+        hard_link: create_hard_link,
+        bin: to_bin,
+    };
 }
 
 struct Entry {
@@ -510,6 +535,7 @@ fn new_job(op: &str, is_move: bool, sources: Vec<PathBuf>, dest: String, events:
         speed_bps: 0,
         errors: Vec::new(),
         error_count: 0,
+        freed_bytes: 0,
     };
     {
         let mut reg = registry();
@@ -1231,6 +1257,48 @@ fn recycle(src: &Path, target: &Path, existing: &Metadata) -> Result<(), String>
     if kind_of(existing) == Kind::Dir && inside(src, target) {
         return Err(HOLDS_SOURCE.into());
     }
+    let size = || {
+        let mut size = file_len(existing);
+        if kind_of(existing) == Kind::Dir {
+            walk(target, &AtomicBool::new(false), |bytes, _| size += bytes);
+        }
+        size
+    };
+    if let Some(why) = binless(target, size) {
+        return Err(match why {
+            Binless::OddName => ODD_NAME.into(),
+            Binless::NoBin => NO_RECYCLE_BIN.into(),
+            Binless::Disabled => BIN_DISABLED.into(),
+            Binless::TooBig(max) => format!("{BIN_TOO_SMALL} (휴지통 최대 {}MB)", max >> 20),
+            Binless::Unknown => NOT_RECYCLED.into(),
+        });
+    }
+    to_bin(target).map_err(|why| format!("{NOT_RECYCLED}: {why}"))
+}
+
+/// Why an item would not go to the Recycle Bin: Windows would delete it for
+/// good instead, or the shell would take another item.
+enum Binless {
+    /// A name on the way ends in a dot or a space: the shell would take
+    /// `abc.` for `abc`.
+    OddName,
+    /// Not on a local fixed disk (a network share, a USB stick, a SUBST drive).
+    NoBin,
+    /// The bin is switched off there.
+    Disabled,
+    /// Bigger than the bin: its limit in bytes.
+    TooBig(u64),
+    /// Where it really is cannot be told.
+    Unknown,
+}
+
+/// Why `target` cannot go to the Recycle Bin, if so: the checks of
+/// `trash_paths`, on the path as given and where it really is. `size` (its
+/// bytes) is asked only when the bin has a limit.
+fn binless(target: &Path, size: impl FnOnce() -> u64) -> Option<Binless> {
+    if !win::shell_can_name(target) {
+        return Some(Binless::OddName);
+    }
     // trash resolves junctions in the folders above the item, so the bin that
     // counts is the one of the drive the item really is on. Both must do.
     let real = target
@@ -1238,34 +1306,32 @@ fn recycle(src: &Path, target: &Path, existing: &Metadata) -> Result<(), String>
         .and_then(|p| std::fs::canonicalize(win::verbatim(p)).ok())
         .zip(target.file_name())
         .map(|(parent, name)| win::long_path(&parent.join(name).to_string_lossy()));
-    let Some(real) = real else { return Err(NOT_RECYCLED.into()) };
+    let Some(real) = real else { return Some(Binless::Unknown) };
     let mut limit: Option<u64> = None;
     for t in [target.to_string_lossy().into_owned(), real] {
         if !win::has_recycle_bin(&t) {
-            return Err(NO_RECYCLE_BIN.into());
+            return Some(Binless::NoBin);
         }
         // On a disk that has a Recycle Bin, Windows still deletes for good (after
         // its own prompt) when the bin is switched off or the item is bigger than the bin.
         let policy = win::recycle_policy(&t);
         if policy.nuke {
-            return Err(BIN_DISABLED.into());
+            return Some(Binless::Disabled);
         }
         if let Some(max) = policy.max_bytes {
             limit = Some(limit.map_or(max, |l| l.min(max)));
         }
     }
-    if let Some(max) = limit {
-        let mut size = file_len(existing);
-        if kind_of(existing) == Kind::Dir {
-            walk(target, &AtomicBool::new(false), |bytes, _| size += bytes);
-        }
-        if size > max {
-            return Err(format!("{BIN_TOO_SMALL} (휴지통 최대 {}MB)", max >> 20));
-        }
-    }
-    trash::delete(target).map_err(|e| format!("{NOT_RECYCLED}: {e}"))?;
+    limit.filter(|&max| size() > max).map(Binless::TooBig)
+}
+
+/// Sends `target` to the Recycle Bin, once `binless` found nothing in the
+/// way, and checks it is gone from where it was. Fails with the shell's
+/// reason.
+fn to_bin(target: &Path) -> Result<(), String> {
+    trash::delete(target).map_err(|e| e.to_string())?;
     if std::fs::symlink_metadata(win::verbatim(target)).is_ok() {
-        return Err(NOT_RECYCLED.into());
+        return Err("그대로 남아 있어요".into());
     }
     Ok(())
 }
@@ -1713,7 +1779,18 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_OFFLINE;
     use windows_sys::Win32::System::DataExchange::EnumClipboardFormats;
 
-    const TEST: Settings = Settings { gap: Duration::ZERO, rename: true, junction: create_junction };
+    const TEST: Settings =
+        Settings { gap: Duration::ZERO, rename: true, junction: create_junction, hard_link: create_hard_link, bin: test_bin };
+
+    /// The Recycle Bin of tests, which keep the real one out of it: `x\.c.ff-link`
+    /// goes to `xin .c.ff-link`.
+    fn test_bin(p: &Path) -> Result<(), String> {
+        let folder = p.parent().unwrap();
+        let bin = folder.parent().unwrap().join("bin");
+        fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+        let name = format!("{} {}", folder.file_name().unwrap().to_string_lossy(), p.file_name().unwrap().to_string_lossy());
+        fs::rename(win::verbatim(p), bin.join(name)).map_err(|e| e.to_string())
+    }
 
     /// Answers conflicts from a list (then "cancel"), or not at all with
     /// `hold`; can cancel its job halfway through a file.
@@ -3137,6 +3214,553 @@ mod tests {
         let long = "x".repeat(MAX_NAME);
         let cut = marked_name(&Path::new(r"C:\d").join(&long), false, OLD_EXT, 3).unwrap();
         assert_eq!(cut.file_name().unwrap().to_string_lossy().encode_utf16().count(), MAX_NAME);
+    }
+
+    // ---- v0.8.2: duplicates made into hard links ------------------------------
+
+    /// Bytes that differ from file to file of one `seed`.
+    fn content(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] ^ seed).collect()
+    }
+
+    /// What the duplicate finder makes of `paths` as they are now.
+    fn search(paths: &[&Path]) -> Vec<dups::DupGroup> {
+        let cands = paths
+            .iter()
+            .map(|p| {
+                let m = fs::metadata(p).unwrap();
+                dups::Candidate { path: p.to_string_lossy().into_owned(), size: m.len(), modified: m.last_write_time() as i64 }
+            })
+            .collect();
+        dups::find_now(cands).unwrap().groups
+    }
+
+    fn link_group(keep: &Path, others: &[&Path]) -> LinkGroup {
+        LinkGroup { keep: keep.to_string_lossy().into_owned(), others: others.iter().map(|p| p.to_string_lossy().into_owned()).collect() }
+    }
+
+    /// The pages of merges in the test folder that holds `keep`'s folder.
+    fn book_for(keep: &Path) -> LinkBook {
+        LinkBook(keep.parent().unwrap().parent().unwrap().join("merges"))
+    }
+
+    /// Merges `others` into `keep` as the finder `found` them and waits for
+    /// the job, which leaves no page behind.
+    fn merge(found: &[dups::DupGroup], keep: &Path, others: &[&Path], settings: Settings, cancel_mid_file: bool) -> JobInfo {
+        let sink = Sink { cancel_mid_file, ..Sink::default() };
+        let book = book_for(keep);
+        let job = wait(begin_link(vec![link_group(keep, others)], found, sink, settings, &book).unwrap());
+        assert!(book.pages().is_empty(), "{:?}", book.pages());
+        job
+    }
+
+    fn key(p: &Path) -> dups::FileKey {
+        key_at(p).unwrap()
+    }
+
+    fn names_of(p: &Path) -> u32 {
+        dups::facts(&File::open(p).unwrap()).unwrap().links
+    }
+
+    fn attrs(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().file_attributes()
+    }
+
+    /// `a\name` and `b\name`, both `bytes`, and what the finder makes of them.
+    fn twins(t: &Temp, name: &str, bytes: &[u8]) -> (PathBuf, PathBuf, Vec<dups::DupGroup>) {
+        let (keep, copy) = (t.dir("a").join(name), t.dir("b").join(name));
+        fs::write(&keep, bytes).unwrap();
+        fs::write(&copy, bytes).unwrap();
+        let found = search(&[&keep, &copy]);
+        assert_eq!(found.len(), 1);
+        (keep, copy, found)
+    }
+
+    /// Both files as they were: their own contents, not one file, nothing next to them.
+    fn untouched(keep: &Path, copy: &Path, keep_bytes: &[u8], copy_bytes: &[u8]) {
+        assert_eq!(fs::read(keep).unwrap(), keep_bytes);
+        assert_eq!(fs::read(copy).unwrap(), copy_bytes);
+        assert_ne!(key(keep), key(copy));
+        assert_eq!((names_of(keep), names_of(copy)), (1, 1));
+        let name = copy.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(copy.parent().unwrap()), [name]);
+    }
+
+    #[test]
+    fn duplicates_become_one_file_with_two_names() {
+        let t = Temp::new("link");
+        let data = content(3 << 20, 1);
+        let (keep, copy) = (t.dir("a").join("model.gguf"), t.dir("b").join("model.gguf"));
+        let third = t.dir("c").join("model.gguf");
+        for p in [&keep, &copy, &third] {
+            fs::write(p, &data).unwrap();
+        }
+        // A read-only file that stays takes links too.
+        set_attrs(&keep, FILE_ATTRIBUTE_READONLY);
+        let found = search(&[&keep, &copy, &third]);
+        assert_eq!(found.len(), 1);
+        assert_ne!(key(&keep), key(&copy));
+
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        assert_eq!((job.op.as_str(), job.state.as_str()), ("link", "done"), "{:?}", job.errors);
+        assert_eq!((job.done_items, job.total_items), (1, 1));
+        assert_eq!((job.done_bytes, job.total_bytes), (6 << 20, 6 << 20));
+        assert_eq!(Path::new(&job.dest), t.0.as_path());
+        // One file under two names, each opening all of it; the name merged
+        // has the attributes of the file that stays.
+        assert_eq!(key(&keep), key(&copy));
+        assert!(win::same_entry(&keep, &copy));
+        assert_eq!(names_of(&keep), 2);
+        assert_eq!(fs::read(&keep).unwrap(), data);
+        assert_eq!(fs::read(&copy).unwrap(), data);
+        assert!(fs::metadata(&copy).unwrap().permissions().readonly());
+        assert_eq!(names(&t.0.join("a")), ["model.gguf"]);
+        // The copy's own bytes went to the bin, with its own attributes (not hidden).
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert_eq!(names(&t.0.join("b")), ["model.gguf"]);
+        let binned = t.0.join("bin").join("b .model.gguf.ff-link");
+        assert_eq!(fs::read(&binned).unwrap(), data);
+        assert_eq!(attrs(&binned) & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY), 0);
+        assert_eq!(job.freed_bytes, 3 << 20);
+
+        // Again from the same result: the merged copy is one file with it
+        // already, and the third one is merged now.
+        let again = merge(&found, &keep, &[&copy, &third], TEST, false);
+        assert_eq!(again.state, "done", "{:?}", again.errors);
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!((again.done_items, again.total_items), (2, 2));
+        assert_eq!(key(&third), key(&keep));
+        assert_eq!(names_of(&keep), 3);
+        assert_eq!(again.freed_bytes, 3 << 20);
+        assert_eq!(names(&t.0.join("bin")), ["b .model.gguf.ff-link", "c .model.gguf.ff-link"]);
+    }
+
+    #[test]
+    fn a_copy_the_bin_turns_down_stays_hidden_and_is_reported() {
+        let t = Temp::new("link-left");
+        let data = content(300_000, 8);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let full = Settings { bin: |_| Err("휴지통이 받지 않았어요".into()), ..TEST };
+        let job = merge(&found, &keep, &[&copy], full, false);
+        // Merged all the same: one file under both names.
+        assert_eq!(job.state, "done");
+        assert_eq!(key(&keep), key(&copy));
+        assert_eq!(fs::read(&copy).unwrap(), data);
+        let left = t.0.join("b").join(".x.bin.ff-link");
+        assert_eq!(job.errors, [(left.to_string_lossy().into_owned(), format!("{LINK_LEFT}(.x.bin.ff-link)을 휴지통에 넣지 못했어요: 휴지통이 받지 않았어요"))]);
+        assert_eq!(fs::read(&left).unwrap(), data);
+        assert_ne!(key(&left), key(&keep));
+        assert!(attrs(&left) & FILE_ATTRIBUTE_HIDDEN != 0);
+        assert_eq!(job.freed_bytes, 0);
+    }
+
+    /// Puts a small file in the Recycle Bin, so it runs only when asked:
+    /// `cargo test a_merged_copy_goes -- --ignored`
+    #[test]
+    #[ignore]
+    fn a_merged_copy_goes_to_the_recycle_bin() {
+        let t = Temp::new("link-bin");
+        let data = content(50_000, 9);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let job = merge(&found, &keep, &[&copy], Settings { bin: to_bin, ..TEST }, false);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert_eq!(key(&keep), key(&copy));
+        assert_eq!(names(&t.0.join("b")), ["x.bin"]);
+        assert_eq!(job.freed_bytes, 50_000);
+    }
+
+    #[test]
+    fn copies_that_differ_are_turned_down_before_anything_is_touched() {
+        let t = Temp::new("link-differ");
+        let data = content(1 << 20, 2);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        // Another content since the search, with the same size and modified time.
+        let when = fs::metadata(&copy).unwrap().modified().unwrap();
+        let mut other = data.clone();
+        other[700_000] ^= 1;
+        fs::write(&copy, &other).unwrap();
+        File::options().write(true).open(&copy).unwrap().set_modified(when).unwrap();
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), LINK_DIFFERENT.to_string())]);
+        assert_eq!(job.freed_bytes, 0);
+        untouched(&keep, &copy, &data, &other);
+
+        // A modified time that changed is turned down without reading.
+        File::options().write(true).open(&copy).unwrap().set_modified(when + Duration::from_secs(5)).unwrap();
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), LINK_CHANGED.to_string())]);
+        assert_eq!(job.done_bytes, job.total_bytes);
+        untouched(&keep, &copy, &data, &other);
+
+        // When the file that stays changed, none of its group is merged.
+        fs::write(&copy, &data).unwrap();
+        let found = search(&[&keep, &copy]);
+        let when = fs::metadata(&keep).unwrap().modified().unwrap();
+        fs::write(&keep, &other).unwrap();
+        File::options().write(true).open(&keep).unwrap().set_modified(when).unwrap();
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        assert_eq!(job.state, "failed");
+        let (at, why) = &job.errors[0];
+        assert_eq!((Path::new(at), why.as_str()), (copy.as_path(), format!("{KEEP_FAILED}(x.bin) — {LINK_CHANGED}").as_str()));
+        untouched(&keep, &copy, &other, &data);
+    }
+
+    #[test]
+    fn files_in_use_are_turned_down_before_they_are_read() {
+        let t = Temp::new("link-busy");
+        let data = content(2 << 20, 10);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let busy = format!("{LINK_NO_OPEN}: 다른 프로그램이 쓰고 있어요");
+        // A copy a program holds open without letting it be renamed.
+        let held = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&copy).unwrap();
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        drop(held);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), busy.clone())]);
+        // Only the file that stays was read.
+        assert_eq!(job.done_bytes, job.total_bytes);
+        untouched(&keep, &copy, &data, &data);
+        // A file that stays which a program is writing to: its whole group waits.
+        let writing = fs::OpenOptions::new().write(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&keep).unwrap();
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        drop(writing);
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), format!("{KEEP_FAILED}(x.bin) — {busy}"))]);
+        untouched(&keep, &copy, &data, &data);
+        // Let go of, both merge.
+        let job = merge(&found, &keep, &[&copy], TEST, false);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert_eq!(key(&keep), key(&copy));
+    }
+
+    #[test]
+    fn copies_on_another_drive_are_turned_down() {
+        let t = Temp::new("link-drive");
+        let data = content(100_000, 3);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        // Tests have no second drive: ACROSS takes any two files for two drives.
+        let job = merge(&found, &keep, &[&copy], ACROSS, false);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), LINK_OTHER_DRIVE.to_string())]);
+        untouched(&keep, &copy, &data, &data);
+    }
+
+    #[test]
+    fn a_cancelled_merge_leaves_both_files_as_they_were() {
+        let t = Temp::new("link-cancel");
+        let data = content(3 << 20, 4);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let job = merge(&found, &keep, &[&copy], TEST, true);
+        assert_eq!(job.state, "cancelled");
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert!(job.done_bytes < job.total_bytes);
+        assert_eq!(job.freed_bytes, 0);
+        untouched(&keep, &copy, &data, &data);
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_made_puts_the_copy_back() {
+        let t = Temp::new("link-undo");
+        let data = content(200_000, 5);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        set_attrs(&copy, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        let refused = Settings { hard_link: |_, _| Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)), ..TEST };
+        let job = merge(&found, &keep, &[&copy], refused, false);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), format!("{LINK_NOT_MADE}: 권한이 없어요"))]);
+        untouched(&keep, &copy, &data, &data);
+        // Its name and its own attributes back, not hidden.
+        assert_eq!(attrs(&copy) & SETTABLE, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+
+        // A link made that then does not hold is taken away again.
+        let made = Settings {
+            hard_link: |link, existing| {
+                create_hard_link(link, existing)?;
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32))
+            },
+            ..TEST
+        };
+        set_attrs(&keep, FILE_ATTRIBUTE_READONLY);
+        let job = merge(&found, &keep, &[&copy], made, false);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), format!("{LINK_NOT_MADE}: 권한이 없어요"))]);
+        untouched(&keep, &copy, &data, &data);
+        assert_eq!(attrs(&copy) & SETTABLE, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        assert_eq!(attrs(&keep) & SETTABLE, FILE_ATTRIBUTE_READONLY);
+    }
+
+    /// `link`'s neighbour folder `folder` in the test folder (`b\x` gives `folder\x`).
+    fn beside(link: &Path, folder: &str) -> PathBuf {
+        link.parent().unwrap().parent().unwrap().join(folder).join(link.file_name().unwrap())
+    }
+
+    #[test]
+    fn the_link_leads_to_the_file_that_was_read_even_if_another_took_its_path() {
+        let t = Temp::new("link-swapped");
+        let data = content(400_000, 11);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let read = key(&keep);
+        // Once both were read, a program renames the file that stays away and
+        // puts a new one at its path (an update of its own, say).
+        let swapped = Settings {
+            hard_link: |link, existing| {
+                let keep = beside(link, "a");
+                fs::rename(&keep, keep.with_extension("old"))?;
+                fs::write(&keep, b"something else")?;
+                create_hard_link(link, existing)
+            },
+            ..TEST
+        };
+        let job = merge(&found, &keep, &[&copy], swapped, false);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        // The copy's name leads to the file that was compared, not to the new one.
+        let moved = keep.with_extension("old");
+        assert_eq!((key(&copy), key(&moved)), (read, read));
+        assert_eq!(fs::read(&copy).unwrap(), data);
+        assert_eq!(fs::read(&keep).unwrap(), b"something else");
+        assert_eq!(names_of(&keep), 1);
+    }
+
+    #[test]
+    fn a_link_that_leads_elsewhere_is_taken_away_again() {
+        let t = Temp::new("link-astray");
+        let data = content(150_000, 12);
+        let (keep, copy, found) = twins(&t, "x.bin", &data);
+        let stranger = t.dir("z").join("x.bin");
+        fs::write(&stranger, b"another file").unwrap();
+        // A link call that went to whatever was at a path.
+        let astray = Settings { hard_link: |link, _| fs::hard_link(beside(link, "z"), link), ..TEST };
+        let job = merge(&found, &keep, &[&copy], astray, false);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(copy.to_string_lossy().into_owned(), format!("{LINK_NOT_MADE}: {LINK_ELSEWHERE}"))]);
+        // The name it made is gone again, the copy has its own back, the other file is as it was.
+        untouched(&keep, &copy, &data, &data);
+        assert_eq!(names_of(&stranger), 1);
+        assert_eq!(fs::read(&stranger).unwrap(), b"another file");
+    }
+
+    #[test]
+    fn a_files_last_name_is_never_taken_away() {
+        let t = Temp::new("link-last");
+        let only = t.0.join("only.bin");
+        fs::write(&only, b"x").unwrap();
+        assert!(!unlink_extra(&only));
+        assert_eq!(fs::read(&only).unwrap(), b"x");
+        assert!(!unlink_extra(&t.0));
+        let second = t.0.join("second.bin");
+        fs::hard_link(&only, &second).unwrap();
+        set_attrs(&only, FILE_ATTRIBUTE_READONLY);
+        assert!(unlink_extra(&second));
+        assert_eq!(names(&t.0), ["only.bin"]);
+        assert_eq!(attrs(&only) & SETTABLE, FILE_ATTRIBUTE_READONLY);
+        set_attrs(&only, FILE_ATTRIBUTE_NORMAL);
+    }
+
+    /// A merge of `copy` into `keep` cut short once the copy had its hidden
+    /// name and, when `linked`, its own name had become a link: the page it
+    /// leaves in `book`, and what is on it.
+    fn cut_short_merge(book: &LinkBook, keep: &Path, copy: &Path, linked: bool) -> Switch {
+        let m = fs::metadata(copy).unwrap();
+        let s = Switch {
+            path: copy.into(),
+            temp: marked_name(copy, true, LINK_EXT, 1).unwrap(),
+            keep: keep.into(),
+            kept: key(keep),
+            copy: key(copy),
+            attrs: attrs(copy),
+            size: m.len(),
+            modified: m.last_write_time() as i64,
+        };
+        let mut page = book.page().unwrap();
+        page.write(&s).unwrap();
+        fs::rename(copy, &s.temp).unwrap();
+        set_attrs(&s.temp, s.attrs | FILE_ATTRIBUTE_HIDDEN);
+        if linked {
+            fs::hard_link(keep, copy).unwrap();
+        }
+        // Let go of with the switch on it, as by a process that ended.
+        drop(page);
+        assert_eq!(book.pages().len(), 1);
+        s
+    }
+
+    /// What `recover_links` does at a start, with the test bin `bin`: its job, if one.
+    fn next_start(book: &LinkBook, bin: fn(&Path) -> Result<(), String>) -> Option<JobInfo> {
+        mend_links(book, bin, Sink::default()).map(wait)
+    }
+
+    #[test]
+    fn merges_cut_short_are_put_right_at_the_next_start() {
+        let t = Temp::new("link-recover");
+        let book = LinkBook(t.0.join("merges"));
+        let data = content(250_000, 13);
+        let (keep, copy, _) = twins(&t, "x.bin", &data);
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+        set_attrs(&copy, FILE_ATTRIBUTE_ARCHIVE);
+
+        // Cut between the rename and the link: the copy gets its name back.
+        let s = cut_short_merge(&book, &keep, &copy, false);
+        assert!(gone(&copy));
+        let job = next_start(&book, test_bin).unwrap();
+        assert_eq!((job.op.as_str(), job.state.as_str()), ("link", "failed"));
+        assert_eq!(job.errors, [(shown_at(&copy), LINK_CUT_BACK.to_string())]);
+        assert!(book.pages().is_empty());
+        untouched(&keep, &copy, &data, &data);
+        assert_eq!(attrs(&copy) & SETTABLE, FILE_ATTRIBUTE_ARCHIVE);
+        assert!(gone(&s.temp));
+        // Nothing left: the next start does nothing.
+        assert!(next_start(&book, test_bin).is_none());
+
+        // Cut once the link was made: the copy's old bytes go to the bin.
+        let s = cut_short_merge(&book, &keep, &copy, true);
+        let job = next_start(&book, test_bin).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(job.errors.is_empty());
+        assert_eq!(job.freed_bytes, 250_000);
+        assert_eq!(key(&copy), key(&keep));
+        assert!(gone(&s.temp));
+        let binned = t.0.join("bin").join("b .x.bin.ff-link");
+        assert_eq!(fs::read(&binned).unwrap(), data);
+        assert_eq!(attrs(&binned) & FILE_ATTRIBUTE_HIDDEN, 0);
+        assert!(book.pages().is_empty());
+    }
+
+    #[test]
+    fn what_the_next_start_cannot_put_right_is_told() {
+        let t = Temp::new("link-recover-left");
+        let book = LinkBook(t.0.join("merges"));
+        let data = content(120_000, 14);
+        let (keep, copy, _) = twins(&t, "x.bin", &data);
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+
+        // The bin turns the old bytes down: they stay, hidden, and the user is told.
+        let s = cut_short_merge(&book, &keep, &copy, true);
+        let job = next_start(&book, |_| Err("휴지통이 받지 않았어요".into())).unwrap();
+        assert_eq!(job.state, "done");
+        let left = format!("{LINK_LEFT}(.x.bin.ff-link)을 휴지통에 넣지 못했어요: 휴지통이 받지 않았어요");
+        assert_eq!(job.errors, [(shown_at(&s.temp), left)]);
+        assert_eq!(job.freed_bytes, 0);
+        assert!(attrs(&s.temp) & FILE_ATTRIBUTE_HIDDEN != 0);
+        assert_eq!(key(&copy), key(&keep));
+        assert!(book.pages().is_empty());
+        set_attrs(&s.temp, FILE_ATTRIBUTE_NORMAL);
+        fs::remove_file(&s.temp).unwrap();
+        fs::remove_file(&copy).unwrap();
+        fs::write(&copy, &data).unwrap();
+
+        // A copy that cannot get its name back yet (a program holds it without
+        // letting it be renamed): the page stays, and the next start does it.
+        let s = cut_short_merge(&book, &keep, &copy, false);
+        let held = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&s.temp).unwrap();
+        let job = next_start(&book, test_bin).unwrap();
+        drop(held);
+        assert_eq!(job.state, "failed");
+        let stuck = format!("{LINK_CUT_STUCK}: 다른 프로그램이 쓰고 있어요. 파일은 지금 {}에 있어요", shown_at(&s.temp));
+        assert_eq!(job.errors, [(shown_at(&copy), stuck)]);
+        assert_eq!(book.pages().len(), 1);
+        let job = next_start(&book, test_bin).unwrap();
+        assert_eq!(job.errors, [(shown_at(&copy), LINK_CUT_BACK.to_string())]);
+        untouched(&keep, &copy, &data, &data);
+        assert!(book.pages().is_empty());
+
+        // Its name taken meanwhile by another file: both stay as they are.
+        let s = cut_short_merge(&book, &keep, &copy, false);
+        fs::write(&copy, b"new").unwrap();
+        let job = next_start(&book, test_bin).unwrap();
+        let taken = format!("{LINK_CUT_TAKEN}. 원래 파일은 지금 {}에 있어요", shown_at(&s.temp));
+        assert_eq!(job.errors, [(shown_at(&copy), taken)]);
+        assert_eq!(fs::read(&copy).unwrap(), b"new");
+        assert_eq!(fs::read(&s.temp).unwrap(), data);
+        assert!(book.pages().is_empty());
+    }
+
+    #[test]
+    fn pages_of_merges_still_running_are_left_alone() {
+        let t = Temp::new("link-recover-busy");
+        let book = LinkBook(t.0.join("merges"));
+        let data = content(60_000, 15);
+        let (keep, copy, _) = twins(&t, "x.bin", &data);
+        // A merge of this process, in the middle of its switch.
+        let mut page = book.page().unwrap();
+        let s = Switch {
+            path: copy.clone(),
+            temp: marked_name(&copy, true, LINK_EXT, 1).unwrap(),
+            keep: keep.clone(),
+            kept: key(&keep),
+            copy: key(&copy),
+            attrs: attrs(&copy),
+            size: 60_000,
+            modified: fs::metadata(&copy).unwrap().last_write_time() as i64,
+        };
+        page.write(&s).unwrap();
+        fs::rename(&copy, &s.temp).unwrap();
+        assert!(next_start(&book, test_bin).is_none());
+        assert!(gone(&copy));
+        assert!(!linking_in(&book), "this process's own merge is no other's");
+        // Another process's.
+        let other = hold_exclusive(&book.0.join("1-0-1.json")).unwrap();
+        assert!(linking_in(&book));
+        drop(other);
+        assert!(!linking_in(&book));
+        // Pages with nothing on them, or only half written, just go.
+        fs::write(book.0.join("1-0-2.json"), b"{\"path\":").unwrap();
+        fs::rename(&s.temp, &copy).unwrap();
+        page.clear();
+        drop(page);
+        assert!(next_start(&book, test_bin).is_none());
+        assert!(book.pages().is_empty());
+        untouched(&keep, &copy, &data, &data);
+    }
+
+    #[test]
+    fn merges_are_checked_against_the_search_before_they_start() {
+        let t = Temp::new("link-plan");
+        let (x, y) = (content(10_000, 6), content(10_000, 7));
+        let (x1, x2, y1, y2) = (t.0.join("x1"), t.0.join("x2"), t.0.join("y1"), t.0.join("y2"));
+        for (p, bytes) in [(&x1, &x), (&x2, &x), (&y1, &y), (&y2, &y)] {
+            fs::write(p, bytes).unwrap();
+        }
+        let found = search(&[&x1, &x2, &y1, &y2]);
+        assert_eq!(found.len(), 2);
+        let book = LinkBook(t.0.join("merges"));
+        let refused = |groups: Vec<LinkGroup>| match begin_link(groups, &found, Sink::default(), TEST, &book) {
+            Ok(id) => panic!("job {id} started: {:?}", wait(id).errors),
+            Err(why) => why,
+        };
+        let shown = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(refused(vec![link_group(&x1, &[])]), NOTHING_TO_LINK);
+        let many: Vec<String> = (0..=MAX_LINKS).map(|i| format!(r"C:\x\{i}")).collect();
+        assert!(refused(vec![LinkGroup { keep: shown(&x1), others: many }]).starts_with(TOO_MANY_LINKS));
+        let stranger = t.0.join("stranger");
+        assert_eq!(refused(vec![link_group(&x1, &[&stranger])]), format!("{NOT_IN_RESULT}: {}", shown(&stranger)));
+        assert_eq!(refused(vec![link_group(&x1, &[&x1])]), format!("{LINK_TWICE}: {}", shown(&x1)));
+        // The same file in two groups, also written another way.
+        let upper = PathBuf::from(shown(&x2).to_uppercase());
+        assert_eq!(refused(vec![link_group(&x1, &[&x2]), link_group(&upper, &[&x1])]), format!("{LINK_TWICE}: {}", shown(&upper)));
+        assert_eq!(refused(vec![link_group(&x1, &[&y1])]), format!("{NOT_ONE_GROUP}: {}", shown(&y1)));
+        // Paths are taken as the search wrote them.
+        let plans = plan_links(vec![link_group(&upper, &[&x1]), link_group(&y2, &[&y1])], &found).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].keep.0, x2);
+        assert_eq!(plans[0].others.iter().map(|(p, _)| p.as_path()).collect::<Vec<_>>(), [x1.as_path()]);
+        assert_eq!((plans[1].size, plans[1].hash), (10_000, *blake3::hash(&y).as_bytes()));
+        assert_eq!(plans[1].keep.1, fs::metadata(&y2).unwrap().last_write_time() as i64);
+        assert_eq!(common_folder([&x1, &y2, &t.0.join("sub").join("z")]), t.0);
+        assert_eq!(common_folder([&PathBuf::from(r"C:\a\b\c"), &PathBuf::from(r"D:\a\b")]), PathBuf::from(r"C:\"));
+    }
+
+    #[test]
+    fn files_of_windows_itself_are_never_merged() {
+        assert!(in_windows(Path::new(r"C:\Windows\System32\drivers\etc\hosts"), None));
+        assert!(in_windows(Path::new(r"D:\Recovery\x.wim"), None));
+        let windows = known_folder(&FOLDERID_Windows);
+        if let Some(w) = &windows {
+            assert!(in_windows(&w.join("notepad.exe"), Some(w)));
+            assert!(matches!(open_for_link(&w.join("notepad.exe"), 1, 0, Some(w), false), Err(why) if why == LINK_SYSTEM));
+        }
+        let t = Temp::new("link-system");
+        assert!(!in_windows(&t.0.join("x.bin"), windows.as_deref()));
     }
 }
 
@@ -4604,5 +5228,938 @@ impl Guards {
     /// Why nothing may be put into the folder `dir`, if so.
     pub(crate) fn why_into(&self, dir: &Path) -> Option<&'static str> {
         guarded_among(dir, true, &self.0).or_else(|| real_path(dir).and_then(|real| guarded_among(&real, true, &self.0)))
+    }
+}
+
+// ---- v0.8.2: duplicates made into hard links ------------------------------------
+//
+// `start_dup_link` (job op "link", the usual "job-progress" events, cancel
+// with `cancel_job`) takes, for groups the duplicate finder found (dups.rs),
+// the file that stays and the copies to merge into it. Each copy is replaced
+// by an NTFS hard link to the file that stays: its path still opens the same
+// content, stored once. Sizes, modified times and hashes come from the
+// finder's own result, not from the window. For each copy:
+//
+// 1. look, changing nothing: both are plain files (no link or other reparse
+//    point, nothing only in the cloud) outside Windows's own folders, on one
+//    local NTFS volume, of the size and modified time the finder saw, and not
+//    one file already (then there is nothing to do); the copy has no other
+//    name (merging it would free nothing), the file that stays has room for
+//    one more (NTFS: 1023), and the Recycle Bin takes the copy;
+// 2. read both whole (blake3) through handles that let nobody write to them
+//    until the copy is merged, and compare them with the finder's hash;
+// 3. write down what is about to happen (`LinkBook`), all the way to the
+//    disk; rename the copy to a hidden `.name.ff-link` next to it, make the
+//    hard link under its name from the handle of the file that stays (so it
+//    is the very file that was read, even if another one has been put at its
+//    path since), and check that the name leads to it;
+// 4. send `.name.ff-link`, with the copy's own attributes back, to the
+//    Recycle Bin (the checks of `trash_paths`): its bytes come free once the
+//    bin is emptied (`JobInfo.freed_bytes`). Then the note goes.
+//
+// Nothing is changed before step 3. A step 3 that fails is undone: the name
+// made is taken away again (the one the link call made, whatever it leads
+// to, or one of the file that stays; never a file's last name) and the copy
+// gets its name and attributes back; when that cannot be done the reason
+// says where the copy is. A copy the bin turns down at step 4 stays where it
+// is, hidden, and the job's errors say so (LINK_LEFT). A merge cut short in
+// steps 3 or 4 (a crash, a power cut, the app killed) is put right at the
+// next start from its note (`recover_links`): the copy gets its name back,
+// or, when the link was made, its old bytes go to the bin; what is left
+// shows in a job of its own. The merged name has the attributes, times and
+// permissions of the file that stays: a hard link is one file under two
+// names, so a program that writes into it in place changes it under both.
+// Cancel works between copies and while reading.
+
+/// The hidden name a merged copy has until it is in the Recycle Bin.
+const LINK_EXT: &str = ".ff-link";
+/// Copies one merge takes at most.
+const MAX_LINKS: usize = 10_000;
+/// Names an NTFS file can have.
+const MAX_FILE_NAMES: u32 = 1023;
+/// Read size of the full hash.
+const HASH_BUF: usize = 1 << 20;
+
+const NOTHING_TO_LINK: &str = "합칠 파일이 없어요";
+const TOO_MANY_LINKS: &str = "한 번에 합칠 수 있는 파일은 10,000개까지예요";
+const NO_DUP_RESULT: &str = "중복 찾기 결과를 찾을 수 없어요. 중복을 다시 찾아 주세요";
+const NOT_IN_RESULT: &str = "중복 찾기 결과에 없는 파일이에요";
+const NOT_ONE_GROUP: &str = "남길 파일과 같은 묶음(내용이 같은 파일들)에 있는 파일이 아니에요";
+const LINK_TWICE: &str = "같은 파일이 두 번 들어 있어요";
+/// The start of the reason given to every copy of a group whose file that
+/// stays could not be used.
+const KEEP_FAILED: &str = "남길 파일";
+const LINK_SYSTEM: &str = "Windows 시스템 폴더의 파일은 합치지 않아요";
+const LINK_NOT_PLAIN: &str = "링크나 특수한 파일이라서 합치지 않았어요";
+const LINK_CLOUD: &str = "온라인 전용 파일이라서 합치지 않았어요 (읽으면 내려받게 돼요)";
+const LINK_GONE: &str = "중복을 찾은 뒤 없어져서 합치지 않았어요";
+const LINK_CHANGED: &str = "중복을 찾은 뒤 바뀌어서 합치지 않았어요";
+const LINK_NO_OPEN: &str = "파일을 열 수 없어서 합치지 않았어요";
+const LINK_NO_READ: &str = "파일을 다 읽지 못해서 합치지 않았어요";
+const LINK_NOT_NTFS: &str = "NTFS 드라이브가 아니라서 합칠 수 없어요 (하드 링크를 만들 수 없어요)";
+const LINK_OTHER_DRIVE: &str = "남길 파일과 다른 드라이브에 있어서 합칠 수 없어요 (하드 링크는 한 드라이브 안에서만 만들 수 있어요)";
+const LINK_HAS_NAMES: &str = "이 파일에는 다른 이름(하드 링크)도 있어서 합쳐도 공간이 생기지 않아요";
+const LINK_FULL: &str = "남길 파일의 이름(하드 링크)이 1023개로 꽉 차서 더 합칠 수 없어요";
+const LINK_DIFFERENT: &str = "내용이 남길 파일과 달라서 합치지 않았어요";
+const LINK_ODD_NAME: &str = "이름이 점(.)이나 공백으로 끝나는 폴더에 있어서 합치지 않았어요 (남는 사본을 휴지통으로 옮길 수 없어요)";
+const LINK_NO_BIN: &str = "이 드라이브에는 휴지통이 없어서 합치지 않았어요 (합치면 남는 사본을 되돌릴 수 없어요)";
+const LINK_BIN_OFF: &str =
+    "이 드라이브는 휴지통을 쓰지 않도록 설정돼 있어서 합치지 않았어요 (합치면 남는 사본을 되돌릴 수 없어요)";
+const LINK_BIN_SMALL: &str = "휴지통보다 커서 합치지 않았어요. 휴지통 속성에서 최대 크기를 늘리면 합칠 수 있어요";
+const LINK_BIN_UNKNOWN: &str = "남는 사본을 휴지통으로 옮길 수 있는지 확인할 수 없어서 합치지 않았어요";
+const LINK_NO_RENAME: &str = "이름을 바꾸지 못해서 합치지 않았어요";
+const LINK_NOT_MADE: &str = "하드 링크를 만들지 못해서 합치지 않았어요";
+const LINK_ELSEWHERE: &str = "만든 이름이 남길 파일로 이어지지 않아요";
+/// The start of the reason for a copy that was merged but whose old bytes
+/// the Recycle Bin turned down; the path is where they are.
+const LINK_LEFT: &str = "합쳤지만 남은 사본";
+const LINK_NO_BOOK: &str = "합치는 기록을 남길 수 없어서 합치지 않았어요";
+const LINK_NOT_RECORDED: &str = "합치는 기록을 저장하지 못해서 합치지 않았어요";
+// What the start after a merge cut short (`recover_links`) did with a copy.
+const LINK_CUT_BACK: &str = "지난번에 합치던 중에 fine-file이 꺼져서, 합치지 않고 원래대로 돌려놓았어요";
+const LINK_CUT_STUCK: &str = "지난번에 합치던 중에 fine-file이 꺼졌는데, 원래대로 되돌리지 못했어요";
+const LINK_CUT_TAKEN: &str = "지난번에 합치던 중에 fine-file이 꺼진 뒤 이 이름에 다른 파일이 생겨서 되돌리지 않았어요";
+const LINK_CUT_GONE: &str = "지난번에 합치던 중에 fine-file이 꺼진 뒤 이 파일이 없어졌어요";
+const LINK_CUT_CHANGED: &str = "합친 뒤에 바뀌어서 그대로 두었어요";
+
+/// One group of `start_dup_link`, with paths as the duplicate finder gave
+/// them (DupFile.path).
+#[derive(Deserialize)]
+pub struct LinkGroup {
+    /// The file that stays as it is.
+    pub keep: String,
+    /// Its copies, each to become a hard link to `keep`.
+    pub others: Vec<String>,
+}
+
+/// Makes each copy in `groups` a hard link to the file its group keeps, so
+/// that every path still opens the same content, stored once (see above).
+/// `dup` is the duplicate search the groups come from (DupReport.id); without
+/// it, the newest search that has them. The groups are checked against that
+/// search's result before a job (op "link") starts; returns its id.
+#[tauri::command]
+pub async fn start_dup_link(app: AppHandle, groups: Vec<LinkGroup>, dup: Option<u64>) -> Result<u64, String> {
+    blocking(move || {
+        let found = dups::found(dup).map_err(|_| NO_DUP_RESULT.to_string())?;
+        begin_link(groups, &found, app, Settings::APP, &LinkBook::app())
+    })
+    .await?
+}
+
+/// Checks `groups` against what the duplicate finder `found`, then starts
+/// the job, which writes down in `book` what it is doing.
+fn begin_link(groups: Vec<LinkGroup>, found: &[dups::DupGroup], events: impl Events, settings: Settings, book: &LinkBook) -> Result<u64, String> {
+    let plans = plan_links(groups, found)?;
+    let mut page = book.page()?;
+    let all = plans.iter().flat_map(|p| std::iter::once(&p.keep.0).chain(p.others.iter().map(|(o, _)| o)));
+    let dest = shown(&common_folder(all));
+    let run = new_job("link", false, Vec::new(), dest, events, settings);
+    launch(run, move |run| run.link_all(&plans, &mut page))
+}
+
+/// One group to merge, as the duplicate finder found it.
+struct LinkPlan {
+    size: u64,
+    /// blake3 of the whole content.
+    hash: [u8; 32],
+    /// The file that stays, with its modified time (FILETIME) as the finder saw it...
+    keep: (PathBuf, i64),
+    /// ...and the copies, with theirs.
+    others: Vec<(PathBuf, i64)>,
+}
+
+/// What the job does for `groups`: each file in them must be in a group the
+/// duplicate finder `found` (the first group that has it counts), each group's
+/// files in one such group, and no file twice.
+fn plan_links(groups: Vec<LinkGroup>, found: &[dups::DupGroup]) -> Result<Vec<LinkPlan>, String> {
+    let count: usize = groups.iter().map(|g| g.others.len()).sum();
+    if count == 0 {
+        return Err(NOTHING_TO_LINK.into());
+    }
+    if count > MAX_LINKS {
+        return Err(format!("{TOO_MANY_LINKS} (고른 파일 {count}개)"));
+    }
+    let text = |p: &str| p.strip_prefix(r"\\?\").unwrap_or(p).trim_end_matches('\\').to_lowercase();
+    let mut files: HashMap<String, (usize, &dups::DupFile)> = HashMap::new();
+    for (i, g) in found.iter().enumerate() {
+        for f in &g.files {
+            files.entry(text(&f.path)).or_insert((i, f));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut look = |p: &str| -> Result<(usize, (PathBuf, i64)), String> {
+        let key = text(p);
+        let &(group, file) = files.get(&key).ok_or_else(|| format!("{NOT_IN_RESULT}: {p}"))?;
+        if !seen.insert(key) {
+            return Err(format!("{LINK_TWICE}: {p}"));
+        }
+        Ok((group, (PathBuf::from(&file.path), file.modified)))
+    };
+    let mut plans = Vec::new();
+    for g in groups.into_iter().filter(|g| !g.others.is_empty()) {
+        let (group, keep) = look(&g.keep)?;
+        let mut others = Vec::new();
+        for other in &g.others {
+            let (of, file) = look(other)?;
+            if of != group {
+                return Err(format!("{NOT_ONE_GROUP}: {other}"));
+            }
+            others.push(file);
+        }
+        let hash = blake3::Hash::from_hex(&found[group].hash).map_err(|_| NO_DUP_RESULT.to_string())?;
+        plans.push(LinkPlan { size: found[group].size, hash: *hash.as_bytes(), keep, others });
+    }
+    Ok(plans)
+}
+
+/// The deepest folder that holds all of `paths` (a drive's root when they
+/// are on several drives): the job's `dest`.
+fn common_folder<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> PathBuf {
+    let text = |p: &Path| format!("{}\\", p.to_string_lossy().trim_end_matches('\\').to_lowercase());
+    let mut common: Option<PathBuf> = None;
+    for path in paths {
+        let Some(parent) = path.parent() else { continue };
+        let mut c = common.take().unwrap_or_else(|| parent.to_path_buf());
+        while !text(parent).starts_with(&text(&c)) && c.pop() {}
+        common = Some(c);
+    }
+    common.unwrap_or_default()
+}
+
+/// A file of a merge, open for reading so that nobody can write to it (no
+/// FILE_SHARE_WRITE) until it is let go of: what was read is what gets
+/// merged. Renaming it and making links to it still work.
+struct Held {
+    file: File,
+    attrs: u32,
+    key: dups::FileKey,
+    /// Names (hard links) it had when it was opened.
+    links: u32,
+    /// Its size and modified time (FILETIME), as the duplicate finder saw them.
+    size: u64,
+    modified: i64,
+}
+
+/// Opens the file at `path` for a merge, if it is still the plain file of
+/// `size` bytes and `modified` time the duplicate finder saw, on a local
+/// NTFS volume, outside Windows's own folders (`windows`: where Windows is).
+/// A copy (`copy`) is opened so that it could be renamed too: one a program
+/// holds open without letting it be renamed is turned down before it is read.
+fn open_for_link(path: &Path, size: u64, modified: i64, windows: Option<&Path>, copy: bool) -> Result<Held, String> {
+    if in_windows(path, windows) {
+        return Err(LINK_SYSTEM.into());
+    }
+    let exact = win::verbatim(path);
+    let lost = |e: io::Error| match e.kind() {
+        io::ErrorKind::NotFound => LINK_GONE.to_string(),
+        _ => format!("{LINK_NO_OPEN}: {}", reason(&e)),
+    };
+    // The attributes first, through a handle that cannot read: an online-only
+    // file is never opened for reading.
+    let meta = std::fs::symlink_metadata(&exact).map_err(lost)?;
+    judge_link(meta.file_attributes(), meta.file_size(), meta.last_write_time() as i64, size, modified)?;
+    let file = OpenOptions::new()
+        .access_mode(if copy { GENERIC_READ | DELETE } else { GENERIC_READ })
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(&exact)
+        .map_err(lost)?;
+    // Again from the handle: it may have changed in between.
+    let facts = dups::facts(&file).ok_or(LINK_NO_OPEN)?;
+    judge_link(facts.attrs, facts.size, facts.modified, size, modified)?;
+    let key = facts.key.filter(|_| on_ntfs(&file)).ok_or(LINK_NOT_NTFS)?;
+    Ok(Held { file, attrs: facts.attrs, key, links: facts.links, size, modified })
+}
+
+/// Whether a file with these attributes, size and modified time is still the
+/// plain file of `size` bytes and `modified` time the duplicate finder saw.
+fn judge_link(attrs: u32, now_size: u64, now_modified: i64, size: u64, modified: i64) -> Result<(), String> {
+    if dups::online_only(attrs) {
+        return Err(LINK_CLOUD.into());
+    }
+    if attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(LINK_NOT_PLAIN.into());
+    }
+    if (now_size, now_modified) != (size, modified) {
+        return Err(LINK_CHANGED.into());
+    }
+    Ok(())
+}
+
+/// Whether `path` is in a folder of Windows itself, as written or where it
+/// really is: `classify`'s "system" (`\Windows`, `\Recovery`, `\$Recycle.Bin`
+/// and the like at a drive's root) or the Windows folder wherever it is.
+fn in_windows(path: &Path, windows: Option<&Path>) -> bool {
+    let system = |p: &Path| {
+        let text = p.to_string_lossy();
+        let name = text.rsplit('\\').next().unwrap_or_default();
+        crate::classify::program_category(&text, name, false) == Some("system") || windows.is_some_and(|w| inside(p, w))
+    };
+    system(path) || real_path(path).is_some_and(|real| system(&real))
+}
+
+/// Whether the open `file` is on an NTFS volume, which can give it more names.
+fn on_ntfs(file: &File) -> bool {
+    let mut fs = [0u16; 32];
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        )
+    } != 0;
+    let len = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+    ok && String::from_utf16_lossy(&fs[..len]).eq_ignore_ascii_case("NTFS")
+}
+
+/// Which file `path` names (`dups::FileKey`); a link there is taken as itself.
+fn key_at(path: &Path) -> Option<dups::FileKey> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(win::verbatim(path))
+        .ok()?;
+    dups::facts(&file)?.key
+}
+
+/// Gives the file at `path` the attributes `attrs` (those SetFileAttributes changes).
+fn put_attrs(path: &Path, attrs: u32) {
+    let attrs = attrs & SETTABLE;
+    unsafe { SetFileAttributesW(win::wide_path(path).as_ptr(), if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs }) };
+}
+
+/// FILE_LINK_INFORMATION (ntifs.h); the name runs on past the struct.
+#[repr(C)]
+struct LinkInformation {
+    /// ReplaceIfExists (a BOOLEAN, in newer headers the ULONG `Flags`): never.
+    replace: u32,
+    /// None: `name` is a whole NT path.
+    root: HANDLE,
+    /// In bytes, without a nul.
+    name_length: u32,
+    name: [u16; 1],
+}
+
+/// FileLinkInformation (FILE_INFORMATION_CLASS, wdm.h).
+const FILE_LINK_INFORMATION: i32 = 11;
+
+// What CreateHardLinkW does underneath, but on a handle: one feature of
+// windows-sys (Wdk) for one function is not worth it.
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtSetInformationFile(file: HANDLE, io: *mut IO_STATUS_BLOCK, info: *const c_void, length: u32, class: i32) -> NTSTATUS;
+}
+
+/// Makes `link` a new name of the open file `existing`, never over anything.
+/// Made from the handle, not from a path: the name leads to the very file
+/// that was opened (and read), even if another one has been put at its
+/// path since.
+fn create_hard_link(link: &Path, existing: &File) -> io::Result<()> {
+    let mut wide = win::wide_path(link);
+    wide.pop();
+    // `\\?\C:\x` is `\??\C:\x` to the kernel (`\\?\UNC\...` likewise).
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let Some(rest) = wide.strip_prefix(verbatim.as_slice()) else {
+        return Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32));
+    };
+    let name: Vec<u16> = r"\??\".encode_utf16().chain(rest.iter().copied()).collect();
+    // Through a handle of its own on that very file, closed right after: the
+    // file's change time and archive mark are set then, as by CreateHardLinkW
+    // (else only once `existing` is closed, past an undo that puts them back).
+    // With the right to change its attributes where that is given (Windows
+    // asks it of sandboxed programs), else without.
+    let all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let reopen = |access: u32| unsafe { ReOpenFile(existing.as_raw_handle() as HANDLE, access | SYNCHRONIZE, all, 0) };
+    let mut h = reopen(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES);
+    if h == INVALID_HANDLE_VALUE {
+        h = reopen(FILE_READ_ATTRIBUTES);
+    }
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let same = unsafe { File::from_raw_handle(h as RawHandle) };
+    let head = std::mem::offset_of!(LinkInformation, name);
+    let size = head + name.len() * 2;
+    // Zeroed (no replacing, no root folder) and aligned for the struct.
+    let mut buf = vec![0u64; size.max(std::mem::size_of::<LinkInformation>()).div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<LinkInformation>();
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        (*info).name_length = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), buf.as_mut_ptr().cast::<u8>().add(head).cast::<u16>(), name.len());
+        NtSetInformationFile(same.as_raw_handle() as HANDLE, &mut status_block, buf.as_ptr().cast(), size as u32, FILE_LINK_INFORMATION)
+    };
+    drop(same);
+    if status < 0 {
+        return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+    }
+    Ok(())
+}
+
+/// Takes the name `path` away from a file that has another name too: never
+/// a file's last name, nor a link or a folder. The name goes as its handle
+/// closes, read-only or not, and also while the file is open under another
+/// name (POSIX semantics); a Windows older than 10 (1809) knows only the old
+/// way, which turns a read-only file down. Whether the name went.
+fn unlink_extra(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(win::verbatim(path))
+    else {
+        return false;
+    };
+    let plain = |attrs: u32| attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    if !dups::facts(&file).is_some_and(|f| f.links >= 2 && plain(f.attrs)) {
+        return false;
+    }
+    let ex = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    let (h, size) = (file.as_raw_handle() as HANDLE, std::mem::size_of_val(&ex) as u32);
+    let marked = unsafe { SetFileInformationByHandle(h, FileDispositionInfoEx, (&raw const ex).cast(), size) != 0 } || delete_on_close(&file);
+    drop(file);
+    marked && gone(path)
+}
+
+/// Why a merge does not start on a copy the Recycle Bin would not take.
+fn link_bin_reason(why: Binless) -> String {
+    match why {
+        Binless::OddName => LINK_ODD_NAME.into(),
+        Binless::NoBin => LINK_NO_BIN.into(),
+        Binless::Disabled => LINK_BIN_OFF.into(),
+        Binless::TooBig(max) => format!("{LINK_BIN_SMALL} (휴지통 최대 {}MB)", max >> 20),
+        Binless::Unknown => LINK_BIN_UNKNOWN.into(),
+    }
+}
+
+/// Undoes a switch that went wrong: takes away the name made at `path` and
+/// gives the copy at `temp` its name back, with its own attributes `attrs`
+/// when they were changed. The name there goes when the link call said it
+/// made it (`made`: our rename had just freed the name, so the link is ours,
+/// whatever file it turned out to lead to) or when it leads to the file that
+/// stays (`kept`; a call that failed may have made it all the same), and
+/// only while its file has another name (`unlink_extra`). The file that
+/// stays (at `keep`, while it is still there) gets its attributes back, as a
+/// name made and taken away marks it for backup (archive). Gives `why`, and
+/// where the copy is when it cannot go back.
+fn link_undo(kept: &Held, keep: &Path, path: &Path, temp: &Path, made: bool, attrs: Option<u32>, why: String) -> String {
+    if (made || key_at(path) == Some(kept.key)) && unlink_extra(path) && key_at(keep) == Some(kept.key) {
+        put_attrs(keep, kept.attrs);
+    }
+    let back = win::rename(temp, path);
+    if let Some(attrs) = attrs {
+        put_attrs(if back.is_ok() { path } else { temp }, attrs);
+    }
+    match back {
+        Ok(()) => why,
+        Err(_) => format!("{why}. {STUCK}. 파일은 지금 {}에 있어요", shown(temp)),
+    }
+}
+
+/// How a copy came out of a merge.
+enum Merged {
+    /// It is a name of the file that stays now, and its old bytes are in the Recycle Bin.
+    Binned,
+    /// It is a name of the file that stays now, but the bin turned its old
+    /// bytes down: they are still at this hidden name, and why.
+    Left(PathBuf, String),
+    /// It was one file with the one that stays already.
+    Same,
+}
+
+impl Run {
+    /// A merge: each group in turn, each switch written down on `page` first.
+    fn link_all(&mut self, plans: &[LinkPlan], page: &mut Page) -> Result<(), Stop> {
+        // Every copy is read whole, and once per group the file that stays.
+        for p in plans {
+            self.info.total_items += p.others.len() as u64;
+            self.info.total_bytes += p.size.saturating_mul(p.others.len() as u64 + 1);
+        }
+        self.publish();
+        self.speed = Speed::new();
+        let windows = known_folder(&FOLDERID_Windows);
+        let mut buf = vec![0; HASH_BUF];
+        for plan in plans {
+            self.check()?;
+            self.link_group(plan, windows.as_deref(), &mut buf, page)?;
+        }
+        Ok(())
+    }
+
+    /// Merges the copies of one group into the file it keeps, which is read
+    /// once for all of them and held meanwhile, so that nobody writes to it.
+    fn link_group(&mut self, plan: &LinkPlan, windows: Option<&Path>, buf: &mut [u8], page: &mut Page) -> Result<(), Stop> {
+        let (keep, modified) = (&plan.keep.0, plan.keep.1);
+        let base = self.info.done_bytes;
+        self.info.current = Some(keep.to_string_lossy().into_owned());
+        self.tick();
+        let kept = match open_for_link(keep, plan.size, modified, windows, false) {
+            Ok(mut held) => match self.hash_whole(&mut held.file, plan.size, buf) {
+                Ok(hash) if hash == plan.hash => Ok(held),
+                Ok(_) => Err(Halt::Why(LINK_CHANGED.into())),
+                Err(halt) => Err(halt),
+            },
+            Err(why) => Err(Halt::Why(why)),
+        };
+        let kept = match kept {
+            Ok(kept) => kept,
+            Err(Halt::Stop) => return Err(Stop),
+            Err(Halt::Why(why)) => {
+                let name = keep.file_name().map_or_else(|| shown(keep), |n| n.to_string_lossy().into_owned());
+                let why = format!("{KEEP_FAILED}({name}) — {why}");
+                for (other, _) in &plan.others {
+                    self.error(other, why.clone());
+                }
+                let n = plan.others.len() as u64;
+                self.info.done_bytes = base + plan.size.saturating_mul(n + 1);
+                self.info.done_items += n;
+                self.tick();
+                return Ok(());
+            }
+        };
+        for other in &plan.others {
+            self.check()?;
+            let start = self.info.done_bytes;
+            self.info.current = Some(other.0.to_string_lossy().into_owned());
+            self.tick();
+            match self.link_one(&kept, plan, other, windows, buf, page) {
+                Ok(Merged::Binned) => {
+                    self.handled += 1;
+                    self.info.freed_bytes += plan.size;
+                }
+                Ok(Merged::Left(temp, why)) => {
+                    self.handled += 1;
+                    let name = temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.error(&temp, format!("{LINK_LEFT}({name})을 휴지통에 넣지 못했어요: {why}"));
+                }
+                Ok(Merged::Same) => self.handled += 1,
+                Err(Halt::Why(why)) => self.error(&other.0, why),
+                Err(Halt::Stop) => return Err(Stop),
+            }
+            self.info.done_bytes = start + plan.size;
+            self.info.done_items += 1;
+            self.tick();
+        }
+        Ok(())
+    }
+
+    /// Merges the copy at `path` into the file that stays (`kept`): steps 1
+    /// to 4 above. Nothing is changed before the copy has been read whole.
+    fn link_one(
+        &mut self,
+        kept: &Held,
+        plan: &LinkPlan,
+        (path, modified): &(PathBuf, i64),
+        windows: Option<&Path>,
+        buf: &mut [u8],
+        page: &mut Page,
+    ) -> Result<Merged, Halt> {
+        // Merged before: then it has the times of the file that stays, not its own.
+        if key_at(path) == Some(kept.key) {
+            return Ok(Merged::Same);
+        }
+        let mut copy = open_for_link(path, plan.size, *modified, windows, true).map_err(Halt::Why)?;
+        if copy.key == kept.key {
+            return Ok(Merged::Same);
+        }
+        // The volume serials; tests take any two files for two volumes.
+        if !self.settings.rename || copy.key.0 != kept.key.0 {
+            return Err(Halt::Why(LINK_OTHER_DRIVE.into()));
+        }
+        if copy.links > 1 {
+            return Err(Halt::Why(LINK_HAS_NAMES.into()));
+        }
+        match dups::facts(&kept.file) {
+            Some(f) if f.links < MAX_FILE_NAMES => {}
+            Some(_) => return Err(Halt::Why(LINK_FULL.into())),
+            None => return Err(Halt::Why(format!("{KEEP_FAILED} — {LINK_NO_OPEN}"))),
+        }
+        let temp = marked_name(path, true, LINK_EXT, 1).ok_or_else(|| Halt::Why(NO_FREE_NAME.into()))?;
+        if let Some(why) = binless(&temp, || plan.size) {
+            return Err(Halt::Why(link_bin_reason(why)));
+        }
+        if self.hash_whole(&mut copy.file, plan.size, buf)? != plan.hash {
+            return Err(Halt::Why(LINK_DIFFERENT.into()));
+        }
+        // Nobody could write to either since they were opened.
+        let merged = self.switch_to_link(kept, copy, path, &plan.keep.0, page);
+        // Done, undone, or (when it could not be undone) told where the copy
+        // is: nothing is left for the next start to put right.
+        page.clear();
+        merged.map_err(Halt::Why)
+    }
+
+    /// Steps 3 and 4: what is about to happen written down on `page`, the
+    /// copy `copy` at `path` out of the way, a hard link to the file that
+    /// stays (`kept` at `keep`) in its place, and the copy to the Recycle Bin.
+    fn switch_to_link(&self, kept: &Held, copy: Held, path: &Path, keep: &Path, page: &mut Page) -> Result<Merged, String> {
+        let attrs = copy.attrs;
+        let mut temp = None;
+        for n in 1..=PARTIAL_TRIES {
+            let Some(t) = marked_name(path, true, LINK_EXT, n) else { break };
+            let note = Switch {
+                path: path.to_path_buf(),
+                temp: t.clone(),
+                keep: keep.to_path_buf(),
+                kept: kept.key,
+                copy: copy.key,
+                attrs,
+                size: copy.size,
+                modified: copy.modified,
+            };
+            page.write(&note).map_err(|e| format!("{LINK_NOT_RECORDED}: {}", reason(&e)))?;
+            match win::rename(path, &t) {
+                Ok(()) => {
+                    temp = Some(t);
+                    break;
+                }
+                // One that is there already (another merge's, or one the bin
+                // turned down and the user was told of) is not ours to touch.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{LINK_NO_RENAME}: {}", reason(&e))),
+            }
+        }
+        let temp = temp.ok_or(NO_FREE_NAME)?;
+        // The very file that was read, not one put at its name since.
+        if key_at(&temp) != Some(copy.key) {
+            return Err(link_undo(kept, keep, path, &temp, false, None, LINK_CHANGED.into()));
+        }
+        put_attrs(&temp, attrs | FILE_ATTRIBUTE_HIDDEN);
+        // From the handle held since the file that stays was read: the link
+        // leads to that file, whatever is at its path by now.
+        let mut made = false;
+        let linked = (self.settings.hard_link)(path, &kept.file).and_then(|()| {
+            made = true;
+            if key_at(path) == Some(kept.key) { Ok(()) } else { Err(io::Error::other(LINK_ELSEWHERE)) }
+        });
+        if let Err(e) = linked {
+            return Err(link_undo(kept, keep, path, &temp, made, Some(attrs), format!("{LINK_NOT_MADE}: {}", reason(&e))));
+        }
+        // Let go of, so that it can go; with its own attributes, as it was.
+        drop(copy);
+        put_attrs(&temp, attrs);
+        match (self.settings.bin)(&temp) {
+            Ok(()) => Ok(Merged::Binned),
+            Err(why) => {
+                put_attrs(&temp, attrs | FILE_ATTRIBUTE_HIDDEN);
+                Ok(Merged::Left(temp, why))
+            }
+        }
+    }
+
+    /// blake3 of all `size` bytes of `file`, read `buf` at a time into the
+    /// job's bytes done.
+    fn hash_whole(&mut self, file: &mut File, size: u64, buf: &mut [u8]) -> Result<[u8; 32], Halt> {
+        let failed = |e: io::Error| {
+            // Shorter than it said: it changed meanwhile.
+            Halt::Why(if e.kind() == io::ErrorKind::UnexpectedEof { LINK_CHANGED.into() } else { format!("{LINK_NO_READ}: {}", reason(&e)) })
+        };
+        file.seek(SeekFrom::Start(0)).map_err(failed)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(buf.len() as u64) as usize;
+            file.read_exact(&mut buf[..n]).map_err(failed)?;
+            hasher.update(&buf[..n]);
+            left -= n as u64;
+            self.info.done_bytes += n as u64;
+            self.tick();
+            self.check()?;
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// The job `recover_links` shows: each switch it put right, told as the
+    /// merge itself would have told it.
+    fn tell_mended(&mut self, mended: Vec<(Switch, Mend)>) {
+        self.info.total_items = mended.len() as u64;
+        for (s, mend) in mended {
+            match mend {
+                Mend::Nothing => {}
+                Mend::Finished => {
+                    self.handled += 1;
+                    self.info.freed_bytes += s.size;
+                }
+                Mend::Left(why) => {
+                    self.handled += 1;
+                    self.error(&s.temp, why);
+                }
+                Mend::Back => self.error(&s.path, LINK_CUT_BACK),
+                Mend::Stuck(why) | Mend::Lost(why) => self.error(&s.path, why),
+            }
+            self.info.done_items += 1;
+        }
+    }
+}
+
+// ---- v0.8.2: merges cut short --------------------------------------------------
+//
+// Each merge has a page of its own in the `LinkBook`, which holds the switch
+// it is making (steps 3 and 4 above) from just before the copy is renamed
+// until the copy's old bytes are in the bin, or the switch is undone, or the
+// job has told where the copy is. The page goes when the job is over. One
+// left behind by a merge cut short (a crash, a power cut, the app killed,
+// the update installer ending another of the app's processes) is read at the
+// next start (`recover_links`), and the switch on it put right as the merge
+// would have gone on (`mend_link`).
+
+/// The folder in the app's data folder that holds the pages.
+const LINK_BOOK_DIR: &str = "link-merges";
+
+/// Where merges write down the switch they are making: a folder (tests keep
+/// their own) with a page (`<pid>-<time>-<n>.json`) per merge running. A
+/// page is held open for nobody else while its merge runs, so the start of
+/// another of the app's processes leaves it alone, and an update asks first
+/// (`linking_elsewhere`).
+struct LinkBook(PathBuf);
+
+impl LinkBook {
+    fn app() -> LinkBook {
+        LinkBook(crate::scan::data_dir().join(LINK_BOOK_DIR))
+    }
+
+    /// A new page, for one merge.
+    fn page(&self) -> Result<Page, String> {
+        let failed = |e: io::Error| format!("{LINK_NO_BOOK}: {}", reason(&e));
+        std::fs::create_dir_all(&self.0).map_err(failed)?;
+        let stamp = filetime_now();
+        for n in 1..=PARTIAL_TRIES {
+            let path = self.0.join(format!("{}-{stamp:016x}-{n}.json", std::process::id()));
+            match open_page(&path, true) {
+                Ok(file) => return Ok(Page { file, pending: false }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(failed(e)),
+            }
+        }
+        Err(format!("{LINK_NO_BOOK}: {NO_FREE_NAME}"))
+    }
+
+    /// Every page in it, held or not.
+    fn pages(&self) -> Vec<PathBuf> {
+        let Ok(read) = std::fs::read_dir(&self.0) else { return Vec::new() };
+        read.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect()
+    }
+}
+
+/// Opens the page at `path` for nobody else: a new one (`new`) to write, or
+/// one left behind to put right what it says.
+fn open_page(path: &Path, new: bool) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(new)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(0)
+        .open(path)
+}
+
+/// Marks the open `file` (opened with DELETE) to go once it is closed.
+fn delete_on_close(file: &File) -> bool {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let size = std::mem::size_of_val(&info) as u32;
+    unsafe { SetFileInformationByHandle(file.as_raw_handle() as HANDLE, FileDispositionInfo, (&raw const info).cast(), size) != 0 }
+}
+
+/// A merge's page: at most one switch on it at a time.
+struct Page {
+    file: File,
+    /// What is on it may need putting right.
+    pending: bool,
+}
+
+impl Page {
+    /// Writes `switch` down, all the way to the disk, before any of it is
+    /// done. A page cut short while being written is one whose switch had
+    /// not started.
+    fn write(&mut self, switch: &Switch) -> io::Result<()> {
+        let bytes = serde_json::to_vec(switch).map_err(io::Error::other)?;
+        self.pending = true;
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&bytes)?;
+        self.file.sync_all()
+    }
+
+    /// Nothing on it needs putting right any more.
+    fn clear(&mut self) {
+        if self.file.set_len(0).is_ok() {
+            self.pending = false;
+        }
+    }
+}
+
+impl Drop for Page {
+    /// A page with nothing to put right goes. One that still has (its job
+    /// stopped on a fault of its own in the middle of a switch) stays for
+    /// the next start.
+    fn drop(&mut self) {
+        if !self.pending {
+            delete_on_close(&self.file);
+        }
+    }
+}
+
+/// One switch of a merge: the copy at `path` renamed to `temp`, and `path`
+/// made a name of the file that stays.
+#[derive(Serialize, Deserialize)]
+struct Switch {
+    path: PathBuf,
+    temp: PathBuf,
+    /// The file that stays, by its path and which file it is.
+    keep: PathBuf,
+    kept: dups::FileKey,
+    /// Which file the copy is, and its own attributes, size and modified time.
+    copy: dups::FileKey,
+    attrs: u32,
+    size: u64,
+    modified: i64,
+}
+
+/// What the start made of a switch cut short.
+enum Mend {
+    /// Nothing was left to do.
+    Nothing,
+    /// The link was made: the copy's old bytes went to the bin now.
+    Finished,
+    /// The link was made, but the copy's old bytes stay, hidden: why (LINK_LEFT).
+    Left(String),
+    /// The copy has its name back, not merged.
+    Back,
+    /// Could not be put right now: why. The page stays, for the next start.
+    Stuck(String),
+    /// Nothing of ours to put right any more, but something to tell: why.
+    Lost(String),
+}
+
+/// Puts right what merges cut short left (`mend_link`), and shows what was
+/// done and what is left for the user in a job of its own (op "link"). Run
+/// once at start, on a thread of its own. The pages of merges still running,
+/// in this process or another of the app's, are left alone.
+pub fn recover_links(app: AppHandle) {
+    mend_links(&LinkBook::app(), to_bin, app);
+}
+
+/// Whether another of the app's processes is merging now (holds a page).
+/// Asked before an update, whose installer would end it in the middle of a
+/// switch.
+pub(crate) fn linking_elsewhere() -> bool {
+    linking_in(&LinkBook::app())
+}
+
+fn linking_in(book: &LinkBook) -> bool {
+    // This process's own pages are held too.
+    let own = format!("{}-", std::process::id());
+    book.pages()
+        .iter()
+        .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&own)))
+        .any(|p| held_elsewhere(p))
+}
+
+/// `recover_links` with the book `book` and the bin `bin` (tests keep their
+/// own): the id of the job that tells what was done, if anything was.
+fn mend_links(book: &LinkBook, bin: fn(&Path) -> Result<(), String>, events: impl Events) -> Option<u64> {
+    let mut mended = Vec::new();
+    for path in book.pages() {
+        // Held: its merge runs.
+        let Ok(mut file) = open_page(&path, false) else { continue };
+        let mut text = Vec::new();
+        // An empty page has nothing on it, and one that cannot be read was
+        // cut short while being written: before anything of its switch.
+        let switch = file.read_to_end(&mut text).ok().and_then(|_| serde_json::from_slice::<Switch>(&text).ok());
+        let mend = switch.map(|s| {
+            let mend = mend_link(&s, bin);
+            (s, mend)
+        });
+        if !matches!(mend, Some((_, Mend::Stuck(_)))) {
+            delete_on_close(&file);
+        }
+        drop(file);
+        mended.extend(mend.filter(|(_, m)| !matches!(m, Mend::Nothing)));
+    }
+    if mended.is_empty() {
+        return None;
+    }
+    let dest = shown(&common_folder(mended.iter().map(|(s, _)| &s.path)));
+    let run = new_job("link", false, Vec::new(), dest, events, Settings::APP);
+    launch(run, move |run| {
+        run.tell_mended(mended);
+        Ok(())
+    })
+    .ok()
+}
+
+/// Puts right one switch cut short, as the merge would have gone on:
+/// - the link made (cut before the bin): the copy's old bytes go to the bin
+///   (`bin_leftover`);
+/// - the copy's own name free (cut between the rename and the link, or while
+///   undoing): the copy gets its name back, with its own attributes;
+/// - its own name taken by another file meanwhile: both stay as they are,
+///   and the user is told where the copy is.
+///
+/// Only the copy itself is touched: a file at its hidden name that is not
+/// the copy is not ours, and nothing is done to a name that leads to neither.
+fn mend_link(s: &Switch, bin: fn(&Path) -> Result<(), String>) -> Mend {
+    let stuck = |why: String| Mend::Stuck(format!("{LINK_CUT_STUCK}: {why}. 파일은 지금 {}에 있어요", shown(&s.temp)));
+    match key_at(&s.temp) {
+        Some(k) if k == s.copy => {}
+        None if !gone(&s.temp) => return stuck(LINK_NO_OPEN.into()),
+        // It never got its hidden name, or it went on from there (to the bin
+        // or back) before the cut. Its name gone all the same is someone else's doing.
+        _ if gone(&s.path) => return Mend::Lost(format!("{LINK_CUT_GONE}. 같은 내용은 {}에 있어요", shown(&s.keep))),
+        _ => return Mend::Nothing,
+    }
+    match key_at(&s.path) {
+        Some(k) if k == s.kept => bin_leftover(s, bin),
+        None if gone(&s.path) => match win::rename(&s.temp, &s.path) {
+            Ok(()) => {
+                put_attrs(&s.path, s.attrs);
+                Mend::Back
+            }
+            Err(e) => stuck(reason(&e)),
+        },
+        None => stuck(LINK_NO_OPEN.into()),
+        Some(_) => Mend::Lost(format!("{LINK_CUT_TAKEN}. 원래 파일은 지금 {}에 있어요", shown(&s.temp))),
+    }
+}
+
+/// The old bytes of a copy merged before the cut, to the Recycle Bin: only
+/// while they are what was merged (size and modified time), and only where
+/// the bin takes them rather than deleting them for good (`binless`).
+fn bin_leftover(s: &Switch, bin: fn(&Path) -> Result<(), String>) -> Mend {
+    let name = s.temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let left = |why: &str| Mend::Left(format!("{LINK_LEFT}({name})을 휴지통에 넣지 못했어요: {why}"));
+    let stamp = |m: Metadata| (m.file_size(), m.last_write_time() as i64);
+    if std::fs::symlink_metadata(win::verbatim(&s.temp)).map(stamp).ok() != Some((s.size, s.modified)) {
+        return left(LINK_CUT_CHANGED);
+    }
+    if let Some(why) = binless(&s.temp, || s.size) {
+        return left(&bin_refusal(why));
+    }
+    put_attrs(&s.temp, s.attrs);
+    match bin(&s.temp) {
+        Ok(()) => Mend::Finished,
+        Err(why) => {
+            put_attrs(&s.temp, s.attrs | FILE_ATTRIBUTE_HIDDEN);
+            left(&why)
+        }
+    }
+}
+
+/// Why the bin would not take a copy's old bytes, short.
+fn bin_refusal(why: Binless) -> String {
+    match why {
+        Binless::OddName => "이름이 점(.)이나 공백으로 끝나는 폴더에 있어요".into(),
+        Binless::NoBin => "이 드라이브에는 휴지통이 없어요".into(),
+        Binless::Disabled => "이 드라이브는 휴지통을 쓰지 않도록 설정돼 있어요".into(),
+        Binless::TooBig(max) => format!("휴지통보다 커요 (휴지통 최대 {}MB)", max >> 20),
+        Binless::Unknown => "휴지통으로 옮길 수 있는지 확인할 수 없어요".into(),
     }
 }

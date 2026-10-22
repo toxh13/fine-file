@@ -117,7 +117,8 @@ export const events = {
 
 export interface JobInfo {
   id: number;
-  op: "copy" | "move" | "relocate" | "restore";
+  /** "link": duplicates made into hard links (v082.startDupLink). */
+  op: "copy" | "move" | "relocate" | "restore" | "link";
   state: "running" | "waiting" | "done" | "failed" | "cancelled";
   dest: string;
   total_bytes: number;
@@ -132,6 +133,11 @@ export interface JobInfo {
    * runs, the first thousand once it is over. Left out, `errors` is the whole list.
    */
   error_count?: number;
+  /**
+   * "link": bytes of the merged copies now in the Recycle Bin, which come free once it is emptied
+   * (`done_bytes` is what was read to compare). 0 for the other jobs; left out by older backends.
+   */
+  freed_bytes?: number;
 }
 
 export interface Conflict {
@@ -564,4 +570,30 @@ export const places = {
   set: (config: PlacesConfig) => invoke<void>("places_set", { config }),
   /** What a path is, from the item itself (no folder listing). Links count as what they are. */
   pathKind: (path: string) => invoke<"dir" | "file" | "gone">("path_kind", { path }),
+};
+
+// ---- v0.8.2: duplicates made into hard links (Duplicates.tsx "하드 링크로 합치기") ----------
+
+/** Copies one start_dup_link takes at most (ops.rs MAX_LINKS). */
+export const LINK_MAX = 10_000;
+
+/** One duplicate group's part: the file that stays, and the copies that become hard links to it. */
+export interface DupLinkGroup {
+  keep: string;
+  others: string[];
+}
+
+export const v082 = {
+  /**
+   * Replaces each of `others` by an NTFS hard link to its group's `keep`, so every path still
+   * opens the same content stored once. A job of ops.rs (op "link"): its progress comes as
+   * "job-progress" and the job list shows it; `done_bytes` counts what was read to compare,
+   * `freed_bytes` what the Recycle Bin got. Each pair is checked right before (both there, plain
+   * files on the same NTFS volume outside Windows' folders, not one file already, unchanged since
+   * the search, the whole content compared again); the old copy goes to the Recycle Bin.
+   * `dup`: the search the groups come from (DupReport.id); null, the newest that has them. Every
+   * path must be in that search's result, each group's in one of its groups, at most
+   * LINK_MAX copies: else it rejects (Korean) and nothing starts. Resolves with the job id.
+   */
+  startDupLink: (groups: DupLinkGroup[], dup: number | null) => invoke<number>("start_dup_link", { groups, dup }),
 };

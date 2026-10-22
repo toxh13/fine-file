@@ -682,21 +682,29 @@ fn app_info() -> AppInfo {
 
 const UPDATE_PLAN_ELSEWHERE: &str = "다른 fine-file 창에서 정리 계획을 실행하거나 되돌리는 중이에요. 설치 프로그램이 그 창을 강제로 꺼서 하던 단계가 되돌리기 기록에 빠질 수 있으니, 끝난 뒤에 업데이트해 주세요";
 const UPDATE_RELOCATION_ELSEWHERE: &str = "다른 fine-file 창에서 폴더를 다른 드라이브로 옮기거나 되돌리는 중이에요. 끝난 뒤에 업데이트해 주세요";
+const UPDATE_LINK_ELSEWHERE: &str = "다른 fine-file 창에서 중복 파일을 하드 링크로 합치는 중이에요. 끝난 뒤에 업데이트해 주세요";
 const UPDATE_STILL_BUSY: &str = "작업이 아직 다 멈추지 않아서 업데이트를 설치하지 않았어요. 멈추게 한 작업은 그대로 멈춰요(정리 계획은 하던 단계까지만 해요). 잠시 뒤에 다시 해 주세요";
 
 /// What the update installer would cut short elsewhere: the other processes
 /// of this program file (other windows, an MCP server a Claude app started),
-/// and whether one of them runs a plan or a relocation now.
+/// and whether one of them runs a plan, a relocation or a merge of
+/// duplicates into hard links now.
 #[derive(Serialize)]
 struct UpdateOthers {
     processes: u32,
     plan: bool,
     relocation: bool,
+    link: bool,
 }
 
 #[tauri::command(async)]
 fn update_others() -> UpdateOthers {
-    UpdateOthers { processes: win::other_instances(), plan: plans::running_elsewhere(), relocation: ops::relocating_elsewhere() }
+    UpdateOthers {
+        processes: win::other_instances(),
+        plan: plans::running_elsewhere(),
+        relocation: ops::relocating_elsewhere(),
+        link: ops::linking_elsewhere(),
+    }
 }
 
 /// Readies the app for the update installer, just before it starts. False,
@@ -707,9 +715,9 @@ fn update_others() -> UpdateOthers {
 /// What was agreed to stops as when the window closes (`confirm_close`): the
 /// plan after the step it is at, written down; the jobs cancelled (also those
 /// the plan's step started), their unfinished copies removed. Then every
-/// cache is written. Refused while a plan or relocation of another window
-/// runs, or a relocation cut short is being put right, since the installer
-/// would end those mid-way.
+/// cache is written. Refused while a plan, relocation or merge into hard
+/// links of another window runs, or a relocation cut short is being put
+/// right, since the installer would end those mid-way.
 #[tauri::command]
 async fn update_prepare(app: AppHandle, stop_jobs: Vec<u64>, stop_plan: Option<String>) -> Result<bool, String> {
     blocking(move || {
@@ -718,6 +726,9 @@ async fn update_prepare(app: AppHandle, stop_jobs: Vec<u64>, stop_plan: Option<S
         }
         if ops::relocating_elsewhere() {
             return Err(UPDATE_RELOCATION_ELSEWHERE.into());
+        }
+        if ops::linking_elsewhere() {
+            return Err(UPDATE_LINK_ELSEWHERE.into());
         }
         if ops::recovering() {
             return Err(ops::RECOVER_BUSY.into());
@@ -1599,6 +1610,9 @@ pub fn run() {
             std::thread::Builder::new().name("auto sync".into()).spawn(move || auto_sync(handle))?;
             // A relocation or undo cut short by a crash or a power cut is put right (ops.rs).
             std::thread::Builder::new().name("relocation recovery".into()).spawn(ops::recover_relocations)?;
+            // So is a merge of duplicates into hard links; what it did shows as a job.
+            let handle = app.handle().clone();
+            std::thread::Builder::new().name("link recovery".into()).spawn(move || ops::recover_links(handle))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1630,6 +1644,7 @@ pub fn run() {
             ops::start_relocate,
             ops::relocations,
             ops::undo_relocate,
+            ops::start_dup_link,
             admin::admin_session_start,
             admin::admin_session_status,
             admin::admin_session_stop,

@@ -830,6 +830,90 @@
   margin: 4px auto 8px;
 }
 
+/* v0.8.2: auto-select over program folders (opt-in), the hard-link job, the prompts. */
+.dup-check {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.dup-check input {
+  flex: none;
+  margin: 2px 0 0;
+}
+
+.dup-with-app {
+  margin-left: 6px;
+}
+
+.dup-with-app .warn {
+  color: var(--warn-text);
+}
+
+.dup-linking {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dup-linking-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dup-notice-paths {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 11px;
+  user-select: text;
+}
+
+.modal.dup-confirm {
+  width: 480px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+/* A box of the link prompt and what it adds. */
+.dup-confirm-opt {
+  margin: 8px 0;
+}
+
+.dup-confirm-opt .dup-check {
+  font-weight: 600;
+}
+
+.dup-confirm-opt p {
+  margin: 4px 0 0 20px;
+  font-size: 12px;
+}
+
+.dup-binned {
+  margin: 4px 0 8px;
+  font-size: 12px;
+}
+
+.dup-confirm-list {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.dup-confirm-list li {
+  margin: 4px 0;
+}
+
+.dup-confirm-app p {
+  margin: 0 0 6px;
+}
+
+.dup-confirm-app .dup-check {
+  color: var(--text);
+  font-weight: 600;
+}
+
 /* ---- relocation ---- */
 .reloc-body {
   display: flex;
