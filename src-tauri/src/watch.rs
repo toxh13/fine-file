@@ -1630,6 +1630,13 @@ mod tests {
             eprintln!("this volume makes no 8.3 names; skipped");
             return;
         }
+        // The stand-in root sits in the temp folder; where that is itself spelled short (CI:
+        // C:\Users\RUNNER~1\...), Windows spells the whole path out and nothing is left to test.
+        // A real watched root is a drive's, which has no short name.
+        if !win::long_path(&t.drive).eq_ignore_ascii_case(&t.drive) {
+            eprintln!("the temp folder is spelled with short names; skipped");
+            return;
+        }
         assert_eq!(long_name(&root, format!("{root}{}\\{}", tail[1], tail[0])), long);
         // Gone, it keeps the alias: there is no long name to find.
         let gone = format!("{root}GONE~1.TXT");

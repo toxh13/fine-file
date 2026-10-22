@@ -354,6 +354,33 @@ pub(crate) fn long_path(path: &str) -> String {
 /// in it stays as it is, which a check against short names must not take.
 pub(crate) fn try_long_path(path: &str) -> Option<String> {
     let path = strip_verbatim(path);
+    if let Some(long) = long_existing(path) {
+        return Some(long);
+    }
+    // Not (all) there yet (a folder a plan will make, a move's target): the part that is there
+    // is spelled out, and the rest is kept as written unless it has short-looking names, which
+    // Windows could only tell once they exist. So C:\Users\RUNNER~1\new is C:\Users\runneradmin\new.
+    let mut cut = path.len();
+    while let Some(i) = path[..cut].rfind('\\') {
+        let tail = &path[i + 1..];
+        // "C:" alone is the current folder on C:; its root is "C:\".
+        let head = if i == 2 && path.as_bytes()[1] == b':' { &path[..3] } else { &path[..i] };
+        if head.is_empty() || head == r"\" {
+            break;
+        }
+        if let Some(long) = long_existing(head) {
+            if tail.is_empty() || looks_short(tail) {
+                return None;
+            }
+            return Some(format!("{}\\{tail}", long.trim_end_matches('\\')));
+        }
+        cut = i;
+    }
+    None
+}
+
+/// `try_long_path` for a path that is there: Windows' own long form of it.
+fn long_existing(path: &str) -> Option<String> {
     let drive = path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'\\') && !path.contains('/');
     // Past MAX_PATH a drive path is read whole only in its `\\?\` form; a
     // shorter one may still have a long form past it, so that form is tried too.
@@ -1181,8 +1208,10 @@ pub(crate) mod tests {
         if n > 0 && !short_name.eq_ignore_ascii_case("Long Folder Name For Test") {
             let mixed = base.join(&short_name).join("x".repeat(120)).join("y".repeat(120)).to_string_lossy().into_owned();
             assert!(mixed.len() >= 260, "{mixed}");
-            assert!(long_path(&mixed).eq_ignore_ascii_case(&deep.to_string_lossy()), "{mixed}");
-            assert!(long_path(&format!(r"\\?\{mixed}")).eq_ignore_ascii_case(&deep.to_string_lossy()), "{mixed}");
+            // The temp folder itself may be spelled short (CI: C:\Users\RUNNER~1\...).
+            let want = long_path(&deep.to_string_lossy());
+            assert!(long_path(&mixed).eq_ignore_ascii_case(&want), "{mixed}");
+            assert!(long_path(&format!(r"\\?\{mixed}")).eq_ignore_ascii_case(&want), "{mixed}");
         }
         let _ = std::fs::remove_dir_all(verbatim(&base));
         // Reading the bin settings of C: must not fail or panic.

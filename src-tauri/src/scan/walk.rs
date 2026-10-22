@@ -262,6 +262,14 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
+        // An account that the deny does not stop (an elevated CI runner with backup rights) still
+        // lists it: nothing to test there.
+        if std::fs::read_dir(root.join("locked")).is_ok() {
+            eprintln!("this account can list a folder denied to everyone; skipped");
+            icacls(&["/remove:d", "*S-1-1-0"]);
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         let walked = walk(&format!("{}\\", root.display()), &Control::default());
         let restored = icacls(&["/remove:d", "*S-1-1-0"]);
         std::fs::remove_dir_all(&root).unwrap();

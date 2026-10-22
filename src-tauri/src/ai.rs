@@ -1815,6 +1815,10 @@ impl Space<'_, '_> {
 /// steps before them (see the module comment). Paths may be relative to the
 /// root. "trash" steps, when the rules allow them, start unselected.
 pub(crate) fn check_steps(rules: &Rules, raw: &[Value]) -> Checked {
+    // The root by its long names (see plan_root_ok), so steps resolved against it are spelled out
+    // too; a step that itself names something by a short name is still refused (short_named).
+    let long_root = win::try_long_path(rules.root).unwrap_or_else(|| rules.root.to_string());
+    let rules = &Rules { root: &long_root, allowed: rules.allowed, guard: rules.guard, size: rules.size };
     let mut space = Space {
         rules,
         root: lower(rules.root),
@@ -1845,9 +1849,15 @@ fn plan_root_ok(root: &str) -> Result<(), String> {
     if parent(root).is_none() {
         return Err("드라이브 전체(루트)에는 AI 계획을 만들지 않아요. 그 아래 폴더를 골라 주세요".into());
     }
-    if short_named(root) {
-        return Err(SHORT_NAME.into());
-    }
+    // A root spelled with short names (an address typed as C:\PROGRA~3, a temp folder such as
+    // C:\Users\RUNNER~1\...) is checked by its long names, so no guard by name is missed; one
+    // Windows cannot spell out stays refused.
+    let long = win::try_long_path(root);
+    let root = match &long {
+        Some(l) => l.as_str(),
+        None if win::looks_short(root) => return Err(SHORT_NAME.into()),
+        None => root,
+    };
     let m = disk(root).ok_or("폴더를 찾을 수 없어요")?;
     if m.file_attributes() & ATTR_DIR == 0 {
         return Err("계획은 폴더에서 만들어요. 폴더를 골라 주세요".into());
@@ -2629,8 +2639,9 @@ mod tests {
             step("move", "a.txt", Some("문서\\2024\\a.txt")),
         ]);
         assert_eq!(c.dropped.len(), 7, "{:?}", c.dropped);
-        // The last move made its two folders first.
-        let r = root.to_string_lossy();
+        // The last move made its two folders first. Steps come out by the root's long names (the
+        // temp folder may be spelled short, as on CI: C:\Users\RUNNER~1\...).
+        let r = win::long_path(&root.to_string_lossy());
         let got: Vec<(&str, &str, Option<&str>)> = c.steps.iter().map(|s| (s.action.as_str(), s.from.as_str(), s.to.as_deref())).collect();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], ("mkdir", format!("{r}\\문서").as_str(), None));
@@ -2734,7 +2745,7 @@ mod tests {
             assert_eq!(why, [SHORT_NAME, SHORT_NAME], "{:?}", c.dropped);
             assert_eq!(c.steps.len(), 1);
             assert!(short_named(&root.join(&short).to_string_lossy()));
-            assert!(!short_named(&long.join("a.txt").to_string_lossy()));
+            assert!(!short_named(&win::long_path(&long.join("a.txt").to_string_lossy())));
         }
         let _ = fs::remove_dir_all(&root);
     }
