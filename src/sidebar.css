@@ -1,0 +1,289 @@
+/* ---- v0.8.1: the sidebar's foldable sections and 즐겨찾기 (Sidebar.tsx) ---- */
+
+.side-sec + .side-sec {
+  margin-top: 4px;
+}
+
+.side-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+}
+
+/* The section's name folds it, as in Explorer's navigation pane. */
+.side-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 10px 6px 4px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: left;
+}
+
+.side-toggle:hover {
+  color: var(--text);
+}
+
+.side-chev {
+  display: inline-flex;
+  width: 10px;
+  transition: transform 0.12s ease;
+}
+
+.side-sec.folded .side-chev {
+  transform: rotate(-90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-chev {
+    transition: none;
+  }
+}
+
+/* The section's ⋯ menu. */
+.side-more {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  margin-top: 6px;
+  border-radius: 5px;
+  color: var(--muted);
+}
+
+.side-more:hover:not(:disabled),
+.side-more.on {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.side-toggle:focus-visible,
+.side-more:focus-visible,
+.fav-item:focus-visible,
+.fav-unpin:focus-visible,
+.sidebar .drive-main:focus-visible,
+.sidebar .place:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---- 즐겨찾기 rows ---- */
+.fav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.fav-li {
+  position: relative;
+}
+
+.place.fav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  min-height: 30px;
+}
+
+.fav-icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+
+img.fav-icon {
+  object-fit: contain;
+}
+
+.fav-icon.fav-glyph {
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.fav-icon.fav-glyph.k-folder {
+  color: var(--dir);
+}
+
+.fav-icon.fav-glyph.k-onedrive,
+.fav-icon.fav-glyph.k-onedrive_business {
+  color: var(--accent);
+}
+
+.fav-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.fav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fav-pin {
+  flex: none;
+  display: inline-flex;
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+/* A pinned folder not found: greyed, with "고정 해제" beside it. */
+.fav-item.missing {
+  color: var(--muted);
+  padding-right: 74px;
+}
+
+.fav-item.missing .fav-icon {
+  opacity: 0.5;
+}
+
+.fav-note {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fav-unpin {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  padding: 2px 7px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+}
+
+.fav-unpin:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.fav-rename {
+  display: block;
+  width: 100%;
+  margin: 1px 0;
+  padding: 5px 9px;
+  border: 1px solid var(--sel-line);
+  border-radius: 6px;
+  background: var(--panel);
+  outline: none;
+}
+
+/* Between the known places (and OneDrive) and the pinned folders, as Explorer draws it. */
+.fav-sep {
+  height: 1px;
+  margin: 4px 10px;
+  background: var(--line);
+}
+
+/* ---- dragging: a pinned folder to another place, or files to be pinned ---- */
+.fav-li.dragged .fav-item {
+  opacity: 0.45;
+}
+
+:root.fav-reordering,
+:root.fav-reordering * {
+  cursor: grabbing !important;
+}
+
+/* Where the folder goes: a line between the rows. */
+.fav-li.ins-before::before,
+.fav-li.pin-before::before,
+.fav-li.ins-after::after,
+.fav-li.pin-after::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.fav-li.ins-before::before,
+.fav-li.pin-before::before {
+  top: -1px;
+}
+
+.fav-li.ins-after::after,
+.fav-li.pin-after::after {
+  bottom: -1px;
+}
+
+/* Below the rows: a drop here pins at the end. Roomier while files are dragged over the window. */
+.fav-pad {
+  min-height: 6px;
+  margin: 0 2px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.fav-pad.empty {
+  padding: 4px 10px 6px;
+  line-height: 1.45;
+}
+
+:root.file-drag .fav-pad {
+  min-height: 26px;
+  border: 1px dashed var(--line);
+}
+
+.side-head.pin-here,
+.fav-pad.pin-here,
+.fav-list.pin-here {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--sel);
+}
+
+/* The first run's offer to bring in Explorer's pinned folders. */
+.fav-offer {
+  margin: 6px 2px 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.fav-offer-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.fav-offer-actions button {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.fav-offer-actions .primary {
+  border-color: transparent;
+  background: var(--accent);
+  /* The panel's color on the accent: at least 4.5:1, light and dark (as .tool-badge). */
+  color: var(--panel);
+}
+
+.fav-offer-actions button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

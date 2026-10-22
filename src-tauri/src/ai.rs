@@ -338,7 +338,7 @@ const NAME_SURROGATE: u32 = 0x2000_0000;
 /// `C:\a\b`: a drive letter, backslashes, no trailing one (but `C:\`), no `.`
 /// or `..`, no characters Windows names cannot hold. None for anything else
 /// (UNC and `\\?\` paths, `C:relative`).
-fn normalize_abs(path: &str) -> Option<String> {
+pub(crate) fn normalize_abs(path: &str) -> Option<String> {
     let p = path.replace('/', "\\");
     let b = p.as_bytes();
     if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
@@ -507,7 +507,7 @@ fn special_folders() -> &'static [String] {
 }
 
 /// A known folder's path (`FOLDERID_*`), when this Windows has one.
-fn known_folder(id: &windows_sys::core::GUID) -> Option<String> {
+pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> Option<String> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
     let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();

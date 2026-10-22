@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { desktopDir, documentDir, downloadDir, homeDir } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ai,
@@ -32,6 +31,7 @@ import {
 } from "./Explorer";
 import { FirstRunGuide, HELP_TIPS, Help, firstRunDone } from "./Help";
 import { dragOverWindow, keysNow, pagePoint, takeOwnDrop, trackModifiers } from "./shell";
+import { FavoritesSection, SidebarSection, pinDropAt, sideNavKeys, usePlaces } from "./Sidebar";
 import { Transfers } from "./Transfers";
 import { UpdateBanner, UpdateSettingsDialog, useUpdateOffered } from "./Updater";
 import { driveKey, folderTitle, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, timeAgo } from "./format";
@@ -40,6 +40,7 @@ import "./App.css";
 /** v0.2 had one view for the window: the first tab gets it when no tabs were saved. */
 const VIEW_KEY = "fine-file.view";
 const TABS_KEY = "fine-file.tabs";
+/** The details pane (상세 정보; "미리 보기" up to v0.8): open, and its width. */
 const PREVIEW_KEY = "fine-file.preview";
 
 interface Tab {
@@ -163,6 +164,16 @@ interface Paste {
 /** The marked drop target while files are dragged over the window (see the drop below). */
 const DROP_MARK = "drop-target";
 
+/** On the page's root while files are dragged over the window: 즐겨찾기 makes room to pin them. */
+const FILE_DRAG = "file-drag";
+
+/** What a drop at a point does: into a folder, pinned in 즐겨찾기 at an index, refused, or nothing. */
+type DropAt =
+  | { dest: string; mark: Element }
+  | { pin: number; mark: Element; cls: string }
+  | { refuse: string }
+  | null;
+
 const isOver = (s: JobInfo["state"]) => s === "done" || s === "failed" || s === "cancelled";
 
 /**
@@ -197,7 +208,6 @@ function planChanges(plan: Plan): Changes {
 
 export default function App() {
   const [drives, setDrives] = useState<DriveInfo[]>([]);
-  const [places, setPlaces] = useState<{ label: string; path: string }[]>([]);
   const [elevated, setElevated] = useState(false);
   const [version, setVersion] = useState("");
   const [scanning, setScanning] = useState<string | null>(null);
@@ -254,6 +264,17 @@ export default function App() {
     const id = Date.now() + Math.random();
     setToasts((t) => [...t, { id, text, kind }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === "error" ? 8000 : 5000);
+  }, []);
+
+  // v0.8.1: the sidebar's 즐겨찾기 (known folders, OneDrive, pinned folders) and folded sections.
+  const places = usePlaces(toast);
+  const placesRef = useRef(places);
+  useLayoutEffect(() => {
+    placesRef.current = places;
+  });
+  const setPinned = useCallback((to: string, pin: boolean) => {
+    if (pin) placesRef.current.pin([to]);
+    else placesRef.current.unpin(to);
   }, []);
 
   const refreshDrives = useCallback(() => api.drives().then(setDrives), []);
@@ -368,8 +389,8 @@ export default function App() {
     return () => clearTimeout(t);
   }, [stuck, drives, retryTick, refreshDrives]);
 
-  // Startup: saved indexes first (instant sizes), then drives and shortcuts, then the tabs open
-  // last time (or the system drive).
+  // Startup: saved indexes first (instant sizes), then drives, then the tabs open last time (or the
+  // system drive). The sidebar's 즐겨찾기 reads its places by itself (usePlaces).
   useEffect(() => {
     (async () => {
       const info = await api.appInfo();
@@ -379,20 +400,6 @@ export default function App() {
       const ds = await api.drives();
       setDrives(ds);
       refreshLive();
-      const named: { label: string; path: string }[] = [];
-      for (const [label, f] of [
-        ["홈", homeDir],
-        ["바탕 화면", desktopDir],
-        ["문서", documentDir],
-        ["다운로드", downloadDir],
-      ] as const) {
-        try {
-          named.push({ label, path: normalizePath(await f()) });
-        } catch {
-          /* folder not configured */
-        }
-      }
-      setPlaces(named);
       const saved = savedTabs();
       const start = ds.find((d) => d.letter === "C:") ?? ds[0];
       const list = saved?.tabs ?? (start ? [{ path: `${start.letter}\\`, view: savedView() }] : []);
@@ -409,7 +416,7 @@ export default function App() {
     store(TABS_KEY, JSON.stringify({ tabs: tabs.map(({ path, view }) => ({ path, view })), active }));
   }, [tabs, activeId]);
 
-  // Dragging the preview's edge changes its width many times a second: saved once it rests.
+  // Dragging the details pane's edge changes its width many times a second: saved once it rests.
   useEffect(() => {
     const t = setTimeout(() => store(PREVIEW_KEY, JSON.stringify(preview)), 300);
     return () => clearTimeout(t);
@@ -706,7 +713,9 @@ export default function App() {
   // Files dropped on the window (from Explorer, another program, or dragged out of a tab here)
   // go into the folder under the pointer, as a job of the transfer panel like a paste: a folder
   // row, tile or tree row (data-path), a place or drive in the sidebar (data-path), a tab's header
-  // (data-tab-drop: what that tab takes), or else the folder the tab shows. Dragged out of a tab
+  // (data-tab-drop: what that tab takes), or else the folder the tab shows. Folders dropped in
+  // 즐겨찾기 between its rows (or on its header, or below the rows) are pinned there instead
+  // (pinDropAt); on a row's middle they still go into that folder. Dragged out of a tab
   // here they are copied, as the cursor shows over this window (the drag offers Windows only a
   // copy, see shell.ts), and moved when Shift is held as they are let go (read from Windows then;
   // the keys of the drag's start when it cannot tell). From another program they are always
@@ -714,10 +723,11 @@ export default function App() {
   useEffect(() => trackModifiers(), []);
 
   /**
-   * The folder a drop at a page point goes into and the element marked as its target, or why it
-   * may not; null where nothing takes files (the transfer panel, a dialog).
+   * The folder a drop at a page point goes into and the element marked as its target, or where in
+   * 즐겨찾기 it pins folders, or why it may not; null where nothing takes files (the transfer
+   * panel, a dialog).
    */
-  const dropAt = useCallback((x: number, y: number): { dest: string; mark: Element } | { refuse: string } | null => {
+  const dropAt = useCallback((x: number, y: number): DropAt => {
     const el = document.elementFromPoint(x, y);
     if (!el) return null;
     // A tab's header takes what its tab takes (not search results, nor a read-only folder).
@@ -727,6 +737,8 @@ export default function App() {
       if (!into) return null;
       return "refuse" in into ? into : { dest: into.path, mark: header };
     }
+    const pin = pinDropAt(el, y);
+    if (pin) return pin;
     const folder = el.closest("[data-path]");
     if (folder) return { dest: folder.getAttribute("data-path")!, mark: folder };
     // A tab's own dialog lies inside it: the tab then says no (dropTarget).
@@ -777,24 +789,38 @@ export default function App() {
   );
 
   // The target under the pointer is marked while files are dragged over the window (again on every
-  // move: a row drawn anew loses the class).
-  const marked = useRef<Element | null>(null);
+  // move: a row drawn anew loses the class). A place in 즐겨찾기 to pin at has a class of its own.
+  const marked = useRef<{ el: Element; cls: string } | null>(null);
   useEffect(() => {
-    const mark = (el: Element | null) => {
-      if (marked.current && marked.current !== el) marked.current.classList.remove(DROP_MARK);
-      el?.classList.add(DROP_MARK);
-      marked.current = el;
+    const mark = (el: Element | null, cls = DROP_MARK) => {
+      const m = marked.current;
+      if (m && (m.el !== el || m.cls !== cls)) m.el.classList.remove(m.cls);
+      el?.classList.add(cls);
+      marked.current = el ? { el, cls } : null;
+    };
+    const dragging = (on: boolean) => {
+      dragOverWindow(on);
+      document.documentElement.classList.toggle(FILE_DRAG, on);
     };
     let unlisten: (() => void) | null = null;
     let gone = false;
     getCurrentWebview()
       .onDragDropEvent((ev) => {
         const e = ev.payload;
-        dragOverWindow(e.type === "enter" || e.type === "over");
-        if (e.type === "leave") return mark(null);
+        if (e.type === "enter" || e.type === "over") dragging(true);
+        if (e.type === "leave") {
+          dragging(false);
+          return mark(null);
+        }
         const at = pagePoint(e.position);
+        // Hit-tested while the drag layout is still in place: leaving it first shrinks the
+        // sidebar's drop pad, the drive cards move up and the point would land on another target.
         const target = dropAt(at.x, at.y);
-        if (e.type !== "drop") return mark(target && "dest" in target ? target.mark : null);
+        if (e.type === "drop") dragging(false);
+        if (e.type !== "drop") {
+          if (!target || !("mark" in target)) return mark(null);
+          return mark(target.mark, "pin" in target ? target.cls : DROP_MARK);
+        }
         mark(null);
         // A drag of this window: its items as this app named them, not as the drop reports them
         // (resolved through junctions and SUBST drives, see shell.ts). Its keys are read at once,
@@ -807,6 +833,11 @@ export default function App() {
           if (!mine) toast(target.refuse);
           return;
         }
+        // Pinned, not copied: only folders are kept (a file dropped there is said so).
+        if ("pin" in target) {
+          placesRef.current.pin(mine?.paths ?? e.paths, target.pin, true);
+          return;
+        }
         dropFiles(mine?.paths ?? e.paths, target.dest, held);
       })
       .then((u) => (gone ? u() : (unlisten = u)))
@@ -816,6 +847,7 @@ export default function App() {
       gone = true;
       unlisten?.();
       mark(null);
+      document.documentElement.classList.remove(FILE_DRAG);
     };
   }, [dropAt, dropFiles, toast]);
 
@@ -1030,6 +1062,7 @@ export default function App() {
         ev.preventDefault();
         closeTab(activeId);
       } else if (ev.altKey && !ev.ctrlKey && !ev.metaKey && isLetter(ev, "p")) {
+        // The details pane (상세 정보): Alt+P, and Alt+Shift+P as in Explorer (Shift is not looked at).
         ev.preventDefault();
         togglePreview();
       } else if (ev.key === "F1" && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.shiftKey) {
@@ -1132,131 +1165,134 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
+      {/* The navigation pane: 즐겨찾기, drives, tools. ↑ ↓ move through its rows (sideNavKeys). */}
+      <nav className="sidebar" aria-label="탐색 창" onKeyDown={sideNavKeys}>
         <div className="brand">
           fine-file <span className="ver">v{version}</span>
         </div>
-        <div className="section">즐겨찾기</div>
-        {places.map((p) => (
-          <button
-            key={p.path}
-            className={`place ${path === p.path ? "active" : ""}`}
-            // Files dropped here go into the place (see the drop above), as on tabs and drives.
-            data-path={p.path}
-            title={`${p.path} (가운데 클릭: 새 탭)`}
-            onClick={() => go(p.path)}
-            onMouseDown={middle(p.path)}
-          >
-            {p.label}
-          </button>
-        ))}
-        <div className="section">드라이브</div>
-        {drives.map((d) => {
-          const used = d.total - d.free;
-          const pct = d.total ? (used / d.total) * 100 : 0;
-          // A drop reported by "index-stale" shows as "stale" while its banner is open, unless the
-          // watcher reports something more telling: an error, or that it is off. "off" without a
-          // detail only means live_status had no watcher for it yet (one that failed to start
-          // reports before it is registered). A sync running shows over all of them. A removed hard
-          // link (needsFull) stays until a full scan, whatever a newer watcher says, but an error
-          // or an "off" with a reason is told first.
-          const st = liveOf(d.letter);
-          const banner = stale[d.letter];
-          const full = needsFull[d.letter];
-          const syncing = isSyncing(d.letter);
-          const sp = syncs[d.letter];
-          const bannerWins = !st || st.state === "watching" || (st.state === "off" && st.detail === null);
-          const fullWins = full !== undefined && (bannerWins || st?.state === "stale");
-          const ls: LiveStatus | undefined = !d.indexed
-            ? undefined
-            : syncing
-              ? { drive: d.letter, state: "syncing", detail: sp?.detail ?? (st?.state === "syncing" ? st.detail : null) }
-              : fullWins
-                ? { drive: d.letter, state: "stale", detail: full }
-                : banner !== undefined && bannerWins
-                  ? { drive: d.letter, state: "stale", detail: banner }
-                  : st;
-          const why = sp ? SYNC_REASON[sp.reason] : undefined;
-          const scanThis = scanning === d.letter;
-          return (
-            <div key={d.letter} className={`drive ${drive?.letter === d.letter ? "active" : ""}`}>
-              <button
-                className="drive-main"
-                data-path={`${d.letter}\\`}
-                onClick={() => go(`${d.letter}\\`)}
-                onMouseDown={middle(`${d.letter}\\`)}
-                {...tip("drive")}
-              >
-                <div className="drive-name">
-                  {d.label || (d.kind === "unresponsive" ? "응답 없음" : "로컬 디스크")} ({d.letter})
-                </div>
-                <div className="usage">
-                  <span className={pct > 90 ? "full" : ""} style={{ width: `${pct}%` }} />
-                </div>
-                <div className="drive-meta">
-                  {d.kind === "unresponsive"
-                    ? "드라이브가 아직 응답하지 않아요"
-                    : `${formatSize(d.free)} 남음 / ${formatSize(d.total)}`}
-                </div>
-                <div className="drive-meta">
-                  {d.indexed
-                    ? `${METHOD_SHORT[d.method ?? ""] ?? "일반 스캔"} · ${timeAgo(d.scanned_at ?? 0)}`
-                    : "아직 스캔 안 함"}
-                </div>
-                {ls && (
-                  <div className={`drive-meta live ${ls.state}`} title={ls.detail ?? undefined}>
-                    {fullWins && !syncing ? NEEDS_FULL_LABEL : (LIVE_LABEL[ls.state] ?? ls.state)}
-                    {ls.state === "syncing" && why ? ` · ${why}` : ""}
-                  </div>
-                )}
-              </button>
-              {/* Scanned: "동기화" (normal rights, no UAC prompt). Not yet: "스캔" (the MFT, one UAC
-                  prompt). "▾": a full rescan with administrator rights, or a plain walk. */}
-              <div className="drive-actions">
-                {d.indexed ? (
-                  <button
-                    className="scan"
-                    disabled={scanThis || syncing}
-                    onClick={() => sync(d.letter)}
-                    {...tip(
-                      "sync",
-                      full !== undefined
-                        ? `${HELP_TIPS.sync}. 이 드라이브는 하드 링크가 여러 개인 파일이 지워져서 크기가 어긋났을 수 있는데, 그건 동기화로 바로잡히지 않아요: ▾ → "전체 다시 스캔"을 해 주세요`
-                        : undefined,
-                    )}
-                  >
-                    {syncing ? "동기화 중…" : scanThis ? "스캔 중…" : "동기화"}
-                  </button>
-                ) : (
-                  <button className="scan" disabled={scanning !== null} onClick={() => scan(d.letter)} {...tip("scan")}>
-                    {scanThis ? "스캔 중…" : "스캔"}
-                  </button>
-                )}
+        <FavoritesSection
+          places={places}
+          path={path}
+          onGo={go}
+          onOpenTab={openTab}
+          toast={toast}
+          onHelp={openHelp}
+        />
+        <SidebarSection id="drives" title="드라이브" places={places}>
+          {drives.map((d) => {
+            const used = d.total - d.free;
+            const pct = d.total ? (used / d.total) * 100 : 0;
+            // A drop reported by "index-stale" shows as "stale" while its banner is open, unless the
+            // watcher reports something more telling: an error, or that it is off. "off" without a
+            // detail only means live_status had no watcher for it yet (one that failed to start
+            // reports before it is registered). A sync running shows over all of them. A removed hard
+            // link (needsFull) stays until a full scan, whatever a newer watcher says, but an error
+            // or an "off" with a reason is told first.
+            const st = liveOf(d.letter);
+            const banner = stale[d.letter];
+            const full = needsFull[d.letter];
+            const syncing = isSyncing(d.letter);
+            const sp = syncs[d.letter];
+            const bannerWins = !st || st.state === "watching" || (st.state === "off" && st.detail === null);
+            const fullWins = full !== undefined && (bannerWins || st?.state === "stale");
+            const ls: LiveStatus | undefined = !d.indexed
+              ? undefined
+              : syncing
+                ? { drive: d.letter, state: "syncing", detail: sp?.detail ?? (st?.state === "syncing" ? st.detail : null) }
+                : fullWins
+                  ? { drive: d.letter, state: "stale", detail: full }
+                  : banner !== undefined && bannerWins
+                    ? { drive: d.letter, state: "stale", detail: banner }
+                    : st;
+            const why = sp ? SYNC_REASON[sp.reason] : undefined;
+            const scanThis = scanning === d.letter;
+            return (
+              <div key={d.letter} className={`drive ${drive?.letter === d.letter ? "active" : ""}`}>
                 <button
-                  className={`scan more ${driveMenu?.letter === d.letter ? "on" : ""}`}
-                  aria-haspopup="menu"
-                  aria-expanded={driveMenu?.letter === d.letter}
-                  aria-label={`${d.letter} 다른 스캔 방식`}
-                  onClick={(ev) => openDriveMenu(ev, d.letter)}
-                  {...tip("scanMore")}
+                  className="drive-main"
+                  data-side-nav=""
+                  data-path={`${d.letter}\\`}
+                  onClick={() => go(`${d.letter}\\`)}
+                  onMouseDown={middle(`${d.letter}\\`)}
+                  {...tip("drive")}
                 >
-                  ▾
+                  <div className="drive-name">
+                    {d.label || (d.kind === "unresponsive" ? "응답 없음" : "로컬 디스크")} ({d.letter})
+                  </div>
+                  <div className="usage">
+                    <span className={pct > 90 ? "full" : ""} style={{ width: `${pct}%` }} />
+                  </div>
+                  <div className="drive-meta">
+                    {d.kind === "unresponsive"
+                      ? "드라이브가 아직 응답하지 않아요"
+                      : `${formatSize(d.free)} 남음 / ${formatSize(d.total)}`}
+                  </div>
+                  <div className="drive-meta">
+                    {d.indexed
+                      ? `${METHOD_SHORT[d.method ?? ""] ?? "일반 스캔"} · ${timeAgo(d.scanned_at ?? 0)}`
+                      : "아직 스캔 안 함"}
+                  </div>
+                  {ls && (
+                    <div className={`drive-meta live ${ls.state}`} title={ls.detail ?? undefined}>
+                      {fullWins && !syncing ? NEEDS_FULL_LABEL : (LIVE_LABEL[ls.state] ?? ls.state)}
+                      {ls.state === "syncing" && why ? ` · ${why}` : ""}
+                    </div>
+                  )}
                 </button>
+                {/* Scanned: "동기화" (normal rights, no UAC prompt). Not yet: "스캔" (the MFT, one UAC
+                    prompt). "▾": a full rescan with administrator rights, or a plain walk. */}
+                <div className="drive-actions">
+                  {d.indexed ? (
+                    <button
+                      className="scan"
+                      disabled={scanThis || syncing}
+                      onClick={() => sync(d.letter)}
+                      {...tip(
+                        "sync",
+                        full !== undefined
+                          ? `${HELP_TIPS.sync}. 이 드라이브는 하드 링크가 여러 개인 파일이 지워져서 크기가 어긋났을 수 있는데, 그건 동기화로 바로잡히지 않아요: ▾ → "전체 다시 스캔"을 해 주세요`
+                          : undefined,
+                      )}
+                    >
+                      {syncing ? "동기화 중…" : scanThis ? "스캔 중…" : "동기화"}
+                    </button>
+                  ) : (
+                    <button className="scan" disabled={scanning !== null} onClick={() => scan(d.letter)} {...tip("scan")}>
+                      {scanThis ? "스캔 중…" : "스캔"}
+                    </button>
+                  )}
+                  <button
+                    className={`scan more ${driveMenu?.letter === d.letter ? "on" : ""}`}
+                    aria-haspopup="menu"
+                    aria-expanded={driveMenu?.letter === d.letter}
+                    aria-label={`${d.letter} 다른 스캔 방식`}
+                    onClick={(ev) => openDriveMenu(ev, d.letter)}
+                    {...tip("scanMore")}
+                  >
+                    ▾
+                  </button>
+                </div>
               </div>
-            </div>
-          );
-        })}
-        <div className="section">도구</div>
-        <button className="place" onClick={() => handles.current.get(activeId)?.openPrograms()} {...tip("programs")}>
-          프로그램 정리
-        </button>
-        <button className="place" onClick={() => setUpdateOpen(true)} {...tip("update")}>
-          업데이트{updateOffered ? " · 새 버전" : ""}
-        </button>
-        <button className="place" onClick={() => openHelp()} {...tip("help")}>
-          도움말 (F1)
-        </button>
-      </aside>
+            );
+          })}
+        </SidebarSection>
+        <SidebarSection id="tools" title="도구" places={places}>
+          <button
+            className="place"
+            data-side-nav=""
+            onClick={() => handles.current.get(activeId)?.openPrograms()}
+            {...tip("programs")}
+          >
+            프로그램 정리
+          </button>
+          <button className="place" data-side-nav="" onClick={() => setUpdateOpen(true)} {...tip("update")}>
+            업데이트{updateOffered ? " · 새 버전" : ""}
+          </button>
+          <button className="place" data-side-nav="" onClick={() => openHelp()} {...tip("help")}>
+            도움말 (F1)
+          </button>
+        </SidebarSection>
+      </nav>
 
       {/* Other ways to scan the drive than its button's. */}
       {driveMenu && menuDrive && (
@@ -1382,6 +1418,8 @@ export default function App() {
               planDrafts={planDrafts}
               onPlansChanged={refreshPlans}
               onHelp={openHelp}
+              pinned={places.isPinned}
+              onPin={setPinned}
             />
           ))}
         </div>

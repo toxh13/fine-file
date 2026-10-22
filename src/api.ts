@@ -513,3 +513,55 @@ export const v08 = {
   /** The installer did not start: the windows the updater hid come back. */
   updateInstallFailed: () => invoke<void>("update_install_failed"),
 };
+
+// ---- v0.8.1: the sidebar's 즐겨찾기 (Sidebar.tsx) ------------------------------------
+
+/** A folder Windows knows by its role (SHGetKnownFolderPath), or a OneDrive account's folder. */
+export type PlaceKind =
+  | "home"
+  | "desktop"
+  | "downloads"
+  | "documents"
+  | "pictures"
+  | "music"
+  | "videos"
+  | "onedrive"
+  | "onedrive_business";
+
+export interface Place {
+  /** Stable, for PlacesConfig.hidden ("desktop", "onedrive_business"…). */
+  id: string;
+  /** The shell's display name ("바탕 화면", "OneDrive - Personal"). */
+  label: string;
+  path: string;
+  kind: PlaceKind;
+}
+
+/** A folder the user pinned; `label` null shows the folder's own name. */
+export interface PinnedPlace {
+  path: string;
+  label: string | null;
+}
+
+/** What the sidebar keeps (places.json in the app's data folder). */
+export interface PlacesConfig {
+  /** In the order shown, at most 100. */
+  pinned: PinnedPlace[];
+  /** Known places (Place.id) the user hid. */
+  hidden: string[];
+  /** Folded sidebar sections: "quick", "drives", "tools". */
+  collapsed: string[];
+  /** Explorer's pinned folders were offered (or brought in) once. */
+  imported_explorer: boolean;
+}
+
+export const places = {
+  /** The known folders and OneDrive folders that exist, with the shell's names. */
+  known: () => invoke<Place[]>("known_places"),
+  /** Folders pinned in Explorer's Quick Access (홈 → 즐겨찾기), that exist. Rejects (Korean). */
+  explorerPins: () => invoke<string[]>("explorer_pins"),
+  get: () => invoke<PlacesConfig>("places_get"),
+  set: (config: PlacesConfig) => invoke<void>("places_set", { config }),
+  /** What a path is, from the item itself (no folder listing). Links count as what they are. */
+  pathKind: (path: string) => invoke<"dir" | "file" | "gone">("path_kind", { path }),
+};

@@ -1,4 +1,4 @@
-/* Preview pane, icon grid and transfer panel. Colors come from the variables in App.css. */
+/* Details pane (상세 정보), icon grid and transfer panel. Colors come from the variables in App.css. */
 
 /* ---- glyphs (items without a thumbnail) ---- */
 .glyph {
@@ -138,7 +138,7 @@
   outline: none;
 }
 
-/* ---- preview pane ---- */
+/* ---- details pane (상세 정보): the item, its details, then its preview ---- */
 .preview {
   flex: none;
   width: var(--preview-w, 320px);
@@ -282,17 +282,81 @@
   color: var(--muted);
 }
 
+/* The pane scrolls as one: the item, its details, and the preview under them. */
+.details-scroll {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.details-top {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 14px 10px;
+}
+
+.details-icon {
+  flex: none;
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+}
+
+.details-icon > img {
+  max-width: 56px;
+  max-height: 56px;
+  object-fit: contain;
+  border-radius: 3px;
+}
+
+.preview .details-icon .glyph {
+  --g: 44px;
+}
+
+/* Several items: two of them, one behind the other. */
+.preview .details-icon.stack .glyph {
+  position: absolute;
+  --g: 36px;
+}
+
+.details-icon.stack .glyph:first-child {
+  left: 4px;
+  top: 2px;
+  opacity: 0.55;
+}
+
+.details-icon.stack .glyph:last-child {
+  right: 4px;
+  bottom: 2px;
+}
+
+.details-title {
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  user-select: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .preview-meta {
   flex: none;
-  max-height: 40%;
-  overflow-y: auto;
   margin: 0;
-  padding: 10px 14px 12px;
+  padding: 2px 14px 12px;
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 4px 12px;
+  gap: 5px 12px;
   font-size: 12px;
-  border-top: 1px solid var(--line);
 }
 
 .preview-meta dt {
@@ -308,6 +372,88 @@
 
 .preview-path {
   user-select: text;
+}
+
+/* The location, and the button that copies the full path. */
+.details-loc {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.details-loc .preview-path {
+  flex: 1;
+  min-width: 0;
+}
+
+.details-copy {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 20px;
+  margin-top: -2px;
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.details-copy:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.details-copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The share of the folder it is in. */
+.details-share {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.details-share-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.details-share-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* "미리 보기": what the page can show of a file fills the rest of the pane (at least 240 px). */
+.details-preview {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+
+.details-preview.fill {
+  flex: 1 0 240px;
+  min-height: 0;
+}
+
+.details-sub {
+  flex: none;
+  margin: 0;
+  padding: 8px 14px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.details-hint {
+  margin: 0;
+  padding: 2px 14px 14px;
+  font-size: 12px;
 }
 
 /* ---- transfer panel ---- */

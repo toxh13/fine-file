@@ -1,6 +1,6 @@
 [package]
 name = "fine-file"
-version = "0.8.0"
+version = "0.8.1"
 description = "Fast Windows file explorer with folder sizes and instant search"
 authors = ["toxh13"]
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,7 @@ tauri-plugin-updater = "2.14.0"
 tauri-plugin-process = "2.4.0"
 
 [target.'cfg(windows)'.dependencies]
-# COM interfaces (shell thumbnails, the Explorer context menu) need the full bindings; everything else uses windows-sys.
+# COM interfaces (shell thumbnails, the Explorer context menu, Quick Access pins) need the full bindings; everything else uses windows-sys.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -45,6 +45,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-sys = { version = "0.59", features = [

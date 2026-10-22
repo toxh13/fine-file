@@ -295,17 +295,26 @@ input {
   background: var(--panel);
 }
 
+/* ---- toolbar: two rows, as in Windows 11 Explorer ---- */
+/* First the address and the search; under them the command bar. */
 .toolbar {
+  flex: none;
   display: flex;
-  /* A narrow window puts the search and the buttons on a second line, under the address. */
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 6px;
-  align-items: center;
-  padding: 8px 10px;
+  padding: 8px 10px 6px;
   border-bottom: 1px solid var(--line);
 }
 
+.toolbar-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .nav {
+  flex: none;
   width: 30px;
   height: 30px;
   border-radius: 6px;
@@ -316,9 +325,10 @@ input {
   background: var(--hover);
 }
 
+/* The address takes what the search leaves, and stays usable in the narrowest window (800 px). */
 .address {
-  flex: 1 1 240px;
-  min-width: 200px;
+  flex: 1 1 0;
+  min-width: 150px;
   height: 30px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -336,10 +346,12 @@ input {
   padding: 0 10px;
 }
 
+/* A path longer than the box shows its end: the folder shown (Explorer.tsx scrolls it there). */
 .crumbs {
   display: flex;
   align-items: center;
   flex: 1;
+  min-width: 0;
   height: 100%;
   padding: 0 4px;
   overflow: hidden;
@@ -348,6 +360,7 @@ input {
 }
 
 .crumb-wrap {
+  flex: none;
   display: inline-flex;
   align-items: center;
 }
@@ -365,23 +378,30 @@ input {
   color: var(--muted);
 }
 
+/* About 340 px, narrower only when the address would get too small. */
 .search {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex: 1 1 220px;
-  min-width: 170px;
-  max-width: 340px;
+  gap: 6px;
+  flex: 0 1 340px;
+  min-width: 190px;
+  max-width: 360px;
   height: 30px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
-  padding-left: 10px;
+  padding: 0 3px 0 8px;
 }
 
 .search:focus-within,
 .address:focus-within {
   border-color: var(--accent);
+}
+
+.search-icon {
+  flex: none;
+  display: inline-flex;
+  color: var(--muted);
 }
 
 .search input[type="text"],
@@ -393,14 +413,192 @@ input {
   background: transparent;
 }
 
+/* "이 폴더만": a small switch inside the box. */
 .scope {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 4px;
+  height: 22px;
+  padding: 0 7px 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
   font-size: 11px;
   color: var(--muted);
-  padding-right: 8px;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.scope input {
+  margin: 0;
+  width: 12px;
+  height: 12px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.scope:hover {
+  color: var(--text);
+}
+
+.search.here .scope {
+  border-color: var(--sel-line);
+  background: var(--sel);
+  color: var(--text);
+}
+
+.scope:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The command bar. Its buttons keep their width: what does not fit folds into "⋯" (useFold
+   measures the overflow). The padding keeps a focus ring at its edges in sight. */
+.cmdbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  margin: -2px;
+  padding: 2px;
+  overflow: hidden;
+}
+
+.cmd-end {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  padding-left: 6px;
+}
+
+.cmd {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.cmd:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.cmd.on {
+  background: var(--sel);
+  border-color: var(--sel-line);
+}
+
+.cmd:focus-visible,
+.nav:focus-visible,
+.crumb:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.cmd.icon-btn {
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+}
+
+.cmd.icon-btn.help-btn {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.cmd.more {
+  position: relative;
+}
+
+/* Plans wait to be looked at, and "계획" is in "⋯". */
+.cmd-dot {
+  position: absolute;
+  top: 5px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--panel);
+}
+
+.cmd-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--line);
+}
+
+.cmd-caret {
+  margin-left: -2px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* Folded far: the labels go, the icons stay (each button keeps its name for screen readers). */
+.cmdbar.fold-2 .cmd-label,
+.cmdbar.fold-3 .cmd-label {
+  display: none;
+}
+
+/* The command bar's menus (CommandBar.tsx): a check, an icon, the label and its key. */
+.cmd-menu {
+  min-width: 190px;
+}
+
+.menu.cmd-menu button:focus-visible {
+  outline: none;
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--sel-line);
+}
+
+.cmd-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cmd-menu-check {
+  flex: none;
+  width: 12px;
+  color: var(--accent);
+  font-weight: 650;
+  text-align: center;
+}
+
+.cmd-menu-icon {
+  flex: none;
+  display: inline-flex;
+  width: 16px;
+  color: var(--muted);
+}
+
+.menu button[aria-checked="true"] .cmd-menu-icon {
+  color: var(--accent);
+}
+
+.cmd-menu-label {
+  flex: 1;
+  white-space: nowrap;
+}
+
+.cmd-menu-keys {
+  flex: none;
+  margin-left: 18px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.menu button:disabled .cmd-menu-row {
+  cursor: default;
 }
 
 .banner {
@@ -511,7 +709,7 @@ input {
   box-shadow: 0 0 0 1px var(--line);
 }
 
-/* New folder, preview: one button each, in the toggle's frame. */
+/* Buttons in the toggle's frame (the size map's own bar). */
 .tool {
   flex: none;
   height: 30px;
@@ -1136,18 +1334,9 @@ input {
   vertical-align: 1px;
 }
 
-.tool.gear {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 8px;
-}
-
-/* v0.7: the help ("?", F1). */
-.tool.help-btn {
-  min-width: 30px;
-  padding: 0 9px;
-  font-size: 13px;
-  font-weight: 650;
+/* In the command bar the button's gap already sets it apart. */
+.cmd .tool-badge {
+  margin-left: -1px;
 }
 
 /* A header that does not sort (위험도: answers come in a while after the rows). */

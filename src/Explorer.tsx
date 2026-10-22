@@ -20,6 +20,7 @@ import {
 import { AdminBar, adminCanRead, adminError, ensureAdmin } from "./AdminSession";
 import { AiPanel, contentsNote } from "./AiPanel";
 import { AiSettings } from "./AiSettings";
+import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
 import { FileTable, type ChangeCell, type Column, type RiskCell, type SortKey } from "./FileTable";
 import { GridView, gridStep } from "./GridView";
@@ -37,6 +38,10 @@ export type View = "list" | "tree" | "grid" | "map";
 export const VIEWS: View[] = ["list", "tree", "grid", "map"];
 const VIEW_LABEL: Record<View, string> = { list: "목록", tree: "트리", grid: "아이콘", map: "지도" };
 const VIEW_TIP: Record<View, string> = { list: "viewList", tree: "viewTree", grid: "viewGrid", map: "viewMap" };
+const VIEW_ICON: Record<View, () => React.ReactNode> = { list: Icon.list, tree: Icon.tree, grid: Icon.grid, map: Icon.map };
+
+/** Search results are always a list: the view menu waits. */
+const SEARCH_VIEW = "검색 결과는 목록으로 보여요";
 
 /**
  * What the buttons and menu items do, as their tooltips: the help's short texts (HELP_TIPS), and
@@ -53,6 +58,7 @@ export const TIPS: Record<string, string> = {
   explain: "이 항목이 무엇인지, 어느 프로그램 것인지, 지워도 되는지 AI에게 설명을 받아요 (AI는 켜야 쓰는 선택 기능)",
   planMenu: "규칙(AI 없이)이나 AI로 이 폴더의 정리 계획을 만들어요. 만들기만 하고, 계획 창에서 확인하고 실행해야 바뀌어요",
   tools: "중복 파일 찾기, 프로그램 정리, 옮긴 폴더 목록, 크기 지도",
+  more: "더 보기: 창이 좁아서 접어 둔 명령 (변화, 도구, AI, 계획…)",
   help: "도움말 (F1): 기능 설명, 검색 문법, 문제 해결",
   drive: "이 드라이브를 열어요. 가운데 클릭하면 새 탭에서 열려요",
   scanMore: "다른 스캔 방식: 관리자 권한으로 전체 다시 스캔, 일반 탐색으로 다시 스캔",
@@ -240,8 +246,6 @@ interface Menu {
   target?: Entry;
   /** The empty area around the rows: the menu acts on the folder shown. */
   background?: boolean;
-  /** The toolbar's "도구" button. */
-  tools?: boolean;
 }
 
 /** AI settings and which keys are saved (App reads them once and after the settings close). */
@@ -402,6 +406,10 @@ export interface ExplorerProps {
   onPlansChanged: () => void;
   /** The toolbar's "?": the help (App's, as F1 opens it), at `topic` when given. */
   onHelp: (topic?: string) => void;
+  /** v0.8.1: whether a folder is in the sidebar's 즐겨찾기 (pinned, or a known place shown). */
+  pinned: (path: string) => boolean;
+  /** "즐겨찾기에 고정" / "즐겨찾기에서 고정 해제" of a folder's menu. */
+  onPin: (path: string, pin: boolean) => void;
 }
 
 /** One tab: its own history, folder, view, search, selection and tree. */
@@ -447,7 +455,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const [reveal, setReveal] = useState<{ dir: string; file: string } | null>(null);
   // Bumped by F5 and the refresh button: the size map draws again.
   const [mapNonce, setMapNonce] = useState(0);
-  const toolsButton = useRef<HTMLButtonElement>(null);
+  // The toolbar's second row (the command bar), and the address's breadcrumbs.
+  const cmdBar = useRef<HTMLDivElement>(null);
+  const crumbsBox = useRef<HTMLDivElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
   const root = useRef<HTMLDivElement>(null);
 
@@ -1308,7 +1318,12 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       items.map((i) => i.path),
       cut,
     ).then(
-      () => toast(cut ? `잘라냈어요: ${what}. 옮길 폴더에서 붙여넣으세요 (Ctrl+V)` : `복사했어요: ${what}`),
+      () => {
+        // The command bar's "붙여넣기" may have known an empty clipboard.
+        clipAsk.current++;
+        setCanPaste(true);
+        toast(cut ? `잘라냈어요: ${what}. 옮길 폴더에서 붙여넣으세요 (Ctrl+V)` : `복사했어요: ${what}`);
+      },
       (err) => toast(String(err), "error"),
     );
   };
@@ -1371,14 +1386,19 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     }
   };
 
-  const openMenu = (m: Menu) => {
-    setMenu(m);
-    setCanPaste(null);
+  // Whether the clipboard holds files: asked as a menu opens, and as the pointer (or the focus)
+  // comes to the command bar, whose "붙여넣기" is off while it is known to hold none.
+  const askClipboard = () => {
     const ask = ++clipAsk.current;
     ops.clipboardRead().then(
       (c) => ask === clipAsk.current && setCanPaste(c.paths.length > 0),
       () => {},
     );
+  };
+  const openMenu = (m: Menu) => {
+    setMenu(m);
+    setCanPaste(null);
+    askClipboard();
   };
 
   // The Explorer context menu ("Windows 메뉴"), with what other programs add to it, at a point of
@@ -1477,6 +1497,14 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         return;
       }
       const ctrl = ev.ctrlKey && !ev.altKey && !ev.metaKey;
+      // Ctrl+Shift+1~4: 목록, 트리, 아이콘, 지도 (Explorer's Ctrl+Shift+number). By the key's
+      // place, as Shift turns "1" into "!". Search results stay a list.
+      const viewKey = ctrl && ev.shiftKey ? /^Digit([1-4])$/.exec(ev.code) : null;
+      if (viewKey) {
+        ev.preventDefault();
+        if (!searching) changeView(VIEWS[Number(viewKey[1]) - 1]);
+        return;
+      }
       if (ctrl && ev.shiftKey && isLetter(ev, "n")) {
         ev.preventDefault();
         newFolder();
@@ -1620,28 +1648,90 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const one = selectedEntries.length === 1 ? selectedEntries[0] : null;
   const previewEntry = treeShown ? (treeFocus?.e ?? null) : mapShown ? null : (rows[focus] ?? null);
   const previewSized = treeShown ? !!treeFocus?.sized : searching || !!fresh?.indexed;
+  // The details pane: several items selected in the list or icons show as one summary.
+  const detailsMany = !treeShown && !mapShown && selectedEntries.length > 1;
+  // The size of the folder shown, for the share of it an item (or the selection) takes: known in
+  // a scanned folder; in the tree, for its top rows only.
+  const detailsParent =
+    searching || !fresh?.indexed || !current
+      ? undefined
+      : !treeShown
+        ? total
+        : previewEntry && treeFocus?.sized && pathKey(parentOf(previewEntry.path) ?? "") === pathKey(path)
+          ? total
+          : undefined;
+  // What the command bar's clipboard buttons act on: as Ctrl+C / Ctrl+X do (the tree's row; the
+  // map has no selection). Rename and trash stay with the list and icons, as their keys do.
+  const clipItems = treeShown ? (treeFocus ? [treeFocus.e] : []) : mapShown ? [] : selectedEntries;
+  const listKeys = !treeShown && !mapShown;
+  const noClip = readOnly
+    ? READ_ONLY
+    : mapShown
+      ? "지도에는 고른 항목이 없어요. 목록이나 아이콘 보기에서 골라 주세요"
+      : clipItems.length
+        ? undefined
+        : "먼저 항목을 골라 주세요";
+  const noPaste = searching
+    ? "검색 결과에는 붙여넣을 수 없어요. 검색을 닫고 붙여넣으세요"
+    : readOnly
+      ? READ_ONLY
+      : canPaste === false
+        ? "클립보드에 붙여넣을 파일이 없어요"
+        : !path
+          ? "붙여넣을 폴더가 없어요"
+          : undefined;
+  const noRename = readOnly
+    ? READ_ONLY
+    : !listKeys
+      ? "이름 바꾸기는 목록이나 아이콘 보기에서 해요"
+      : one
+        ? undefined
+        : "이름을 바꿀 항목을 하나만 골라 주세요";
+  const noTrash = readOnly
+    ? READ_ONLY
+    : !listKeys
+      ? "휴지통으로 보내기는 목록이나 아이콘 보기에서 해요"
+      : selectedEntries.length
+        ? undefined
+        : "먼저 항목을 골라 주세요";
+  // The command bar folds into "⋯" in a narrow window; measured again when its buttons change.
+  const fold = useFold(cmdBar, `${view}|${jevOk}|${p.planDrafts > 0 ? (p.planDrafts > 99 ? 3 : String(p.planDrafts).length) : 0}`);
+
+  // The breadcrumbs show their end (the folder shown) when the path is longer than the box.
+  useLayoutEffect(() => {
+    const el = crumbsBox.current;
+    if (!el) return;
+    const end = () => {
+      el.scrollLeft = el.scrollWidth;
+    };
+    end();
+    const ro = new ResizeObserver(end);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [path, editingAddress]);
   const pasteTitle = canPaste === false ? "클립보드에 붙여넣을 파일이 없어요" : undefined;
   const emptyText = searching ? "검색 결과가 없어요" : fresh || loadError ? "빈 폴더예요" : "불러오는 중…";
   const denied = !searching && !readOnly && loadError !== null && isDenied(loadError);
   // Refused, and somewhere the admin session can read (not a network place).
   const elevatable = denied && adminCanRead(path, p.drives);
 
-  const openTools = (ev: React.MouseEvent) => {
-    // The click would reach the window and close the menu it opens.
-    ev.stopPropagation();
-    if (menu?.tools) {
-      setMenu(null);
-      return;
-    }
-    // Under the button, lined up with its left edge; at the window's right edge, with its right
-    // edge (the menu's layout puts one that does not fit to the right of x on its left).
-    const r = toolsButton.current?.getBoundingClientRect();
-    const x = !r ? ev.clientX : r.left + 240 <= window.innerWidth ? r.left : r.right;
-    setMenu({ x, y: (r?.bottom ?? ev.clientY) + 4, tools: true });
-  };
   const openDialog = (d: TabDialog) => {
     setMenu(null);
     setDialog(d);
+  };
+
+  /**
+   * v0.8.1: a folder's "즐겨찾기에 고정", or "고정 해제" when the sidebar's 즐겨찾기 has it.
+   * `what`: the menu of the empty area says which folder ("이 폴더를 ").
+   */
+  const pinItem = (folder: string, what = "") => {
+    const on = p.pinned(folder);
+    return (
+      <button onClick={() => (setMenu(null), p.onPin(folder, !on))} {...tip(on ? "unpin" : "pin")}>
+        {what}
+        {on ? "즐겨찾기에서 고정 해제" : "즐겨찾기에 고정"}
+      </button>
+    );
   };
 
   // ---- v0.6: AI and plans ----
@@ -1808,187 +1898,355 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     );
   };
 
+  // ---- the toolbar: the address and the search, and under them the command bar ----
+
+  // The 도구 menu's items; in a narrow window they are in "⋯" too, as rows lined up with its others.
+  const toolItems = (inMore: boolean) => {
+    const row = (label: string) => (inMore ? <MenuRow check={false} icon={null} label={label} /> : label);
+    return (
+      <>
+        <button role="menuitem" disabled={!path} onClick={() => openDialog({ kind: "dups" })} {...tip("dups")}>
+          {row("중복 파일 찾기…")}
+        </button>
+        <button role="menuitem" onClick={() => openDialog({ kind: "programs" })} {...tip("programs")}>
+          {row("프로그램 정리…")}
+        </button>
+        <button role="menuitem" onClick={() => openDialog({ kind: "relocs" })} {...tip("relocations")}>
+          {row("옮긴 폴더 목록…")}
+        </button>
+      </>
+    );
+  };
+  const diffTitle = searching
+    ? "검색 결과에는 변화 열이 없어요"
+    : readOnly
+      ? "관리자 권한으로 읽는 폴더는 스캔 결과와 비교할 수 없어요"
+      : "지난 스캔 뒤로 크기가 얼마나 늘고 줄었는지 보여 주는 열을 더해요";
+  const riskTitle = searching
+    ? "검색 결과에는 위험도 열이 없어요"
+    : readOnly
+      ? "관리자 권한으로 읽는 폴더는 jev에 묻지 않아요"
+      : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)";
+  const aiTitle = readOnly
+    ? "관리자 권한으로 읽는 폴더에서는 쓸 수 없어요"
+    : aiBlocker(p.ai) === null
+      ? undefined
+      : "정리 도우미: 규칙으로 정리 계획을 만들어요 (AI는 꺼져 있어요. 톱니바퀴(AI 설정)에서 켤 수 있어요)";
+  const plansTitle =
+    p.planDrafts > 0
+      ? `정리 계획 목록 · Claude 앱이 MCP로 제안한 계획 ${p.planDrafts.toLocaleString()}개가 확인을 기다려요`
+      : undefined;
+  const badge = p.planDrafts > 0 && <span className="tool-badge">{p.planDrafts > 99 ? "99+" : p.planDrafts}</span>;
+  const newFolderOff = readOnly
+    ? READ_ONLY
+    : searching
+      ? "새 폴더는 검색을 닫고 만들 수 있어요"
+      : mapShown
+        ? "새 폴더는 목록이나 아이콘 보기에서 만들 수 있어요"
+        : undefined;
+  // The clipboard and file commands: icons in the bar, items of "⋯" when the bar folds that far.
+  // Each does what its key does, and is off (saying why) where the key does nothing.
+  const fileCmds: { key: string; label: string; keys: string; icon: () => React.ReactNode; off?: string; run: () => void }[] = [
+    { key: "cut", label: "잘라내기", keys: "Ctrl+X", icon: Icon.cut, off: noClip, run: () => toClipboard(clipItems, true) },
+    { key: "copy", label: "복사", keys: "Ctrl+C", icon: Icon.copy, off: noClip, run: () => toClipboard(clipItems, false) },
+    { key: "paste", label: "붙여넣기", keys: "Ctrl+V", icon: Icon.paste, off: noPaste, run: () => paste(path) },
+    { key: "rename", label: "이름 바꾸기", keys: "F2", icon: Icon.rename, off: noRename, run: () => one && setRenaming(one.path) },
+    {
+      key: "trash",
+      label: "휴지통으로 이동",
+      keys: "Delete",
+      icon: Icon.trash,
+      off: noTrash ?? (trashLock.busy ? "휴지통으로 옮기는 중이에요. 끝난 뒤에 다시 해 주세요" : undefined),
+      run: () => !trashLock.busy && setConfirmTrash(selectedEntries),
+    },
+  ];
+
   return (
     // data-tab: App's drop finds the tab a drop lands on (see dropTarget).
     <div ref={root} className={`explorer ${active ? "" : "hidden"}`} data-tab={id}>
       <div className="toolbar">
-        <button className="nav" title="뒤로 (Alt+←)" disabled={pos <= 0} onClick={() => go(-1)}>
-          ←
-        </button>
-        <button className="nav" title="앞으로 (Alt+→)" disabled={pos >= history.length - 1} onClick={() => go(1)}>
-          →
-        </button>
-        <button className="nav" title="위로 (Backspace)" disabled={!parentOf(path)} onClick={goUp}>
-          ↑
-        </button>
-        <button className="nav" title="새로 고침 (F5)" onClick={refreshView}>
-          ⟳
-        </button>
-        <form
-          className="address"
-          onSubmit={(e) => {
-            e.preventDefault();
-            setEditingAddress(false);
-            // An empty address goes nowhere; the current folder comes back.
-            setAddress(path);
-            if (normalizePath(address)) navigate(address);
-          }}
-        >
-          {editingAddress ? (
-            <input
-              autoFocus
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              onFocus={(e) => e.currentTarget.select()}
-              onBlur={() => (setEditingAddress(false), setAddress(path))}
-              onKeyDown={(e) => e.key === "Escape" && (setEditingAddress(false), setAddress(path))}
-              spellCheck={false}
-            />
-          ) : (
-            <div className="crumbs" onClick={() => setEditingAddress(true)}>
-              {crumbs.map((c, i) => (
-                <span key={i} className="crumb-wrap">
-                  {i > 0 && <span className="sep">›</span>}
-                  <button
-                    type="button"
-                    className="crumb"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigate(crumbs.slice(0, i + 1).join("\\") + (i === 0 ? "\\" : ""));
-                    }}
-                  >
-                    {c}
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-        </form>
-        <div className="search">
-          <input
-            ref={searchBox}
-            placeholder={scopeHere ? "이 폴더에서 검색 (Ctrl+F)" : "모든 드라이브에서 검색 (Ctrl+F)"}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && setQuery("")}
-            spellCheck={false}
-            {...tip("search")}
-          />
-          <label className="scope" {...tip("searchHere")}>
-            <input type="checkbox" checked={scopeHere} onChange={(e) => setScopeHere(e.target.checked)} />
-            이 폴더만
-          </label>
-        </div>
-        <div className="view-toggle" role="group" aria-label="보기 방식" title={searching ? "검색 결과는 목록으로 보여요" : undefined}>
-          {VIEWS.map((v) => (
-            <button
-              key={v}
-              className={view === v ? "on" : ""}
-              aria-pressed={view === v}
-              disabled={searching}
-              onClick={() => changeView(v)}
-              {...tip(VIEW_TIP[v], searching ? "검색 결과는 목록으로 보여요" : undefined)}
-            >
-              {VIEW_LABEL[v]}
-            </button>
-          ))}
-        </div>
-        {view === "list" && (
+        {/* First row, as in Explorer: where you are, and the search. */}
+        <div className="toolbar-top">
+          <button className="nav" aria-label="뒤로" title="뒤로 (Alt+←)" disabled={pos <= 0} onClick={() => go(-1)}>
+            ←
+          </button>
           <button
-            className={`tool ${diffOn ? "on" : ""}`}
-            aria-pressed={diffOn}
-            disabled={searching || readOnly}
-            {...tip(
-              "diff",
-              searching
-                ? "검색 결과에는 변화 열이 없어요"
-                : readOnly
-                  ? "관리자 권한으로 읽는 폴더는 스캔 결과와 비교할 수 없어요"
-                  : "지난 스캔 뒤로 크기가 얼마나 늘고 줄었는지 보여 주는 열을 더해요",
+            className="nav"
+            aria-label="앞으로"
+            title="앞으로 (Alt+→)"
+            disabled={pos >= history.length - 1}
+            onClick={() => go(1)}
+          >
+            →
+          </button>
+          <button className="nav" aria-label="위로" title="위로 (Backspace)" disabled={!parentOf(path)} onClick={goUp}>
+            ↑
+          </button>
+          <button className="nav" aria-label="새로 고침" title="새로 고침 (F5)" onClick={refreshView}>
+            ⟳
+          </button>
+          <form
+            className="address"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setEditingAddress(false);
+              // An empty address goes nowhere; the current folder comes back.
+              setAddress(path);
+              if (normalizePath(address)) navigate(address);
+            }}
+          >
+            {editingAddress ? (
+              <input
+                autoFocus
+                aria-label="주소"
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                onFocus={(e) => e.currentTarget.select()}
+                onBlur={() => (setEditingAddress(false), setAddress(path))}
+                onKeyDown={(e) => e.key === "Escape" && (setEditingAddress(false), setAddress(path))}
+                spellCheck={false}
+              />
+            ) : (
+              <div ref={crumbsBox} className="crumbs" title={path} onClick={() => setEditingAddress(true)}>
+                {crumbs.map((c, i) => (
+                  <span key={i} className="crumb-wrap">
+                    {i > 0 && <span className="sep">›</span>}
+                    <button
+                      type="button"
+                      className="crumb"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(crumbs.slice(0, i + 1).join("\\") + (i === 0 ? "\\" : ""));
+                      }}
+                    >
+                      {c}
+                    </button>
+                  </span>
+                ))}
+              </div>
             )}
-            onClick={toggleDiff}
-          >
-            변화
-          </button>
-        )}
-        {/* jev on in the AI settings, with its key: this tab's 위험도 column. */}
-        {view === "list" && jevOk && (
+          </form>
+          <div className={`search${scopeHere ? " here" : ""}`}>
+            <span className="search-icon">
+              <Icon.search />
+            </span>
+            <input
+              ref={searchBox}
+              aria-label={scopeHere ? "이 폴더에서 검색" : "모든 드라이브에서 검색"}
+              placeholder={scopeHere ? "이 폴더에서 검색 (Ctrl+F)" : "모든 드라이브에서 검색 (Ctrl+F)"}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+              spellCheck={false}
+              {...tip("search")}
+            />
+            <label className="scope" {...tip("searchHere")}>
+              <input type="checkbox" checked={scopeHere} onChange={(e) => setScopeHere(e.target.checked)} />
+              이 폴더만
+            </label>
+          </div>
+        </div>
+
+        {/* Second row, the command bar (Windows 11 Explorer's). In a narrow window the less used
+            commands fold into "⋯" (useFold). */}
+        <div
+          ref={cmdBar}
+          className={`cmdbar fold-${fold}`}
+          onPointerEnter={askClipboard}
+          onFocus={(e) => !e.currentTarget.contains(e.relatedTarget as Node | null) && askClipboard()}
+        >
           <button
-            className={`tool ${riskOn ? "on" : ""}`}
-            aria-pressed={riskOn}
-            disabled={searching || readOnly}
-            title={
-              searching
-                ? "검색 결과에는 위험도 열이 없어요"
-                : readOnly
-                  ? "관리자 권한으로 읽는 폴더는 jev에 묻지 않아요"
-                  : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)"
-            }
-            onClick={toggleRisk}
+            className="cmd"
+            aria-label="새 폴더"
+            disabled={searching || !fresh || mapShown}
+            onClick={newFolder}
+            {...tip("newFolder", newFolderOff)}
           >
-            위험도
+            <Icon.newFolder />
+            <span className="cmd-label">새 폴더</span>
           </button>
-        )}
-        <button
-          className="tool"
-          disabled={searching || !fresh || mapShown}
-          onClick={newFolder}
-          {...tip("newFolder", readOnly ? READ_ONLY : undefined)}
-        >
-          새 폴더
-        </button>
-        <button
-          className={`tool ${p.previewOpen ? "on" : ""}`}
-          aria-pressed={p.previewOpen}
-          onClick={p.onTogglePreview}
-          {...tip("preview")}
-        >
-          미리 보기
-        </button>
-        <button
-          ref={toolsButton}
-          className={`tool ${menu?.tools ? "on" : ""}`}
-          aria-haspopup="menu"
-          aria-expanded={!!menu?.tools}
-          onClick={openTools}
-          {...tip("tools")}
-        >
-          도구 ▾
-        </button>
-        <button
-          className="tool"
-          disabled={!path || readOnly}
-          {...tip(
-            "ai",
-            readOnly
-              ? "관리자 권한으로 읽는 폴더에서는 쓸 수 없어요"
-              : aiBlocker(p.ai) === null
-                ? undefined
-                : "정리 도우미: 규칙으로 정리 계획을 만들어요 (AI는 꺼져 있어요. 톱니바퀴(AI 설정)에서 켤 수 있어요)",
+          {fold < FOLD_MAX && (
+            <>
+              <span className="cmd-sep" aria-hidden="true" />
+              {fileCmds.map((c) => (
+                <button key={c.key} className="cmd icon-btn" aria-label={c.label} disabled={!!c.off} onClick={c.run} {...tip(c.key, c.off)}>
+                  {c.icon()}
+                </button>
+              ))}
+            </>
           )}
-          onClick={() => openAi({ path, is_dir: true })}
-        >
-          AI
-        </button>
-        <button
-          className="tool"
-          {...tip(
-            "plans",
-            p.planDrafts > 0
-              ? `정리 계획 목록 · Claude 앱이 MCP로 제안한 계획 ${p.planDrafts.toLocaleString()}개가 확인을 기다려요`
-              : undefined,
+          <span className="cmd-sep" aria-hidden="true" />
+          <MenuButton
+            name="보기 방식"
+            active={active}
+            disabled={searching}
+            label={
+              <>
+                {VIEW_ICON[view]()}
+                <span className="cmd-label">보기</span>
+                <Caret />
+              </>
+            }
+            attrs={{ "aria-label": `보기: ${VIEW_LABEL[view]}`, ...tip("view", searching ? SEARCH_VIEW : undefined) }}
+          >
+            {VIEWS.map((v, i) => (
+              <button key={v} role="menuitemradio" aria-checked={view === v} onClick={() => changeView(v)} {...tip(VIEW_TIP[v])}>
+                <MenuRow check={view === v} icon={VIEW_ICON[v]()} label={VIEW_LABEL[v]} keys={`Ctrl+Shift+${i + 1}`} />
+              </button>
+            ))}
+          </MenuButton>
+          {fold < 1 && view === "list" && (
+            <button
+              className={`cmd ${diffOn ? "on" : ""}`}
+              aria-pressed={diffOn}
+              disabled={searching || readOnly}
+              {...tip("diff", diffTitle)}
+              onClick={toggleDiff}
+            >
+              <Icon.diff />
+              <span className="cmd-label">변화</span>
+            </button>
           )}
-          onClick={() => openDialog({ kind: "plans" })}
-        >
-          계획
-          {p.planDrafts > 0 && <span className="tool-badge">{p.planDrafts > 99 ? "99+" : p.planDrafts}</span>}
-        </button>
-        <button className="tool gear" aria-label="AI 설정" onClick={() => openDialog({ kind: "aiSettings" })} {...tip("aiSettings")}>
-          <GearIcon />
-        </button>
-        <button className="tool help-btn" aria-label="도움말" onClick={() => p.onHelp()} {...tip("help")}>
-          ?
-        </button>
+          {/* jev on in the AI settings, with its key: this tab's 위험도 column. */}
+          {fold < 1 && view === "list" && jevOk && (
+            <button
+              className={`cmd ${riskOn ? "on" : ""}`}
+              aria-pressed={riskOn}
+              disabled={searching || readOnly}
+              title={riskTitle}
+              onClick={toggleRisk}
+            >
+              <span className="cmd-label">위험도</span>
+            </button>
+          )}
+          <button
+            className={`cmd ${p.previewOpen ? "on" : ""}`}
+            aria-label="상세 정보"
+            aria-pressed={p.previewOpen}
+            onClick={p.onTogglePreview}
+            {...tip("details")}
+          >
+            <Icon.details />
+            <span className="cmd-label">상세 정보</span>
+          </button>
+          {fold >= 1 && (
+            <MenuButton
+              className="cmd icon-btn more"
+              name="더 보기"
+              active={active}
+              label={
+                <>
+                  <Icon.more />
+                  {p.planDrafts > 0 && <span className="cmd-dot" />}
+                </>
+              }
+              attrs={{
+                "aria-label":
+                  p.planDrafts > 0 ? `더 보기 · 확인을 기다리는 계획 ${p.planDrafts.toLocaleString()}개` : "더 보기",
+                ...tip("more"),
+              }}
+            >
+              {fold >= FOLD_MAX && (
+                <>
+                  {fileCmds.map((c) => (
+                    <button key={c.key} role="menuitem" disabled={!!c.off} onClick={c.run} {...tip(c.key, c.off)}>
+                      <MenuRow check={false} icon={c.icon()} label={c.label} keys={c.keys} />
+                    </button>
+                  ))}
+                  <hr />
+                </>
+              )}
+              {view === "list" && (
+                <>
+                  <button
+                    role="menuitemcheckbox"
+                    aria-checked={diffOn}
+                    disabled={searching || readOnly}
+                    onClick={toggleDiff}
+                    {...tip("diff", diffTitle)}
+                  >
+                    <MenuRow check={diffOn} icon={<Icon.diff />} label="변화" />
+                  </button>
+                  {jevOk && (
+                    <button
+                      role="menuitemcheckbox"
+                      aria-checked={riskOn}
+                      disabled={searching || readOnly}
+                      onClick={toggleRisk}
+                      title={riskTitle}
+                    >
+                      <MenuRow check={riskOn} icon={null} label="위험도" />
+                    </button>
+                  )}
+                  <hr />
+                </>
+              )}
+              {toolItems(true)}
+              <hr />
+              <button role="menuitem" disabled={!path || readOnly} onClick={() => openAi({ path, is_dir: true })} {...tip("ai", aiTitle)}>
+                <MenuRow check={false} icon={null} label="AI (정리 도우미)…" />
+              </button>
+              <button role="menuitem" onClick={() => openDialog({ kind: "plans" })} {...tip("plans", plansTitle)}>
+                <MenuRow
+                  check={false}
+                  icon={null}
+                  label={
+                    <>
+                      계획
+                      {badge}
+                    </>
+                  }
+                />
+              </button>
+            </MenuButton>
+          )}
+
+          <span className="cmd-end">
+            {fold < 1 && (
+              <>
+                <MenuButton
+                  name="도구"
+                  active={active}
+                  label={
+                    <>
+                      <span className="cmd-label">도구</span>
+                      <Caret />
+                    </>
+                  }
+                  attrs={tip("tools")}
+                >
+                  {toolItems(false)}
+                  <hr />
+                  <button
+                    role="menuitem"
+                    disabled={searching}
+                    onClick={() => changeView("map")}
+                    {...tip("viewMap", searching ? SEARCH_VIEW : undefined)}
+                  >
+                    크기 지도로 보기
+                  </button>
+                  <hr />
+                  <button role="menuitem" onClick={() => p.onHelp()} {...tip("help")}>
+                    도움말 (F1)
+                  </button>
+                </MenuButton>
+                <button className="cmd" disabled={!path || readOnly} {...tip("ai", aiTitle)} onClick={() => openAi({ path, is_dir: true })}>
+                  AI
+                </button>
+                <button className="cmd" {...tip("plans", plansTitle)} onClick={() => openDialog({ kind: "plans" })}>
+                  계획
+                  {badge}
+                </button>
+              </>
+            )}
+            <button className="cmd icon-btn" aria-label="AI 설정" onClick={() => openDialog({ kind: "aiSettings" })} {...tip("aiSettings")}>
+              <GearIcon />
+            </button>
+            <button className="cmd icon-btn help-btn" aria-label="도움말" onClick={() => p.onHelp()} {...tip("help")}>
+              ?
+            </button>
+          </span>
+        </div>
       </div>
 
       {p.banners}
@@ -2172,13 +2430,16 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           )}
         </div>
 
-        {/* Only the tab shown asks for previews. */}
+        {/* The details pane (상세 정보). Only the tab shown asks for previews. */}
         {active && p.previewOpen && (
           <>
-            <div className="divider" title="끌어서 미리 보기 너비 바꾸기" onPointerDown={startResize} />
+            <div className="divider" title="끌어서 상세 정보 창 너비 바꾸기" onPointerDown={startResize} />
             <Preview
-              entry={previewEntry}
+              entry={detailsMany ? null : previewEntry}
+              selection={detailsMany ? selectedEntries : undefined}
+              parentSize={detailsParent}
               onClose={p.onTogglePreview}
+              onCopyPaths={copyPaths}
               sized={previewSized}
               adminFolder={readOnly}
               drives={p.drives}
@@ -2233,6 +2494,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               새 탭에서 열기
             </button>
           )}
+          {target.is_dir && pinItem(target.path)}
           <button
             onClick={() => (setMenu(null), api.reveal(target.path).catch((err) => toast(String(err), "error")))}
             {...tip("reveal")}
@@ -2283,33 +2545,6 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         </div>
       )}
 
-      {menu?.tools && (
-        <div ref={menuBox} className="menu" role="menu" onClick={(e) => e.stopPropagation()}>
-          <button role="menuitem" disabled={!path} onClick={() => openDialog({ kind: "dups" })} {...tip("dups")}>
-            중복 파일 찾기…
-          </button>
-          <button role="menuitem" onClick={() => openDialog({ kind: "programs" })} {...tip("programs")}>
-            프로그램 정리…
-          </button>
-          <button role="menuitem" onClick={() => openDialog({ kind: "relocs" })} {...tip("relocations")}>
-            옮긴 폴더 목록…
-          </button>
-          <hr />
-          <button
-            role="menuitem"
-            disabled={searching}
-            onClick={() => (setMenu(null), changeView("map"))}
-            {...tip("viewMap", searching ? "검색 결과는 목록으로 보여요" : undefined)}
-          >
-            크기 지도로 보기
-          </button>
-          <hr />
-          <button role="menuitem" onClick={() => (setMenu(null), p.onHelp())} {...tip("help")}>
-            도움말 (F1)
-          </button>
-        </div>
-      )}
-
       {menu?.background && (
         <div ref={menuBox} className="menu" onClick={(e) => e.stopPropagation()}>
           <button
@@ -2322,6 +2557,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           <button disabled={!fresh} onClick={() => (setMenu(null), newFolder())} {...tip("newFolder")}>
             새 폴더 (Ctrl+Shift+N)
           </button>
+          {pinItem(path, "이 폴더를 ")}
           <hr />
           <button onClick={() => openAi({ path, is_dir: true })} {...tip("explain")}>
             이 폴더를 AI로 설명…
@@ -2330,7 +2566,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         </div>
       )}
 
-      {menu && !menu.target && !menu.background && !menu.tools && !treeShown && !mapShown && selectedEntries.length > 0 && (
+      {menu && !menu.target && !menu.background && !treeShown && !mapShown && selectedEntries.length > 0 && (
         <div ref={menuBox} className="menu" onClick={(e) => e.stopPropagation()}>
           {one && (
             <button onClick={() => (setMenu(null), activate(one))} {...tip("open")}>
@@ -2342,6 +2578,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               새 탭에서 열기
             </button>
           )}
+          {one?.is_dir && pinItem(one.path)}
           {one && (
             <button
               onClick={() => (setMenu(null), api.reveal(one.path).catch((err) => toast(String(err), "error")))}

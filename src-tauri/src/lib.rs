@@ -7,6 +7,7 @@ mod index;
 mod mapview;
 mod mcp;
 mod ops;
+mod places;
 mod plans;
 mod preview;
 mod programs;
@@ -1242,8 +1243,14 @@ struct Listing {
 
 #[tauri::command]
 async fn list_dir(path: String, state: State<'_, AppState>) -> Result<Listing, String> {
-    let drive = drive_of(&path).ok_or("경로가 올바르지 않아요")?;
-    if let Some(shared) = state.get(&drive) {
+    // A network folder (\\server\share\...) has no index: it is listed live, like an unscanned
+    // drive. Known folders redirected to a share (company PCs) open this way from the sidebar.
+    let network = path.starts_with(r"\\") && !path.starts_with(r"\\?\") && !path.starts_with(r"\\.\");
+    let drive = drive_of(&path);
+    if drive.is_none() && !network {
+        return Err("경로가 올바르지 않아요".into());
+    }
+    if let Some(shared) = drive.as_deref().and_then(|d| state.get(d)) {
         let p = path.clone();
         let found = blocking(move || indexed_listing(&shared.read().unwrap(), &p)).await?;
         if let Some((current, entries)) = found {
@@ -1656,6 +1663,11 @@ pub fn run() {
             update_others,
             update_prepare,
             update_install_failed,
+            places::known_places,
+            places::explorer_pins,
+            places::places_get,
+            places::places_set,
+            places::path_kind,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
