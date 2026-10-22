@@ -1,0 +1,1033 @@
+/* v0.4: size map, duplicates, relocation, admin session. Colors come from the variables in App.css. */
+
+/* Category colours of the size map. Labels sit on them in --text: every fill keeps at least
+   4.5:1 against it, light and dark. */
+:root {
+  --cat-system: #8fa3bf;
+  --cat-program: #6f9fe6;
+  --cat-dev: #a98ee0;
+  --cat-game: #ec8aa6;
+  --cat-cache: #f2a46b;
+  --cat-media: #4fbfa8;
+  --cat-document: #e8c547;
+  --cat-archive: #c39a72;
+  --cat-personal: #84c46e;
+  --cat-other: #b9bec6;
+  --map-rest: #dfe2e7;
+  --map-rest-line: #c9cdd4;
+  /* Change since the scan before (the map's "변화" switch); the same 4.5:1 against --text.
+     Grown and shrunk blocks are mixed between -lo and -hi by how much they changed. */
+  --diff-same: #e4e7ec;
+  --diff-grow-lo: #fde4d2;
+  --diff-grow-hi: #e8604c;
+  --diff-shrink-lo: #d9f0d3;
+  --diff-shrink-hi: #5cb563;
+  --diff-new: #dbe8fb;
+  --diff-new-line: #2f6fde;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cat-system: #46566d;
+    --cat-program: #2f5591;
+    --cat-dev: #5a4791;
+    --cat-game: #8c3a55;
+    --cat-cache: #8a5126;
+    --cat-media: #1f6e5f;
+    --cat-document: #7a6614;
+    --cat-archive: #6b5139;
+    --cat-personal: #3d6d2e;
+    --cat-other: #4a4f57;
+    --map-rest: #2a2e35;
+    --map-rest-line: #353a42;
+    --diff-same: #2f343c;
+    --diff-grow-lo: #553a2c;
+    --diff-grow-hi: #a8362c;
+    --diff-shrink-lo: #2b4a30;
+    --diff-shrink-hi: #2a7034;
+    --diff-new: #23395c;
+    --diff-new-line: #6b9cf0;
+  }
+}
+
+/* ---- shared bits ---- */
+.btn {
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn.primary:hover:not(:disabled) {
+  color: #fff;
+  filter: brightness(1.08);
+}
+
+.btn.danger {
+  border-color: transparent;
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn.danger:hover:not(:disabled) {
+  color: #fff;
+  filter: brightness(1.08);
+}
+
+.btn.small {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field.grow {
+  flex: 1;
+}
+
+.field input,
+.field select {
+  height: 30px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: var(--accent);
+}
+
+.field input:disabled,
+.field select:disabled {
+  opacity: 0.6;
+}
+
+.v04-tag {
+  flex: none;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  border-radius: 4px;
+  background: var(--sel);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.v04-tag.del,
+.v04-tag.broken {
+  background: var(--err-bg);
+  color: var(--danger);
+}
+
+.v04-tag.keep,
+.v04-tag.active {
+  background: var(--sel);
+  color: var(--accent);
+}
+
+.v04-tag.app {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.v04-tag.restored {
+  background: var(--hover);
+  color: var(--muted);
+}
+
+.v04-error,
+.v04-ok {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.v04-error {
+  background: var(--err-bg);
+  color: var(--danger);
+}
+
+.v04-ok {
+  background: var(--sel);
+}
+
+.v04-intro {
+  margin: 14px 0;
+  line-height: 1.6;
+}
+
+/* ---- big dialogs: a head, a body that scrolls, a foot ---- */
+.modal.v04-dialog {
+  width: 560px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  outline: none;
+}
+
+.modal.v04-dialog.dups {
+  width: 900px;
+  height: calc(100vh - 48px);
+  max-height: 760px;
+}
+
+.modal.v04-dialog.relocs {
+  width: 680px;
+}
+
+.modal:focus {
+  outline: none;
+}
+
+.dlg-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px 10px 20px;
+}
+
+.dlg-head h3 {
+  flex: 1;
+  margin: 0;
+}
+
+.dlg-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.dlg-close:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.dlg-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 20px 12px;
+}
+
+.dlg-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+
+/* ---- size map ---- */
+.map-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.map-head {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.map-title {
+  flex: 1 1 160px;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.map-title b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-title .muted {
+  font-size: 12px;
+}
+
+.map-canvas {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.map-svg {
+  display: block;
+  font-size: 11px;
+  transition: opacity 0.12s;
+}
+
+/* The map of the folder before, while the new one loads. */
+.map-canvas.stale .map-svg {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-svg {
+    transition: none;
+  }
+}
+
+.map-cell > rect,
+.map-cell > path,
+.map-cell > circle {
+  stroke: var(--panel);
+  stroke-width: 1;
+}
+
+.map-cell.dir,
+.map-cell.root {
+  cursor: pointer;
+}
+
+.map-cell text {
+  fill: var(--text);
+  pointer-events: none;
+}
+
+.map-cell text.map-size {
+  fill-opacity: 0.78;
+}
+
+/* Treemap folders show through as frames and header lines, lighter than what is in them. */
+.map-treemap .map-cell.inner > rect {
+  fill-opacity: 0.55;
+}
+
+.map-hover {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+.map-hatch-bg {
+  fill: var(--map-rest);
+}
+
+.map-hatch-line {
+  stroke: var(--map-rest-line);
+  stroke-width: 3;
+}
+
+.cat-system > :first-child,
+.map-swatch.cat-system {
+  fill: var(--cat-system);
+  background: var(--cat-system);
+}
+.cat-program > :first-child,
+.map-swatch.cat-program {
+  fill: var(--cat-program);
+  background: var(--cat-program);
+}
+.cat-dev > :first-child,
+.map-swatch.cat-dev {
+  fill: var(--cat-dev);
+  background: var(--cat-dev);
+}
+.cat-game > :first-child,
+.map-swatch.cat-game {
+  fill: var(--cat-game);
+  background: var(--cat-game);
+}
+.cat-cache > :first-child,
+.map-swatch.cat-cache {
+  fill: var(--cat-cache);
+  background: var(--cat-cache);
+}
+.cat-media > :first-child,
+.map-swatch.cat-media {
+  fill: var(--cat-media);
+  background: var(--cat-media);
+}
+.cat-document > :first-child,
+.map-swatch.cat-document {
+  fill: var(--cat-document);
+  background: var(--cat-document);
+}
+.cat-archive > :first-child,
+.map-swatch.cat-archive {
+  fill: var(--cat-archive);
+  background: var(--cat-archive);
+}
+.cat-personal > :first-child,
+.map-swatch.cat-personal {
+  fill: var(--cat-personal);
+  background: var(--cat-personal);
+}
+.cat-other > :first-child,
+.map-swatch.cat-other {
+  fill: var(--cat-other);
+  background: var(--cat-other);
+}
+
+.map-message {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  text-align: center;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.map-message.error {
+  color: var(--text);
+}
+
+.map-tip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 5;
+  min-width: 160px;
+  max-width: 320px;
+  padding: 8px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+
+.map-tip[hidden] {
+  display: none;
+}
+
+.map-tip-name {
+  margin-bottom: 4px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.map-tip dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  margin: 0;
+}
+
+.map-tip dt {
+  color: var(--muted);
+}
+
+.map-tip dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-tip-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.map-legend {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.map-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.map-key.off {
+  opacity: 0.45;
+}
+
+.map-key .muted {
+  font-variant-numeric: tabular-nums;
+}
+
+.map-swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.map-swatch.rest {
+  background: repeating-linear-gradient(45deg, var(--map-rest) 0 2px, var(--map-rest-line) 2px 4px);
+}
+
+/* ---- size map: mind map ("가지 나무") ---- */
+.map-mindmap {
+  cursor: grab;
+  touch-action: none;
+}
+
+.map-mindmap.dragging,
+.map-mindmap.dragging .map-cell {
+  cursor: grabbing;
+}
+
+.map-links {
+  fill: none;
+  stroke: var(--muted);
+  stroke-opacity: 0.45;
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.map-mindmap .map-cell > circle {
+  stroke-width: 1.5;
+}
+
+/* Labels are part of the node there (bigger to aim at), with a halo over the branches. */
+.map-mindmap .map-cell text {
+  pointer-events: auto;
+  paint-order: stroke;
+  stroke: var(--panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.map-mindmap .map-hover,
+.map-mindmap .map-diff-new {
+  vector-effect: non-scaling-stroke;
+}
+
+.map-toggle {
+  cursor: pointer;
+}
+
+.map-toggle circle {
+  fill: var(--panel);
+  stroke: var(--muted);
+  stroke-width: 1;
+}
+
+.map-toggle path {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+
+.map-toggle:hover circle {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+
+.map-mind-help {
+  position: absolute;
+  left: 8px;
+  bottom: 6px;
+  max-width: calc(100% - 16px);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+/* ---- size map: change since the scan before ---- */
+.map-diff-bar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* No comparison (no scan before this one, and the like): the backend's reason. */
+.map-diff-bar.note {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.map-diff-new {
+  fill: none;
+  stroke: var(--diff-new-line);
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+.map-swatch.diff-grow,
+.map-swatch.diff-shrink {
+  width: 26px;
+}
+
+.map-swatch.diff-grow {
+  background: linear-gradient(90deg, var(--diff-grow-lo), var(--diff-grow-hi));
+}
+
+.map-swatch.diff-shrink {
+  background: linear-gradient(90deg, var(--diff-shrink-lo), var(--diff-shrink-hi));
+}
+
+.map-swatch.diff-new {
+  background: var(--diff-new);
+  box-shadow: inset 0 0 0 2px var(--diff-new-line);
+}
+
+.map-swatch.diff-same {
+  background: var(--diff-same);
+}
+
+.map-tip dd.map-change {
+  font-weight: 600;
+}
+
+.map-tip-removed {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.map-tip-removed ul {
+  margin: 2px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.map-tip-removed li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.map-tip-removed li > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.map-tip-removed li > .muted {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-tip-sub {
+  color: var(--muted);
+}
+
+/* ---- duplicates ---- */
+.dup-options {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 0 20px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dup-options .btn {
+  height: 30px;
+  min-width: 72px;
+}
+
+.dup-progress {
+  margin: 16px 0;
+}
+
+.dup-phase {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.dup-summary {
+  margin: 12px 0 8px;
+}
+
+.dup-notice {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--sel);
+  overflow-wrap: anywhere;
+}
+
+.dup-notice.error {
+  background: var(--err-bg);
+}
+
+/* What the results leave out: files not compared, a search stopped early, files spared by auto-select. */
+.dup-caveat {
+  margin: 8px 0;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.dup-notice-why {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.dup-tools {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0;
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.dup-group {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.dup-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--bg);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dup-group-head .muted {
+  font-weight: 400;
+  font-size: 12px;
+}
+
+.dup-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px 5px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.dup-file.sel {
+  background: var(--sel);
+}
+
+.dup-file-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.dup-file-pick input {
+  flex: none;
+  margin: 0;
+}
+
+.dup-file-pick input:disabled + .dup-file-name {
+  cursor: default;
+}
+
+.dup-file-name {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.dup-file-base,
+.dup-file-dir {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dup-file-dir {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dup-file-date {
+  flex: none;
+  width: 112px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.dup-more {
+  display: block;
+  margin: 4px auto 8px;
+}
+
+/* ---- relocation ---- */
+.reloc-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.reloc-body .actions {
+  margin-top: 4px;
+}
+
+.reloc-source {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg);
+  overflow-wrap: anywhere;
+}
+
+.reloc-source .muted {
+  font-size: 12px;
+}
+
+.reloc-drives {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
+.reloc-drives legend {
+  padding: 0;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reloc-drive {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.reloc-drive:hover {
+  background: var(--hover);
+}
+
+.reloc-drive.on {
+  border-color: var(--sel-line);
+  background: var(--sel);
+}
+
+.reloc-drive.short {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.reloc-drive input {
+  flex: none;
+  margin: 0;
+}
+
+.reloc-drive-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.reloc-final {
+  margin-top: -6px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.reloc-explain {
+  margin: 0;
+  padding: 10px 12px 10px 28px;
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.reloc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.reloc-item {
+  padding: 10px 0;
+}
+
+.reloc-item + .reloc-item {
+  border-top: 1px solid var(--line);
+}
+
+.reloc-item.restored .reloc-name,
+.reloc-item.restored .reloc-paths {
+  color: var(--muted);
+}
+
+.reloc-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reloc-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.reloc-paths {
+  margin-top: 4px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.reloc-arrow {
+  margin: 0 6px;
+  color: var(--muted);
+}
+
+.reloc-when {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+/* ---- admin session ---- */
+.admin-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 14px;
+  background: var(--err-bg);
+  color: var(--danger);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.admin-bar-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.admin-bar-text {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.admin-bar-warn {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.admin-bar-error {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.admin-bar-stop {
+  flex: none;
+  padding: 2px 10px;
+  border-radius: 5px;
+  border: 1px solid currentColor;
+  color: var(--danger);
+}
+
+.admin-bar-stop:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}

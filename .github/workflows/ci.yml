@@ -1,0 +1,55 @@
+name: CI
+
+# Type check, build the web part, test and lint on Windows for every push to main and every pull
+# request. No installer is built and nothing is released here: releases are made on the
+# maintainer's PC with scripts/release.ps1, because the update signing key never leaves it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Pinned, so a newer clippy's new lints (-D warnings) do not turn CI red by themselves. Raise
+      # it on purpose: rustup update here, clippy and the tests clean, then this version (README).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build the web part
+        run: npx vite build
+
+      # cargo builds and tests the app without bundling it, so no signing key is needed.
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --release
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings

@@ -1,0 +1,611 @@
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { ai, type AiProvider, type AiSettings as Settings, type KeyStatus } from "./api";
+import { Dialog } from "./Duplicates";
+import "./components.css";
+import "./v04.css";
+import "./v06.css";
+
+type KeyName = "claude" | "openai" | "jev";
+type Notice = { text: string; error?: boolean };
+
+const DEFAULT_CLAUDE = "claude-opus-5-5";
+const DEFAULT_CODEX = "gpt-5.6-luna";
+const DEFAULT_OLLAMA = "http://localhost:11434";
+
+const PROVIDERS: { id: AiProvider; label: string; note: string }[] = [
+  { id: "off", label: "끄기", note: "AI를 쓰지 않아요" },
+  { id: "claude", label: "Claude API", note: "내 Anthropic API 키" },
+  { id: "openai", label: "OpenAI API", note: "내 OpenAI API 키" },
+  { id: "ollama", label: "Ollama (내 PC)", note: "이 컴퓨터에서 실행" },
+  { id: "claude_cli", label: "Claude Code CLI", note: "내가 설치·로그인한 claude" },
+  { id: "codex_cli", label: "Codex CLI", note: "내가 설치·로그인한 codex" },
+];
+
+const CLAUDE_MODELS = [
+  { id: "claude-opus-5-5", label: "claude-opus-5-5 (기본)" },
+  { id: "claude-sonnet-5-5", label: "claude-sonnet-5-5" },
+  { id: "claude-haiku-5-5", label: "claude-haiku-5-5" },
+];
+
+const EFFORTS: { id: Settings["effort"]; label: string }[] = [
+  { id: "low", label: "낮음 (빠르고 적게 써요)" },
+  { id: "medium", label: "보통" },
+  { id: "high", label: "높음 (느리고 많이 써요)" },
+];
+
+const EXE = "C:\\Program Files\\fine-file\\fine-file.exe";
+const MCP_JSON = JSON.stringify({ mcpServers: { "fine-file": { command: EXE, args: ["--mcp"] } } }, null, 2);
+const MCP_CMD = `claude mcp add fine-file -- "${EXE}" --mcp`;
+
+function errText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message;
+  try {
+    return JSON.stringify(err) ?? String(err);
+  } catch {
+    return String(err);
+  }
+}
+
+/** An Ollama address on this computer: what goes there stays here. */
+function isLocalUrl(url: string): boolean {
+  try {
+    const h = new URL(url.trim()).hostname.toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1" || h.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Puts text on the clipboard. The fallback's textarea goes inside `host` (the dialog): one outside
+ * would lose the focus to the dialog, which keeps it in.
+ */
+async function copyText(text: string, host: HTMLElement): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // below
+  }
+  const before = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.readOnly = true;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  ta.style.pointerEvents = "none";
+  host.appendChild(ta);
+  try {
+    ta.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    ta.remove();
+    before?.focus();
+  }
+}
+
+function CopyBlock({ text, label }: { text: string; label: string }) {
+  const [state, setState] = useState<"idle" | "done" | "fail">("idle");
+  const box = useRef<HTMLDivElement>(null);
+  const timer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  const copy = async () => {
+    if (!box.current) return;
+    const ok = await copyText(text, box.current);
+    setState(ok ? "done" : "fail");
+    if (timer.current !== null) clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      setState("idle");
+    }, 1800);
+  };
+
+  return (
+    <div ref={box} className="v06-code-wrap">
+      <pre className="v06-code" aria-label={label}>
+        {text}
+      </pre>
+      <button type="button" className="btn small v06-copy" onClick={copy}>
+        {state === "done" ? "복사했어요" : state === "fail" ? "복사하지 못했어요" : "복사"}
+      </button>
+    </div>
+  );
+}
+
+/** One API key: typed in a password field, kept by the backend, never shown again. */
+function KeyField({
+  name,
+  label,
+  placeholder,
+  has,
+  onChanged,
+}: {
+  name: KeyName;
+  label: string;
+  placeholder: string;
+  /** Whether a key is saved; undefined while not known. */
+  has: boolean | undefined;
+  onChanged(): void;
+}) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<Notice | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const store = async (key: string | null) => {
+    if (busy) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      await ai.setKey(name, key);
+      if (!alive.current) return;
+      setValue("");
+      setMsg({ text: key ? "키를 저장했어요" : "키를 지웠어요" });
+      onChanged();
+    } catch (err) {
+      if (alive.current) setMsg({ text: `${key ? "저장하지" : "지우지"} 못했어요: ${errText(err)}`, error: true });
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      className="ai-key"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const k = value.trim();
+        if (k) store(k);
+      }}
+    >
+      <label className="field">
+        <span>
+          {label}
+          <span className={`ai-key-state${has ? " on" : ""}`}>{has === undefined ? "확인 중" : has ? "저장됨" : "없음"}</span>
+        </span>
+        <input
+          type="password"
+          value={value}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={has ? "바꾸려면 새 키를 넣어 주세요" : placeholder}
+          disabled={busy}
+          onChange={(e) => setValue(e.target.value)}
+        />
+      </label>
+      <button type="submit" className="btn" disabled={busy || !value.trim()}>
+        저장
+      </button>
+      <button type="button" className="btn" disabled={busy || !has} onClick={() => store(null)}>
+        지우기
+      </button>
+      {msg && <div className={`ai-key-msg${msg.error ? " error" : ""}`}>{msg.text}</div>}
+    </form>
+  );
+}
+
+export function AiSettings({ onClose }: { onClose(): void }) {
+  /** As last loaded or saved; `draft` is what the page shows. */
+  const [saved, setSaved] = useState<Settings | null>(null);
+  const [draft, setDraft] = useState<Settings | null>(null);
+  const [keys, setKeys] = useState<KeyStatus | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [tested, setTested] = useState<{ provider: string; text: string; error?: boolean } | null>(null);
+  const [askClose, setAskClose] = useState(false);
+  const alive = useRef(true);
+  const group = useId();
+
+  const dirty = !!draft && !!saved && JSON.stringify(draft) !== JSON.stringify(saved);
+
+  const loadKeys = useCallback(() => {
+    ai.keyStatus().then(
+      (k) => alive.current && setKeys(k),
+      (err) => alive.current && setNotice({ text: `저장한 키를 확인하지 못했어요: ${errText(err)}`, error: true }),
+    );
+  }, []);
+
+  useEffect(() => {
+    alive.current = true;
+    ai.getSettings().then(
+      (s) => {
+        if (!alive.current) return;
+        setSaved(s);
+        setDraft(s);
+      },
+      (err) => alive.current && setLoadError(errText(err)),
+    );
+    loadKeys();
+    return () => {
+      alive.current = false;
+    };
+  }, [loadKeys]);
+
+  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setDraft((d) => (d ? { ...d, [k]: v } : d));
+
+  const pick = (p: AiProvider) =>
+    setDraft((d) => {
+      if (!d) return d;
+      const n = { ...d, provider: p };
+      if ((p === "claude" || p === "claude_cli") && !n.claude_model.trim()) n.claude_model = DEFAULT_CLAUDE;
+      if (p === "codex_cli" && !n.codex_model.trim()) n.codex_model = DEFAULT_CODEX;
+      if (p === "ollama" && !n.ollama_url.trim()) n.ollama_url = DEFAULT_OLLAMA;
+      return n;
+    });
+
+  /** True when what the page shows is what is saved. */
+  const save = async (): Promise<boolean> => {
+    if (!draft || !saved) return false;
+    if (!dirty) return true;
+    const s: Settings = {
+      ...draft,
+      claude_model: draft.claude_model.trim(),
+      openai_model: draft.openai_model.trim(),
+      ollama_url: draft.ollama_url.trim(),
+      ollama_model: draft.ollama_model.trim(),
+      codex_model: draft.codex_model.trim(),
+    };
+    setSaving(true);
+    setNotice(null);
+    try {
+      await ai.setSettings(s);
+      if (alive.current) {
+        setSaved(s);
+        setDraft((d) => (d === draft ? s : d));
+        setNotice({ text: "설정을 저장했어요" });
+      }
+      return true;
+    } catch (err) {
+      if (alive.current) setNotice({ text: `설정을 저장하지 못했어요: ${errText(err)}`, error: true });
+      return false;
+    } finally {
+      if (alive.current) setSaving(false);
+    }
+  };
+
+  /** Saves what changed first: the test tries the settings as saved. */
+  const test = async (provider: string) => {
+    if (testing || saving) return;
+    setTested(null);
+    if (!(await save())) return;
+    setTesting(provider);
+    try {
+      const text = await ai.test(provider);
+      if (alive.current) setTested({ provider, text: text || "연결했어요" });
+    } catch (err) {
+      if (alive.current) setTested({ provider, text: errText(err), error: true });
+    } finally {
+      if (alive.current) setTesting(null);
+    }
+  };
+
+  const close = () => (dirty ? setAskClose(true) : onClose());
+
+  const p = draft?.provider ?? "off";
+  const testLine = (provider: string) =>
+    tested?.provider === provider && <span className={tested.error ? "ai-test-bad" : "ai-test-ok"}>{tested.text}</span>;
+  const claudeModels =
+    draft && draft.claude_model && !CLAUDE_MODELS.some((m) => m.id === draft.claude_model)
+      ? [...CLAUDE_MODELS, { id: draft.claude_model, label: draft.claude_model }]
+      : CLAUDE_MODELS;
+
+  return (
+    <Dialog className="v04-dialog ai-settings" title="AI 설정" onClose={close}>
+      <div className="dlg-head">
+        <h3>AI 설정</h3>
+        <button className="dlg-close" aria-label="닫기" onClick={close}>
+          ✕
+        </button>
+      </div>
+      <div className="dlg-body">
+        {loadError && <div className="v04-error">AI 설정을 불러오지 못했어요: {loadError}</div>}
+        {!draft && !loadError && <p className="muted v04-intro">불러오는 중…</p>}
+        {draft && (
+          <>
+            <p className="muted v06-lead">
+              AI는 고를 때만 쓰는 선택 기능이에요. 꺼 두어도 탐색, 검색, 크기 지도, 규칙으로 만드는 정리 계획까지 모든 기능이
+              그대로 동작해요.
+            </p>
+
+            <section className="v06-section first">
+              <h4>쓸 AI</h4>
+              <div className="ai-providers" role="radiogroup" aria-label="쓸 AI">
+                {PROVIDERS.map((o) => (
+                  <label key={o.id} className={`ai-provider${p === o.id ? " on" : ""}`}>
+                    <input type="radio" name={group} checked={p === o.id} onChange={() => pick(o.id)} />
+                    <span className="ai-provider-main">
+                      <span>{o.label}</span>
+                      <span className="muted">{o.note}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+
+              {p === "off" && (
+                <p className="v06-note">AI에 아무것도 보내지 않아요. 아래의 MCP 연결은 이 설정과 따로 동작해요.</p>
+              )}
+
+              {(p === "claude" || p === "claude_cli") && (
+                <div className="ai-fields">
+                  <label className="field">
+                    <span>모델</span>
+                    <select value={draft.claude_model || DEFAULT_CLAUDE} onChange={(e) => set("claude_model", e.target.value)}>
+                      {claudeModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>생각 깊이 (effort)</span>
+                    <select value={draft.effort} onChange={(e) => set("effort", e.target.value as Settings["effort"])}>
+                      {EFFORTS.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              )}
+              {p === "claude" && (
+                <>
+                  <KeyField name="claude" label="Claude API 키" placeholder="sk-ant-…" has={keys?.claude} onChanged={loadKeys} />
+                  <p className="v06-note">
+                    Anthropic Console에서 만든 API 키를 넣어 주세요. 쓴 만큼 Anthropic이 키 주인에게 청구해요.
+                  </p>
+                </>
+              )}
+              {p === "claude_cli" && (
+                <p className="v06-note">
+                  직접 설치하고 로그인한 Claude Code(<code>claude</code> 명령)를 불러요. 앱은 로그인 정보(<code>~/.claude</code>)를
+                  읽거나 저장하지 않아요. 사용량은 그 CLI에 로그인한 계정의 한도와 요금을 따라요.
+                </p>
+              )}
+
+              {p === "openai" && (
+                <>
+                  <div className="ai-fields">
+                    <label className="field">
+                      <span>모델</span>
+                      <input
+                        value={draft.openai_model}
+                        spellCheck={false}
+                        placeholder="OpenAI 모델 ID"
+                        onChange={(e) => set("openai_model", e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <KeyField name="openai" label="OpenAI API 키" placeholder="sk-…" has={keys?.openai} onChanged={loadKeys} />
+                  <p className="v06-note">
+                    OpenAI Platform에서 만든 API 키를 넣어 주세요. ChatGPT 구독과는 따로, 쓴 만큼 OpenAI가 키 주인에게 청구해요.
+                  </p>
+                </>
+              )}
+
+              {p === "ollama" && (
+                <>
+                  <div className="ai-fields">
+                    <label className="field">
+                      <span>주소</span>
+                      <input
+                        value={draft.ollama_url}
+                        spellCheck={false}
+                        placeholder={DEFAULT_OLLAMA}
+                        onChange={(e) => set("ollama_url", e.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>모델</span>
+                      <input
+                        value={draft.ollama_model}
+                        spellCheck={false}
+                        placeholder="ollama list에 보이는 이름"
+                        onChange={(e) => set("ollama_model", e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  {draft.ollama_url.trim() && !isLocalUrl(draft.ollama_url) && (
+                    <div className="v06-warn">
+                      이 주소는 이 컴퓨터가 아니에요. 폴더 정보가 그 컴퓨터로 가요. 내 PC에서만 쓰려면{" "}
+                      <code>{DEFAULT_OLLAMA}</code>로 두세요.
+                    </div>
+                  )}
+                  <p className="v06-note">
+                    Ollama를 설치하고 모델을 받아 두세요(<code>ollama pull 모델이름</code>). 요금이 없고, 주소가 이 컴퓨터면 폴더
+                    정보가 밖으로 나가지 않아요.
+                  </p>
+                </>
+              )}
+
+              {p === "codex_cli" && (
+                <>
+                  <div className="ai-fields">
+                    <label className="field">
+                      <span>모델</span>
+                      <input
+                        value={draft.codex_model}
+                        spellCheck={false}
+                        placeholder={DEFAULT_CODEX}
+                        onChange={(e) => set("codex_model", e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <p className="v06-note">
+                    직접 설치하고 로그인한 Codex CLI(<code>codex</code> 명령)를 불러요. 앱은 로그인 정보(<code>auth.json</code>)를
+                    읽지 않아요. 사용량은 그 CLI에 로그인한 계정의 한도와 요금을 따라요.
+                  </p>
+                  <div className="v06-warn">
+                    Codex는 스스로 도구를 쓰는 에이전트예요. 앱은 폴더 정보만 넘기고, Codex를 내{" "}
+                    <code>~/.codex/config.toml</code> 없이 실행해요. 거기 넣어 둔 MCP 서버·플러그인·프로필·직접 넣은 모델 공급자는 쓰지
+                    않아서, 직접 넣은 공급자로만 쓰고 있었다면 실패하거나 기본 공급자(OpenAI)로 갈 수 있어요. 셸 명령·웹 검색 같은 도구
+                    기능도 끄고 남는 것은 읽기 전용 샌드박스에서 돌게 하지만, Codex가 가진 도구를 앱이 모두 끈다고 보장할 수 없어요.
+                    Codex가 그 샌드박스 안에서 이 PC의 파일을 읽고 그 내용을 OpenAI로 보낼 수 있다고 생각하고 써 주세요.
+                  </div>
+                </>
+              )}
+
+              {p !== "off" && (
+                <div className="ai-test">
+                  <button className="btn" disabled={!!testing || saving} onClick={() => test(p)}>
+                    {testing === p ? "시험하는 중…" : "연결 시험"}
+                  </button>
+                  {dirty && !testing && <span className="muted">바꾼 설정을 먼저 저장해요</span>}
+                  {testLine(p)}
+                </div>
+              )}
+            </section>
+
+            <section className="v06-section">
+              <h4>보내는 정보</h4>
+              <label className="v06-check">
+                <input
+                  type="checkbox"
+                  checked={draft.confirm_before_send}
+                  onChange={(e) => set("confirm_before_send", e.target.checked)}
+                />
+                <span className="v06-check-main">
+                  <span>보내기 전에 미리 보기</span>
+                  <span className="muted">AI에 보내기 전에 보낼 내용을 그대로 보여 주고 물어봐요.</span>
+                </span>
+              </label>
+              <p className="v06-note">
+                앱은 파일 내용을 보내지 않아요. 경로, 이름, 크기, 날짜, 분류만 보내요{p === "codex_cli" ? " (Codex CLI는 위의 주의처럼 스스로 파일을 읽을 수 있어요)" : ""}.
+                미리 보기에서 "보내기"를 누르면 보낼 내용을 다시 만들어, 보여 준 것과 같을 때만 보내요. AI가 낸 계획은 바로 실행하지
+                않아요. 직접 확인하고 실행을 눌러야 하고, 실행할 때 앱이 단계마다 다시 확인해요.
+              </p>
+            </section>
+
+            <section className="v06-section">
+              <h4>위험도 배지 (TypeSafe jev)</h4>
+              <p className="v06-note">
+                <b>jev는 무엇인가요?</b> 항목마다 지워도 되는지(안전·주의·위험)와 프로그램이 다시 만드는 항목인지를 빠르게 판정해
+                주는 TypeSafe의 서비스예요. 위에서 고른 AI와는 따로라서, AI를 꺼 둔 채로 jev만 쓸 수도 있어요. 이 앱에서는 두 곳에 써요.
+              </p>
+              <ul className="v06-list">
+                <li>
+                  <b>목록의 "위험도" 열</b>: 목록 보기 툴바의 "위험도"를 켜면, 그 탭에 보이는 항목마다 jev의 판정이 배지로 붙어요.
+                </li>
+                <li>
+                  <b>정리 계획의 2차 확인</b>: 계획 창의 "jev로 위험도 다시 확인"을 누르면, 계획(규칙이나 AI)이 매긴 위험 옆에 jev의
+                  판정이 "jev 안전"처럼 한 번 더 붙어요. 계획을 만든 쪽과 따로 보는 빠르고 저렴한 2차 의견이에요.
+                </li>
+                <li>
+                  <b>필요한 것</b>: 내 jev API 키(아래). 키가 없으면 버튼과 열이 생기지 않아요.
+                </li>
+                <li>
+                  <b>요금</b>: 보낸 만큼 jev 키 주인에게 jev의 조건대로 청구돼요. 이 앱은 요금을 받지 않아요.
+                </li>
+                <li>
+                  <b>보내는 것</b>: 항목의 경로·이름·종류·크기·날짜·분류(메타데이터)만 보내요. 파일 내용은 보내지 않아요.
+                </li>
+              </ul>
+              <label className="v06-check">
+                <input type="checkbox" checked={draft.jev_enabled} onChange={(e) => set("jev_enabled", e.target.checked)} />
+                <span className="v06-check-main">
+                  <span>jev 위험도 배지 쓰기 (정리 계획, 목록)</span>
+                  <span className="muted">
+                    켜면 계획 창의 "jev로 위험도 다시 확인"과 목록 보기 툴바의 "위험도" 버튼이 생겨요. 그 버튼을 눌러야 항목마다
+                    안전·주의·위험을 받아 와요(언제 무엇을 보내는지는 아래).
+                  </span>
+                </span>
+              </label>
+              <KeyField name="jev" label="jev API 키" placeholder="jev 콘솔에서 받은 키" has={keys?.jev} onChanged={loadKeys} />
+              {draft.jev_enabled && keys && !keys.jev && <div className="v06-warn">jev API 키가 없으면 배지를 받을 수 없어요.</div>}
+              <div className="ai-test">
+                <button className="btn" disabled={!!testing || saving || !keys?.jev} onClick={() => test("jev")}>
+                  {testing === "jev" ? "시험하는 중…" : "jev 연결 시험"}
+                </button>
+                {testLine("jev")}
+              </div>
+              <p className="v06-note">
+                jev는 얼리 액세스 서비스예요. 내 jev API 키로만 동작하고, 항목의 경로·이름·종류·크기·날짜·분류만 보내요(파일 내용은
+                보내지 않아요). 계획 창에서는 누를 때 그 계획의 항목(500개까지)을 보내요. 목록의 "위험도"는 탭마다 따로 켜는데, 켜
+                두는 동안 그 탭의 목록에 보이는 항목(한 번에 200개까지)을 보내고, 스크롤하거나 다른 폴더로 갈 때마다 새로 보이는
+                항목도 보내요. "보내기 전에 미리 보기"가 켜져 있으면 계획 창에서는 보내기 전에, 목록에서는 켤 때 무엇을 보내는지
+                먼저 물어요. 꺼 두면 묻지 않고 보내요. 배지는 참고용이고, 실행할 단계는 직접 골라요.
+              </p>
+            </section>
+
+            <section className="v06-section">
+              <h4>MCP로 Claude 앱에 연결</h4>
+              <p className="v06-note">
+                Claude 앱(Claude Desktop, Claude Code)에 이 앱을 MCP 서버로 붙이면, 내 Claude 구독으로 스캔 결과(드라이브, 폴더
+                크기, 검색, 크기 지도)를 <b>읽기 전용</b>으로 보고 정리 계획을 제안할 수 있어요. API 키가 필요 없어요. 제안은
+                "정리 계획"에 초안으로 들어오고, 여기서 확인하고 실행해야만 파일이 바뀌어요.
+              </p>
+              <p className="v06-note">
+                Claude Desktop: <code>%APPDATA%\Claude\claude_desktop_config.json</code>에 넣고 Claude Desktop을 다시 켜요.
+              </p>
+              <CopyBlock text={MCP_JSON} label="claude_desktop_config.json에 넣을 내용" />
+              <p className="v06-note">Claude Code: 터미널에서 실행해요.</p>
+              <CopyBlock text={MCP_CMD} label="Claude Code에 추가하는 명령" />
+              <p className="v06-note">다른 폴더에 설치했다면 경로를 그 폴더의 fine-file.exe로 바꿔 주세요.</p>
+            </section>
+
+            <section className="v06-section">
+              <h4>요금과 로그인</h4>
+              <ul className="v06-list muted">
+                <li>API 키(Claude·OpenAI)로 보낸 요청은 쓴 만큼 그 회사가 키 주인에게 청구해요. 이 앱은 요금을 받지 않아요.</li>
+                <li>Ollama는 내 PC에서 돌아서 요금이 없어요.</li>
+                <li>
+                  Claude Pro·Max나 ChatGPT 같은 구독 로그인은 이 앱 안에서 쓸 수 없어요. 구독으로 쓰려면 위의 MCP로 Claude 앱에
+                  연결하거나, 직접 설치하고 로그인한 CLI(Claude Code, Codex)를 고르세요.
+                </li>
+                <li>키는 Windows 자격 증명 관리자에 저장하고, 파일이나 로그에는 남기지 않아요. 저장한 키는 다시 보여 주지 않아요.</li>
+              </ul>
+            </section>
+          </>
+        )}
+      </div>
+      <div className="dlg-foot">
+        {notice && <span className={`v06-foot-note${notice.error ? " error" : ""}`} title={notice.text}>{notice.text}</span>}
+        <span className="spacer" />
+        <button className="btn" onClick={close}>
+          닫기
+        </button>
+        <button className="btn primary" disabled={!dirty || saving} onClick={() => void save()}>
+          {saving ? "저장하는 중…" : "저장"}
+        </button>
+      </div>
+
+      {askClose && (
+        <Dialog title="바꾼 설정을 저장할까요?" onClose={() => setAskClose(false)} onBackdrop={() => setAskClose(false)}>
+          <h3>바꾼 설정을 저장할까요?</h3>
+          <p className="muted">저장하지 않고 닫으면 바꾼 내용은 없어져요. API 키는 키 옆의 "저장"으로 따로 저장해요.</p>
+          <div className="actions">
+            <button onClick={onClose}>저장하지 않고 닫기</button>
+            <button
+              className="primary"
+              autoFocus
+              onClick={async () => {
+                setAskClose(false);
+                if (await save()) onClose();
+              }}
+            >
+              저장하고 닫기
+            </button>
+          </div>
+        </Dialog>
+      )}
+    </Dialog>
+  );
+}

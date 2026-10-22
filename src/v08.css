@@ -1,0 +1,110 @@
+/* v0.8: in-app updates (Updater.tsx). The banner is App.css's .banner.info; the dialogs use the
+   frames of App.css (.modal) and v04.css (.v04-dialog). Colors come from the variables in App.css. */
+
+/* ---- the banner over the tabs ---- */
+.banner.update-banner {
+  flex: none;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  row-gap: 6px;
+}
+
+.update-banner .grow {
+  flex-basis: 320px;
+  padding-top: 3px;
+}
+
+.update-banner .muted {
+  font-size: 12px;
+}
+
+.update-notes {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.update-notes summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.update-notes summary:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.update-notes-body {
+  max-height: 260px;
+  margin-top: 6px;
+  padding: 8px 12px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.update-progress {
+  display: block;
+  max-width: 420px;
+  margin-top: 6px;
+}
+
+.update-progress .job-bar {
+  display: block;
+  margin: 0 0 2px;
+}
+
+.update-error {
+  color: var(--danger);
+  opacity: 1;
+  user-select: text;
+}
+
+/* What a screen reader says about the update (Updater.tsx): heard, not seen. */
+.update-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- before installing, and while the installer starts ---- */
+.modal.update-confirm {
+  width: 500px;
+  max-width: calc(100vw - 32px);
+}
+
+.update-steps,
+.update-warns {
+  margin: 8px 0;
+  padding-left: 18px;
+  line-height: 1.6;
+}
+
+.update-steps li + li,
+.update-warns li + li {
+  margin-top: 4px;
+}
+
+.update-warns {
+  margin: 0;
+}
+
+/* ---- the settings window (sidebar "업데이트") ---- */
+.modal.v04-dialog.update-settings {
+  width: 520px;
+}
+
+.update-version {
+  margin: 4px 0 0;
+}
+
+.update-auto {
+  margin-top: 12px;
+}

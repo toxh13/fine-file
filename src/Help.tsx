@@ -1,0 +1,947 @@
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Dialog } from "./Duplicates";
+import "./components.css";
+import "./v04.css";
+import "./v06.css";
+import "./v07.css";
+
+// ---- help (F1), feature tooltips, first-run guide ----------------------------------
+
+/**
+ * Short tooltip texts by feature id, for the toolbar, menus and sidebar. The help panel has the
+ * long form: `<Help topic={id} />` opens at the part about the same feature.
+ */
+export const HELP_TIPS: Record<string, string> = {
+  scan: "이 드라이브의 모든 폴더 크기를 재요. 처음 한 번이면 되고, 그 뒤로는 실시간 반영과 빠른 동기화가 맞춰요",
+  sync: "빠른 동기화: 관리자 권한 없이(UAC 창 없이) 폴더를 다시 훑어 바뀐 것을 맞춰요. 열 수 없는 폴더는 마지막 스캔 값을 써요",
+  fullScan:
+    "전체 스캔: 파일 목록표(MFT)를 직접 읽어 보호된 폴더까지 처음부터 다시 세요. 관리자 권한이 필요해서 할 때마다 UAC 창이 떠요 (관리자 모드가 켜져 있으면 묻지 않아요)",
+  viewList: "목록: 이름, 크기, 파일 수, 수정한 날짜를 열로 보여 줘요. 열 머리를 누르면 정렬해요",
+  viewTree: "트리: 폴더를 펼쳐 가며 아래 폴더들의 크기를 한눈에 비교해요",
+  viewGrid: "아이콘: Windows 썸네일로 보여 줘요. 사진·동영상 폴더에 좋아요",
+  viewMap: "지도: 지금 폴더 아래를 크기만큼의 넓이로 그려서, 어디가 자리를 차지하는지 바로 보여요 (스캔한 드라이브만)",
+  preview: "미리 보기 창: 고른 파일을 옆에 보여 줘요 (Alt+P)",
+  newFolder: "지금 폴더에 새 폴더를 만들어요 (Ctrl+Shift+N)",
+  search: "스캔한 모든 드라이브에서 이름으로 바로 찾아요. 띄어쓰기로 여러 단어, * · ? 와일드카드 (Ctrl+F)",
+  searchHere: "켜면 지금 폴더 아래에서만 찾아요. 끄면 스캔한 모든 드라이브에서 찾아요",
+  dups: "내용이 똑같은 파일을 찾아요. 고른 파일은 휴지통으로만 보내고, 묶음마다 하나는 남겨요",
+  relocate: "폴더를 다른 드라이브로 옮기고 원래 자리에 링크를 남겨요. 프로그램은 예전 경로로 그대로 찾아가요",
+  relocations: "다른 드라이브로 옮긴 폴더를 보고, 원래 자리로 되돌려요",
+  programs:
+    "설치된 프로그램의 크기와 마지막으로 쓴 때를 보고, 안 쓰는 프로그램을 공식 제거 프로그램으로 지워요(Store 앱은 한 번 물은 뒤 바로 제거돼요). 지운 프로그램이 남긴 폴더도 찾아요",
+  plans: "정리 계획 목록: 만든 계획을 확인하고, 실행하고, 되돌려요. \"실행\"을 눌러야만 파일이 바뀌어요",
+  ai: "정리 도우미: 이 폴더를 AI로 설명하고, 규칙이나 AI로 정리 계획을 만들어요 (AI는 켜야 쓰는 선택 기능)",
+  aiSettings: "AI 설정: 쓸 AI와 키, 보내기 전 미리 보기를 정해요. 처음에는 꺼져 있어요",
+  admin: "내 계정으로 열 수 없는 폴더를 관리자 권한으로 읽기 전용으로 봐요. UAC 창이 한 번 뜨고, 10분 동안 안 쓰면 꺼져요",
+  diff: "지난 스캔 뒤로 크기가 얼마나 늘고 줄었는지 보여 줘요",
+  tabs: "탭마다 폴더와 보기 방식을 따로 가져요. 새 탭 Ctrl+T, 닫기 Ctrl+W, 폴더를 가운데 클릭하면 새 탭으로 열려요",
+  copy: "복사 (Ctrl+C). 탐색기나 다른 프로그램에 붙여넣을 수도 있어요",
+  cut: "잘라내기 (Ctrl+X). 붙여넣으면 옮겨요. 다른 드라이브로 옮길 때는 복사본을 확인한 뒤에야 원본을 지워요",
+  paste: "지금 폴더에 붙여넣기 (Ctrl+V). 이름이 같은 항목이 있으면 먼저 물어요",
+  trash: "휴지통으로 보내요 (Delete). 영구 삭제는 하지 않아요",
+  rename: "이름 바꾸기 (F2)",
+  shellMenu: "탐색기의 오른쪽 클릭 메뉴를 띄워요 (Shift+F10). 다른 프로그램이 넣은 명령은 그 프로그램의 규칙대로 동작해요",
+  update: "지금 버전을 보고 새 버전이 있는지 확인해요. 새 버전은 알려 주기만 하고, \"지금 업데이트\"를 눌러야 설치해요",
+};
+
+// Text in the help may hold `code` and **bold**; the rest is plain.
+type Block =
+  | string
+  | { list: string[] }
+  | { steps: string[] }
+  | { head: string[]; rows: string[][] }
+  | { tip: string };
+
+interface Item {
+  id: string;
+  title: string;
+  blocks: Block[];
+  /** More words to be found by (not shown). */
+  keys?: string;
+}
+
+interface Section {
+  id: string;
+  title: string;
+  items: Item[];
+}
+
+const SECTIONS: Section[] = [
+  {
+    id: "start",
+    title: "시작하기",
+    items: [
+      {
+        id: "first",
+        title: "처음 할 일",
+        blocks: [
+          '왼쪽 드라이브 목록에서 드라이브의 **"스캔"**을 누르면 그 드라이브의 모든 폴더 크기와 파일 수를 재요. 결과는 저장돼서 다음에 켤 때 바로 보여요.',
+          "한 번 스캔한 드라이브는 실시간 반영과 빠른 동기화가 바뀌는 대로 맞춰 줘서, 전체 스캔을 다시 할 일은 많지 않아요.",
+          { tip: "아직 스캔하지 않은 드라이브도 둘러보기와 열기는 돼요. 폴더 크기, 검색, 지도, 중복 찾기는 스캔한 드라이브에서만 써요." },
+        ],
+      },
+      {
+        id: "scan",
+        title: "전체 스캔과 빠른 동기화",
+        keys: "다시 스캔 동기화 MFT 일반 탐색 sync",
+        blocks: [
+          {
+            head: ["방식", "하는 일"],
+            rows: [
+              [
+                "전체 스캔",
+                "NTFS 드라이브의 파일 목록표(MFT)를 직접 읽어 처음부터 다시 세요. 수 초면 끝나고, 보호된 폴더까지 모두 세요. 관리자 권한이 필요해서 할 때마다 UAC 창이 떠요. 처음 \"스캔\", 또는 드라이브 버튼 옆 ▾ → \"전체 다시 스캔\"이에요.",
+              ],
+              [
+                "빠른 동기화",
+                "관리자 권한 없이(UAC 창 없이) 폴더를 다시 훑어서 지금 디스크에 맞춰요. 내 계정으로 열 수 없는 폴더는 마지막 전체 스캔 값을 그대로 써요. 스캔한 드라이브의 \"동기화\" 버튼이고, 앱을 켤 때(꺼 둔 동안 바뀐 것)와 실시간 반영이 변경을 놓쳤을 때는 저절로 돌아요.",
+              ],
+              [
+                "일반 탐색",
+                "FAT32·exFAT·네트워크 드라이브, UAC 창에서 거절했을 때, Program Files 밖에 설치했을 때 쓰는 스캔이에요. 열 수 없는 폴더는 빠져요.",
+              ],
+            ],
+          },
+          "**전체 스캔은 언제 하나요?** 드라이브를 처음 쓸 때 한 번, 그리고 폴더 크기가 많이 어긋나 보일 때예요. 평소에는 실시간 반영과 빠른 동기화로 충분해요.",
+        ],
+      },
+      {
+        id: "uac",
+        title: "왜 UAC 창이 뜨나요",
+        keys: "관리자 권한 사용자 계정 컨트롤 알 수 없는 게시자",
+        blocks: [
+          "MFT는 Windows가 관리자에게만 열어 주는 파일 목록표예요. 그래서 전체 스캔을 할 때만 이 앱 자신을 관리자 권한으로 한 번 더 실행해요(관리자 도우미).",
+          {
+            list: [
+              "도우미는 파일을 쓰거나 지우지 않고, 목록만 읽어 앱에 보낸 뒤 바로 끝나요. 관리자 권한을 계속 들고 있지 않는 게 안전해서, 전체 스캔을 할 때마다 다시 물어요.",
+              "**관리자 모드**(\"관리자 권한으로 보기\")가 켜져 있는 동안에는 전체 스캔도 그 도우미로 읽어서 UAC 창을 다시 띄우지 않아요.",
+              "UAC 창에서 거절하면 일반 탐색으로 대신 스캔해요.",
+              "UAC 창에 \"알 수 없는 게시자\"로 보이는 것은 아직 코드 서명을 하지 않아서예요.",
+              "바뀌지 않게 보호된 Program Files 안에 설치했을 때만 UAC를 요청해요. 다른 폴더에서 실행하면 늘 일반 탐색으로 스캔해요.",
+              "빠른 동기화, 실시간 반영, 검색, 둘러보기는 UAC 창 없이 돌아요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "update",
+        title: "업데이트",
+        keys: "새 버전 버전 확인 자동 업데이트 건너뛰기 나중에 설치 UAC 서명 GitHub 릴리스 latest",
+        blocks: [
+          '새 버전이 나오면 창 위쪽에 **"새 버전 … 나왔어요"** 알림이 떠요. 알려 주기만 하고, 저절로 설치하지는 않아요. **"바뀐 점 보기"**로 무엇이 바뀌었는지 볼 수 있어요.',
+          {
+            list: [
+              '**지금 업데이트**: 무엇을 하는지 먼저 보여 주고, 업데이트 파일을 내려받아요(진행률이 알림에 보여요). 파일의 서명을 앱에 들어 있는 공개 키로 확인해서, 맞지 않으면 설치하지 않아요. 내려받는 동안 **"내려받기 취소"**로 그만둘 수 있고, 1분 동안 하나도 받지 못하면 멈추고 알려 줘요.',
+              '설치할 때 Windows의 **UAC 창**이 한 번 떠요. 모든 사용자용으로 Program Files에 설치된 앱이라 관리자 권한이 필요해서예요. "예"를 누르면 앱이 꺼지고, 짧은 설치 창이 보인 뒤 새 버전이 저절로 다시 켜져요. "아니요"를 누르면 설치하지 않고 앱이 다시 보여요(아래처럼 업데이트하려고 멈춘 작업은 다시 이어지지 않아요).',
+              '복사·이동, 다른 드라이브로 옮기기, 정리 계획의 실행·되돌리기가 도는 중이면 먼저 알려 줘요. 그래도 업데이트하면 창을 닫을 때처럼 멈춰요: 복사·이동은 취소하고 쓰다 만 복사본을 지우고, 계획은 하던 단계까지 마치고 되돌리기 기록을 남겨요. 작업은 UAC 창이 뜨기 전에 멈춰서, UAC 창에서 "아니요"를 눌러도 다시 이어지지 않아요. 내려받는 동안 새로 시작한 작업은 멈추기 전에 다시 물어요.',
+              "다른 fine-file 창(또는 Claude 앱이 띄운 MCP 서버)이 떠 있으면 설치 프로그램이 함께 꺼요. 다른 창에서 정리 계획이나 다른 드라이브로 옮기기가 도는 중이면 끝난 뒤에 하라고 알려 줘요.",
+              '**나중에**: 지금은 닫고, 6시간쯤 뒤(또는 다음에 켤 때) 다시 알려 줘요. 그동안에도 왼쪽 "업데이트"에 "새 버전"이 보여요.',
+              '**이 버전 건너뛰기**: 그 버전은 다시 알리지 않아요(왼쪽 "업데이트"의 "새 버전" 표시도 사라져요). 더 새 버전이 나오면 알려 줘요.',
+            ],
+          },
+          '왼쪽 **도구 → 업데이트**에서 지금 버전을 보고, **"업데이트 확인"**으로 바로 확인할 수 있어요(건너뛴 버전도 다시 보여 줘요). **"시작할 때 업데이트 확인"**을 끄면 저절로 확인하지 않아요. 켜 두면 켤 때 15초쯤 뒤와, 켜 둔 동안 6시간마다 확인해요.',
+          { tip: "확인할 때는 GitHub의 fine-file 릴리스에서 최신 버전 정보(`latest.json`)만 받아 와요. 파일·폴더 정보는 보내지 않아요." },
+        ],
+      },
+    ],
+  },
+  {
+    id: "browse",
+    title: "둘러보기",
+    items: [
+      {
+        id: "views",
+        title: "보기 방식: 목록, 트리, 아이콘, 지도",
+        keys: "보기 목록 트리 아이콘 썸네일",
+        blocks: [
+          {
+            list: [
+              "**목록**: 이름, 크기, 파일 수, 수정한 날짜를 열로 보여 줘요. 폴더마다 크기와 파일 수가 바로 보이고, 열 머리를 눌러 정렬해요.",
+              "**트리**: 폴더를 펼쳐 가며 아래 폴더들의 크기를 한눈에 비교해요.",
+              "**아이콘**: Windows 썸네일로 보여 줘요. Windows에 이미 있는 썸네일만 써요.",
+              "**지도**: 지금 폴더 아래를 크기만큼의 넓이로 그려요(아래 \"크기 지도\").",
+            ],
+          },
+          "보기 방식은 탭마다 따로 기억해요. 검색 결과는 늘 목록으로 보여요.",
+        ],
+      },
+      {
+        id: "map",
+        title: "크기 지도",
+        keys: "지도 아이시클 선버스트 트리맵 가지 나무 마인드맵",
+        blocks: [
+          "지금 폴더 아래 4단계까지를 크기만큼의 넓이로 그려요. 아이시클, 선버스트, 트리맵, 가지 나무 중에 고를 수 있고, 시스템·프로그램·게임·캐시·미디어 같은 종류마다 색이 달라요.",
+          {
+            list: [
+              "폴더 블록을 누르면 그 폴더로 들어가고, 맨 위(가운데) 폴더를 누르면 위로 가요. 파일은 두 번 눌러 열어요.",
+              "아주 작은 항목은 \"기타 N개\"로 묶여요.",
+              "가지 나무는 끌어서 움직이고, 휠로 확대·축소하고, +/−로 가지를 펴고 접어요.",
+              "스캔한 드라이브에서만 그려요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "diff",
+        title: "지난 스캔과 비교",
+        keys: "변화 늘어남 줄어듦 이전 스캔이 없어요 동기화",
+        blocks: [
+          "드라이브를 다시 스캔하면(▾ → \"전체 다시 스캔\"이나 \"일반 탐색으로 다시 스캔\") 바로 전 스캔 결과를 하나 남겨 두고 지금과 비교해 보여 줘요.",
+          {
+            list: [
+              "목록 보기의 **\"변화\"** 버튼은 항목마다 늘거나 준 크기를 보여 주는 열을 더해요.",
+              "지도 보기의 **\"변화\"**를 켜면 늘어난 곳은 빨강, 줄어든 곳은 초록, 새로 생긴 곳은 파랑으로 칠해요.",
+              "**빠른 동기화는 스캔으로 세지 않아요.** \"동기화\"(와 저절로 도는 동기화)는 지금 쪽만 맞추고 남겨 둔 스캔은 그대로 둬서, 비교하는 전 스캔은 늘 마지막으로 다시 스캔하기 바로 전의 스캔이에요. 지금 쪽에는 동기화와 실시간 반영까지 들어가요.",
+              "전 스캔이 없으면(처음 스캔했거나, 같은 드라이브 문자에 다른 디스크를 꽂았거나) 그 이유를 알려 줘요. 동기화를 몇 번 해도 생기지 않으니, 드라이브 버튼 옆 **▾** → \"전체 다시 스캔\"을 해 주세요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "tabs",
+        title: "탭",
+        blocks: [
+          "탭마다 폴더, 뒤로/앞으로 기록, 보기 방식, 검색, 선택을 따로 가져요. 열어 둔 탭은 다음에 켤 때 그대로 돌아와요.",
+          {
+            list: [
+              "새 탭: `Ctrl+T` 또는 탭 줄의 +",
+              "폴더를 가운데 클릭하면 새 탭으로 뒤에서 열려요. 메뉴의 \"새 탭에서 열기\"는 그 탭으로 바로 가요.",
+              "탭 닫기: `Ctrl+W` 또는 탭을 가운데 클릭 (마지막 탭은 남아요)",
+              "다음 / 이전 탭: `Ctrl+Tab` / `Ctrl+Shift+Tab`",
+            ],
+          },
+        ],
+      },
+      {
+        id: "preview",
+        title: "미리 보기",
+        blocks: [
+          "`Alt+P`나 툴바의 \"미리 보기\"로 고른 항목을 옆에 보여 줘요. 그림, 동영상, 소리, PDF, 텍스트(앞 256 KB)를 열고, 나머지는 Windows 썸네일과 정보를 보여 줘요.",
+          "원드라이브 같은 클라우드의 온라인 전용 파일은 읽지 않아요(조금만 읽어도 파일 전체를 내려받기 때문이에요). 경계선을 끌어 너비를 바꿀 수 있어요.",
+        ],
+      },
+      {
+        id: "copy",
+        title: "복사, 이동, 끌어서 놓기",
+        keys: "붙여넣기 잘라내기 클립보드 이름 바꾸기 드래그",
+        blocks: [
+          {
+            list: [
+              "`Ctrl+C` / `Ctrl+X` / `Ctrl+V`는 Windows 클립보드를 써서, 탐색기와 서로 복사·붙여넣기를 할 수 있어요. 진행률은 아래 작업 창에 보이고 언제든 취소할 수 있어요.",
+              "이름이 같은 항목이 있으면 건너뛰기, 덮어쓰기, 이름 바꾸기 중에 물어요. 덮어쓰면 원래 항목은 먼저 휴지통으로 가요.",
+              "다른 드라이브로 옮길 때는 복사본을 끝까지 확인한 뒤에야 원본을 지워요.",
+              "항목을 끌어 다른 프로그램에 놓으면 늘 복사예요. 이 창 안에서 끈 항목은 놓을 때 Shift를 누르고 있으면 옮겨요.",
+              "이름 바꾸기는 `F2`예요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "shellMenu",
+        title: "Windows 메뉴",
+        keys: "오른쪽 클릭 컨텍스트 메뉴 7-Zip 보내기",
+        blocks: [
+          "오른쪽 클릭 메뉴의 \"Windows 메뉴 더 보기…\", Shift+오른쪽 클릭, `Shift+F10`, 메뉴 키로 탐색기의 오른쪽 클릭 메뉴를 띄워요. 7-Zip, VS Code, 보내기처럼 다른 프로그램이 넣은 항목도 다 있어요.",
+          "탐색기의 \"삭제\"와 \"휴지통 비우기\"는 영구 삭제가 될 수 있어서 \"이름 바꾸기\"와 함께 빼 두었어요. 휴지통으로 보내려면 `Delete`, 이름을 바꾸려면 `F2`를 써 주세요. **그 밖의 명령은 탐색기와 그 명령을 넣은 프로그램의 규칙대로 동작해요.** 다른 프로그램이 넣은 명령(예: \"완전 삭제\")은 휴지통을 거치지 않을 수도 있어요.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "find",
+    title: "찾기",
+    items: [
+      {
+        id: "search",
+        title: "검색과 검색 문법",
+        keys: "와일드카드 별표 물음표 Everything",
+        blocks: [
+          "`Ctrl+F`로 검색창에 가서 이름을 치면, 스캔한 모든 드라이브의 파일·폴더 이름에서 치는 대로 찾아요. 대문자·소문자는 가리지 않고, 큰 것부터 보여요.",
+          {
+            head: ["이렇게 치면", "찾는 것"],
+            rows: [
+              ["`보고서 2024`", "두 단어가 **모두** 들어간 이름 (띄어쓰기는 \"그리고\")"],
+              ["`*.mp4`", ".mp4로 끝나는 이름. `*`는 아무 글자 여러 개(없어도 돼요)"],
+              ["`보고서?.hwp`", "`?`는 아무 글자 하나. \"보고서1.hwp\", \"보고서A.hwp\""],
+              ["`보고서*`", "\"보고서\"로 시작하는 이름"],
+              ["`*.log 설치`", "와일드카드 단어와 보통 단어를 섞을 수 있어요"],
+            ],
+          },
+          "`*`나 `?`가 든 단어는 이름 **전체**와 맞춰 봐요(탐색기·Everything과 같아요). 와일드카드가 없는 단어는 이름 어디에 들어 있어도 돼요.",
+        ],
+      },
+      {
+        id: "searchHere",
+        title: "이 폴더만",
+        blocks: [
+          "검색창 옆의 **\"이 폴더만\"**을 켜면 지금 폴더 아래에서만 찾아요. 끄면 스캔한 모든 드라이브에서 찾아요.",
+          "스캔하지 않은 드라이브는 검색에 나오지 않아요.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "organize",
+    title: "정리하기",
+    items: [
+      {
+        id: "trash",
+        title: "휴지통 규칙",
+        keys: "삭제 지우기 영구 삭제",
+        blocks: [
+          "**지우는 것은 늘 휴지통으로만 보내요.** 이 앱에는 영구 삭제 기능이 없어요. 휴지통에서 언제든 되살릴 수 있어요.",
+          {
+            list: [
+              "휴지통이 없는 드라이브(네트워크 드라이브, USB 메모리, 메모리 카드, SUBST 드라이브)와 휴지통보다 큰 항목은 지우지 않고 이유를 알려 줘요.",
+              "덮어쓰기도 원래 항목을 먼저 휴지통에 넣고, 넣을 수 없으면 덮어쓰지 않아요.",
+              "예외는 다른 드라이브로 옮기기(이동)뿐이에요. 복사본을 끝까지 확인한 뒤에만 원본을 지워요.",
+              "관리자 권한으로 읽는 폴더에서는 아무것도 바꾸지 않아요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "dups",
+        title: "중복 파일 찾기",
+        keys: "같은 파일 해시",
+        blocks: [
+          "툴바의 **도구 ▾ → \"중복 파일 찾기…\"**는 지금 폴더(바꿀 수 있어요)에서 내용이 똑같은 파일을 찾아요. 크기가 같은 파일만 고른 뒤, 앞·가운데·끝을 먼저 비교하고 마지막에 파일 전체를 비교해요.",
+          {
+            list: [
+              "\"최신 하나만 남기기\" 같은 자동 선택이 있어요. Windows·프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일은 자동으로 고르지 않아요.",
+              "묶음마다 적어도 하나는 남겨요. 고른 파일은 휴지통으로만 보내요.",
+              "클라우드의 온라인 전용 파일은 읽지 않아요(읽으면 내려받게 돼서요).",
+            ],
+          },
+        ],
+      },
+      {
+        id: "relocate",
+        title: "다른 드라이브로 옮기기",
+        keys: "정션 링크 C 드라이브 공간 옮긴 폴더 목록",
+        blocks: [
+          "폴더의 메뉴에서 **\"다른 드라이브로 옮기기…\"**를 고르면, 폴더를 이 컴퓨터의 다른 로컬 NTFS 드라이브로 옮기고 원래 자리에 링크(정션)를 남겨요. 프로그램은 예전 경로로 그대로 찾아가서, 게임이나 캐시처럼 큰 폴더로 C: 공간을 비울 때 좋아요.",
+          {
+            list: [
+              "복사하고, 모든 항목을 원본과 비교한 뒤에만 원본을 지워요.",
+              "옮기는 동안에는 그 폴더를 쓰는 프로그램을 꺼 두세요.",
+              "도구 ▾ → **\"옮긴 폴더 목록…\"**에서 원래 자리로 되돌릴 수 있어요.",
+              "Windows, Program Files, 앱 데이터 폴더, 드라이브 전체, 클라우드 동기화 폴더는 옮기지 않아요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "programs",
+        title: "프로그램 정리",
+        keys: "제거 언인스톨 uninstall 앱 Microsoft Store 남은 찌꺼기 잔여 폴더 건너뜀 Revo",
+        blocks: [
+          "**\"프로그램 정리\"**는 설치된 프로그램의 크기와 마지막으로 쓴 때를 보여 줘서, 오래 안 쓰면서 자리만 차지하는 프로그램을 찾게 도와줘요.",
+          {
+            list: [
+              "**큰 것부터 / 오래 안 쓴 것**: \"오래 안 쓴 것\"은 6개월 넘게 쓰지 않았거나, 쓴 기록 없이 6개월보다 전에 설치한 프로그램이에요.",
+              "**크기**: \"스캔 기준\"은 설치 폴더를 스캔해 잰 값이고, \"프로그램이 알려 준 값\"은 설치할 때 적어 둔 값이라 실제와 다를 수 있어요.",
+              "**마지막 사용**: Windows가 남긴 시작 메뉴 실행 기록으로 짐작해요. 다른 방법으로만 실행한 프로그램은 \"알 수 없음\"이거나 실제보다 오래돼 보일 수 있어요. **\"사용 기록 더 정확히 보기 (관리자)\"**는 관리자 모드(UAC 창 한 번)로 Windows 미리 읽기(Prefetch) 기록까지 읽어요.",
+              "**제거 (데스크톱 프로그램)**: 그 프로그램이 Windows에 등록한 제거 명령을 그대로 실행해요. 대부분은 제거 창이 떠서 그 안내를 따르면 되지만, 일부(Slack 같은 앱, 조용히 지우도록 등록한 프로그램)는 **창 없이 바로** 지워져요. fine-file이 프로그램 폴더를 직접 지우지는 않아요.",
+              "**제거 (Microsoft Store 앱)**: 한 번 물은 뒤 이 계정에서 **바로** 제거해요. 제거 프로그램 창이 뜨지 않고 더 묻지도 않으며, 앱이 저장해 둔 데이터도 함께 지워져요(휴지통으로 가지 않아요). Microsoft Store에서 다시 설치할 수 있지만 데이터는 돌아오지 않아요.",
+              "**남은 찌꺼기**: 지운 프로그램이 Program Files, ProgramData, AppData에 남긴 것으로 보이는 폴더를 찾아요. 지우려면 \"위치 보기\"로 폴더를 열어 안을 확인하고, 위로(`Backspace`) 가서 그 폴더를 고른 뒤 `Delete`(휴지통)를 눌러요. Program Files 안처럼 관리자만 바꿀 수 있는 폴더는 이 앱의 Delete로 지워지지 않아서, \"탐색기에서 보기\"로 열어 탐색기에서 지워 주세요.",
+              "**정리 계획 만들기** (남은 찌꺼기): 고른 폴더를 계획(목록)으로 남겨 두기만 해요. 정리 계획은 Program Files·ProgramData·AppData 안의 항목을 건드리지 않아서, 이런 폴더의 단계는 이유와 함께 \"건너뜀\"으로 저장되고 실행되지 않아요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "plans",
+        title: "정리 계획과 되돌리기",
+        keys: "계획 실행 되돌리기 undo 정리 후보 캐시 임시 파일 압축 용량 줄이기",
+        blocks: [
+          "계획은 \"어떤 항목을 어떻게 바꿀지\"를 단계마다 적은 목록이에요. **만들기만 해서는 아무것도 바뀌지 않아요.**",
+          {
+            steps: [
+              "만들기: 폴더 메뉴의 \"정리 계획 만들기 ▸\", 툴바의 \"AI\"(정리 도우미)에서 만들어요. 정리 후보(캐시·임시 파일), 중복 정리, 용량 줄이기(Windows 압축), 다른 드라이브로 옮기기는 AI 없이 규칙으로 만들어요. 프로그램 정리의 \"남은 찌꺼기\"에서도 만들 수 있지만, 그 폴더들은 대부분 계획이 건드리지 않는 Program Files·ProgramData·AppData 안이라 \"건너뜀\"으로만 남아요(위 \"프로그램 정리\").",
+              "확인: 툴바의 \"계획\"에서 계획을 열고 단계를 하나씩 확인해서 고르세요. 휴지통 단계는 \"안전\"만 처음에 골라져 있어요.",
+              "실행: \"실행…\"을 누르면 동작별 개수를 보여 주고 한 번 더 물어요. 실행하기 바로 전에도 단계마다 다시 확인해서, 그사이 바뀐 단계는 건너뛰어요.",
+              "되돌리기: 실행한 계획은 \"되돌리기\"로 마지막 단계부터 거꾸로 되돌려요. 휴지통을 비웠거나 휴지통에서 지운 항목은 되살릴 수 없어요.",
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "adminMode",
+    title: "관리자 모드",
+    items: [
+      {
+        id: "admin",
+        title: "관리자 권한으로 보기 (읽기 전용)",
+        keys: "액세스가 거부되었습니다 권한 Prefetch",
+        blocks: [
+          "내 계정으로 열 수 없는 폴더(\"액세스가 거부되었습니다\")에는 **\"관리자 권한으로 보기\"** 버튼이 떠요. 누르면 UAC 창으로 한 번 허락을 받고, 그 폴더의 항목을 읽기 전용으로 보여 줘요. 미리 보기 창의 \"관리자 권한으로 읽기\"는 파일 앞 256 KB를 보여 줘요.",
+          {
+            list: [
+              "**읽기만 해요.** 이름 바꾸기, 휴지통, 복사·붙여넣기, 새 폴더는 할 수 없고, 폴더 크기는 보이지 않아요.",
+              "10분 동안 쓰지 않으면 저절로 꺼져요. 아래 상태 표시줄에 남은 시간이 보이고, \"끝내기\"로 바로 끌 수 있어요.",
+              "프로그램 정리의 \"사용 기록 더 정확히 보기\"도 관리자 모드로 Windows 미리 읽기 기록을 읽어요.",
+              "네트워크 드라이브와 SUBST 드라이브에서는 쓸 수 없어요. Program Files 안에 설치했을 때만 켜져요.",
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "liveSec",
+    title: "실시간 반영",
+    items: [
+      {
+        id: "live",
+        title: "바뀌는 대로 맞추기",
+        keys: "실시간 감시 변경 알림 동기화 중 다시 스캔 필요 놓친 변경 있음 전체 스캔 필요 하드 링크",
+        blocks: [
+          "스캔한 로컬 드라이브는 Windows의 변경 알림으로 지켜봐요. 일반 권한으로 돌아서 UAC 창이 뜨지 않아요.",
+          {
+            list: [
+              "파일이 생기고, 지워지고, 바뀌면 0.3초쯤 모았다가 반영해요. 폴더 크기는 위 폴더까지 다시 합산되고, 검색에도 바로 나와요.",
+              "압축 풀기, 대량 복사, Windows 업데이트처럼 변경이 한꺼번에 몰리면 Windows가 알림을 다 담지 못할 때가 있어요. 그래도 인덱스는 그대로 쓸 수 있고, 놓친 변경은 **빠른 동기화**(UAC 없음)가 맞춰요.",
+              "앱을 꺼 둔 동안 바뀐 것은 다음에 켤 때 빠른 동기화로 맞춰요. 끈 지 10분이 안 돼서 다시 켰으면 바로 하지 않고 10분쯤 뒤에 맞춰요(바로 맞추려면 **\"동기화\"**를 누르세요).",
+              "네트워크 드라이브는 지켜보지 않고 저절로 동기화하지도 않아요. 바뀐 내용은 \"동기화\"를 누르면 보여요.",
+              "USB 드라이브를 \"안전하게 제거\"하면 지켜보기를 멈추고 드라이브를 놓아줘요.",
+            ],
+          },
+          "드라이브 목록 아래에 지금 상태(실시간 반영 중, 동기화 중, 놓친 변경 있음, 전체 스캔 필요, 실시간 반영 꺼짐, 실시간 반영 오류)가 보여요. **\"놓친 변경 있음\"**은 저절로 도는 동기화가 맞추고, **\"전체 스캔 필요\"**(하드 링크가 여러 개인 파일이 지워졌을 때)는 동기화로 바로잡히지 않아서, 동기화한 뒤에도 그대로 보여요. ▾ → \"전체 다시 스캔\"을 해 주세요.",
+          "**\"실시간 반영 오류\"**는 변경 알림이 끊긴 거예요. 끊긴 알림은 잠시 뒤 저절로 다시 이어 보고, 이어지면 그사이 놓친 변경을 빠른 동기화로 맞춰요. 화면 위 알림에 \"멈췄어요\"라고 나오면 드라이브의 \"동기화\"나 다시 스캔을 눌러 주세요. 조용한 드라이브(D: 등)에서 995 오류로 자꾸 끊기던 것은 v0.7.1에서 고쳤어요(아래 \"문제 해결\").",
+        ],
+      },
+    ],
+  },
+  {
+    id: "aiSec",
+    title: "AI (선택)",
+    items: [
+      {
+        id: "ai",
+        title: "AI 기능",
+        keys: "Claude OpenAI Ollama Codex CLI MCP API 키 정리 도우미 jev",
+        blocks: [
+          "AI는 켜야만 쓰는 선택 기능이고, 처음에는 꺼져 있어요. 꺼진 채로도 앱의 모든 기능과 규칙으로 만드는 정리 계획이 그대로 동작해요.",
+          {
+            list: [
+              "**켜기**: 툴바의 톱니바퀴(AI 설정)에서 Claude API, OpenAI API, Ollama(내 PC), Claude Code CLI, Codex CLI 중에 골라요.",
+              "**하는 일**: 폴더·파일 설명(무엇인지, 지워도 되는지), 구조 정리·이름 정리 계획. AI가 낸 계획도 같은 안전 규칙으로 다시 확인하고, 실행은 늘 직접 해요.",
+              "**보내는 것**: 경로, 이름, 크기, 날짜, 분류 같은 정보만 보내고, 파일 내용은 앱이 읽어 보내지 않아요(Codex CLI는 스스로 파일을 읽을 수 있어요).",
+              "**보내기 전에 미리 보기**(처음에 켜져 있어요): 보낼 내용을 글자 그대로 보여 주고 \"보내기\"를 눌러야 보내요.",
+              "API 키는 Windows 자격 증명 관리자에 저장해요. Claude Pro·Max 같은 구독은 이 앱 안에서 쓸 수 없고, MCP로 Claude 앱에 연결해 쓸 수 있어요.",
+              "**답 보기**: AI의 설명은 제목·목록·굵게·표 같은 서식을 살려 보여 줘요. 링크는 누를 수 없는 글자로(주소도 함께) 보여 주고, 그림은 불러오지 않아요. CLI가 덧붙이는 색 코드나 \"tokens used\" 같은 줄은 빼요. 경로와 파일 이름(밑줄·괄호가 든 이름도)은 적힌 그대로 보여요.",
+              "**jev 위험도**: AI와 따로 켜는 위험도 배지예요(아래 \"jev 위험도\").",
+            ],
+          },
+        ],
+      },
+      {
+        id: "jev",
+        title: "jev 위험도 (어디에 쓰나요)",
+        keys: "jev TypeSafe 위험도 배지 2차 판정 다시 확인 안전 주의 위험 요금",
+        blocks: [
+          "**jev**는 TypeSafe의 얼리 액세스 서비스예요. 항목마다 지워도 되는지(안전·주의·위험)와 프로그램이 다시 만드는 항목인지를 빠르게 판정해요. 위의 AI(Claude, OpenAI 등)와는 따로라서, AI를 꺼 둔 채로 jev만 쓸 수도 있어요.",
+          {
+            list: [
+              "**목록의 \"위험도\" 열**: 목록 보기 툴바의 **\"위험도\"**를 켜면, 그 탭에 보이는 항목마다 jev의 판정이 배지로 붙어요. 탭마다 따로 켜고, 검색 결과와 관리자 권한으로 읽는 폴더에서는 묻지 않아요.",
+              "**정리 계획의 2차 확인**: 계획 창의 **\"jev로 위험도 다시 확인\"**을 누르면, 계획(규칙이나 AI)이 매긴 위험 옆에 jev의 판정이 \"jev 안전\"처럼 한 번 더 붙어요. 계획을 만든 쪽과 따로 보는 빠르고 저렴한 2차 의견이에요.",
+              "**켜기**: AI 설정 → \"위험도 배지 (TypeSafe jev)\"를 켜고 내 jev API 키를 저장해요. 키가 없으면 버튼과 열이 생기지 않아요.",
+              "**요금**: 보낸 만큼 jev 키 주인에게 jev의 조건대로 청구돼요. 이 앱은 요금을 받지 않아요.",
+              "**보내는 것**: 항목의 경로, 이름, 종류, 크기, 날짜, 분류만 보내요. 파일 내용은 보내지 않아요. \"보내기 전에 미리 보기\"가 켜져 있으면 보내기 전에(목록은 켤 때) 먼저 물어요.",
+            ],
+          },
+          { tip: "배지는 참고용이에요. 계획의 단계를 대신 고르거나 실행하지 않고, Windows가 쓰는 시스템 위치는 jev의 답과 상관없이 \"위험\"으로 보여요." },
+        ],
+      },
+    ],
+  },
+  {
+    id: "keysSec",
+    title: "단축키",
+    items: [
+      {
+        id: "keys",
+        title: "단축키 표",
+        keys: "키보드 shortcut",
+        blocks: [
+          {
+            head: ["키", "동작"],
+            rows: [
+              ["`F1`", "도움말"],
+              ["`Ctrl+F`", "검색창으로 이동"],
+              ["`Alt+←` / `Alt+→`", "뒤로 / 앞으로"],
+              ["`Backspace`", "상위 폴더"],
+              ["`Enter` / 더블클릭", "열기"],
+              ["가운데 클릭 (폴더)", "새 탭에서 열기 (뒤에서)"],
+              ["`Ctrl+T`", "새 탭 (같은 폴더)"],
+              ["`Ctrl+W` / 탭 가운데 클릭", "탭 닫기 (마지막 탭은 남아요)"],
+              ["`Ctrl+Tab` / `Ctrl+Shift+Tab`", "다음 탭 / 이전 탭"],
+              ["`Ctrl+C` / `Ctrl+X`", "복사 / 잘라내기"],
+              ["`Ctrl+V`", "붙여넣기 (지금 폴더로)"],
+              ["`Ctrl+Shift+N`", "새 폴더"],
+              ["`F2`", "이름 바꾸기"],
+              ["`Delete`", "휴지통으로 이동"],
+              ["`F5`", "새로 고침"],
+              ["`Ctrl+A`", "모두 선택"],
+              ["`Alt+P`", "미리 보기 창 열기/닫기"],
+              ["`Shift+F10` / 메뉴 키", "Windows 메뉴"],
+              ["Shift+오른쪽 클릭", "Windows 메뉴 (이 앱의 메뉴 대신)"],
+              ["끌어서 놓기 + Shift", "이 창 안에서 끈 항목을 옮기기 (누르지 않으면 복사)"],
+              ["화살표", "항목 사이 이동"],
+              ["`Esc`", "메뉴 닫기, 선택 해제, 열린 창 닫기"],
+            ],
+          },
+          "중복 파일 찾기 같은 창이 열려 있는 동안에는 목록의 단축키와 탭 단축키가 쉬어요. 관리자 권한으로 읽는 폴더에서는 바꾸는 단축키(F2, Delete, 잘라내기·붙여넣기, 새 폴더)가 동작하지 않아요.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "trouble",
+    title: "문제 해결",
+    items: [
+      {
+        id: "taskbarIcon",
+        title: "작업 표시줄 아이콘이 예전 것일 때",
+        keys: "아이콘 캐시 고정 바로 가기 업데이트",
+        blocks: [
+          "Windows는 실행 파일 경로마다 아이콘을 기억해 둬서(아이콘 캐시), 새 버전을 같은 자리에 설치해도 예전 아이콘을 한동안 보여 줄 수 있어요.",
+          {
+            steps: [
+              "설치를 마친 뒤 컴퓨터를 **한 번 다시 시작**해 주세요.",
+              "그래도 그대로면 작업 표시줄의 fine-file 아이콘을 오른쪽 클릭 → **\"작업 표시줄에서 고정 해제\"**를 누르고, fine-file을 다시 실행한 뒤 아이콘을 오른쪽 클릭 → **\"작업 표시줄에 고정\"**을 눌러요.",
+            ],
+          },
+          "시작 메뉴나 바탕 화면의 바로 가기도 지우고 다시 만들면 새 아이콘으로 바뀌어요.",
+        ],
+      },
+      {
+        id: "frequentScan",
+        title: "스캔이 자주 필요하다고 나올 때",
+        keys: "다시 스캔 필요 놓친 변경 있음 전체 스캔 필요 하드 링크 실시간 반영이 끊겼어요 자꾸",
+        blocks: [
+          "C: 드라이브처럼 Windows와 프로그램이 쉬지 않고 쓰는 드라이브는 변경이 몰려서 Windows가 알림을 다 담지 못할 때가 있어요. 그래도 인덱스는 그대로 쓸 수 있어요.",
+          {
+            list: [
+              "놓친 변경은 **빠른 동기화**가 UAC 창 없이 저절로 맞춰요. 전체 스캔(UAC)을 다시 할 필요는 없어요.",
+              "저절로 도는 동기화는 처음에는 30초쯤 뒤예요. 계속 놓치는 드라이브는 컴퓨터를 덜 쓰려고 적어도 10분 간격을 두고, 놓칠 때마다 간격을 두 배씩(2시간 40분까지) 늘려요. 2시간 동안 조용하면 다시 짧아져요. 기다리지 않으려면 알림이나 드라이브의 **\"동기화\"**를 누르세요.",
+              "앱을 꺼 둔 동안 바뀐 것은 켤 때 빠른 동기화로 맞춰요. 잠깐(10분 안) 껐다 켰으면 10분쯤 뒤에 맞춰서, 껐다 켤 때마다 드라이브를 곧바로 다시 훑지 않아요.",
+              "압축 풀기나 게임 설치 같은 큰 작업 뒤에 크기가 이상해 보이면 드라이브의 **\"동기화\"**를 눌러 주세요.",
+              "**\"전체 스캔 필요\"**가 보이면(하드 링크가 여러 개인 파일이 지워졌을 때) 동기화로는 바로잡히지 않아요. 드라이브 버튼 옆 **▾** → \"전체 다시 스캔\"을 해 주세요.",
+              "그 밖에도 크기가 많이 어긋나면 그때만 **▾** → \"전체 다시 스캔\"을 해 주세요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "watch995",
+        title: "\"실시간 반영 오류\"(995)가 뜰 때",
+        keys: "실시간 반영 오류 995 변경 알림이 끊겼어요 I/O 작업이 취소되었습니다 스레드 종료 응용 프로그램 요청 os error D 드라이브 끊김",
+        blocks: [
+          "드라이브 목록 아래에 **\"실시간 반영 오류\"**가 뜨고 화면 위에 \"변경 알림이 끊겼어요 (… I/O 작업이 취소되었습니다. (os error 995))\"가 나오던 것은 **v0.7.0까지 있던 버그**예요. **v0.7.1에서 고쳤어요.**",
+          "D:처럼 평소에 조용한 드라이브에서 주로 보였어요. 앱이 변경 알림을 처음 신청한 작업 스레드가 몇 초 쉬다가 끝나면, Windows가 그 스레드가 걸어 둔 신청을 취소했기 때문이에요. C:처럼 쉬지 않고 바뀌는 드라이브는 그 전에 다음 알림을 받아서 괜찮았어요.",
+          {
+            list: [
+              "v0.7.1부터는 조용한 드라이브에서도 알림이 끊기지 않아요.",
+              "그래도 알림이 끊기면(화면 위에 \"잠시 뒤 다시 이어 볼게요\") 실시간 반영을 다시 이어 보고, 이어지면 그사이 놓친 변경은 **빠른 동기화**(UAC 창 없음)가 저절로 맞춰요. 이때는 따로 할 일이 없어요.",
+              "화면 위 알림에 **\"멈췄어요\"**라고 나오면(드라이브를 다시 열 수 없거나 알림이 계속 끊길 때) 저절로 다시 켜지지 않아요. 그 드라이브의 **\"동기화\"**나 다시 스캔을 눌러 주세요.",
+              "예전 버전에서 이 오류가 보였다면 새 버전을 설치해 주세요. 예전 버전에서는 **\"동기화\"**를 눌러도 잠시 뒤 다시 끊길 수 있어요. 인덱스와 폴더 크기는 그대로 쓸 수 있어요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "uacEvery",
+        title: "스캔할 때마다 UAC 창이 뜰 때",
+        keys: "확인 메시지 관리자 권한 매번",
+        blocks: [
+          "UAC 창은 **전체 스캔**에서만 떠요. 관리자 도우미는 결과를 보내고 바로 끝나서(관리자 권한을 계속 켜 두지 않는 게 안전해서요) 전체 스캔을 할 때마다 다시 물어요.",
+          {
+            list: [
+              "스캔한 드라이브의 버튼은 **\"동기화\"**예요. 동기화와 실시간 반영은 UAC 창이 뜨지 않고, 평소에는 이것으로 충분해요. 전체 스캔은 드라이브 버튼 옆의 **▾** 메뉴에 있어요.",
+              "관리자 모드가 켜져 있는 동안의 전체 스캔은 다시 묻지 않아요.",
+              "UAC 창에서 \"아니요\"를 누르면 일반 탐색으로 스캔해요. 내 계정으로 열 수 없는 폴더만 빠져요.",
+              "\"알 수 없는 게시자\"로 보이는 것은 아직 코드 서명을 하지 않아서예요.",
+            ],
+          },
+        ],
+      },
+      {
+        id: "noSize",
+        title: "폴더 크기가 안 보일 때",
+        blocks: [
+          "폴더 크기는 스캔한 드라이브에서만 보여요. 왼쪽 드라이브 목록에서 \"스캔\"을 눌러 주세요. 네트워크 드라이브는 실시간 반영이 없어서 \"동기화\"를 눌러야 새 크기가 보여요. 관리자 권한으로 읽는 폴더는 크기를 보여 주지 않아요.",
+        ],
+      },
+      {
+        id: "smartscreen",
+        title: "설치할 때 SmartScreen 경고가 뜰 때",
+        keys: "Windows의 PC 보호 설치",
+        blocks: ["아직 코드 서명이 없어서 뜨는 경고예요. \"추가 정보 → 실행\"을 누르면 돼요."],
+      },
+    ],
+  },
+];
+
+/** Tooltip ids whose long form is in an item of another name. */
+const TOPIC_ALIAS: Record<string, string> = {
+  sync: "scan",
+  fullScan: "scan",
+  viewList: "views",
+  viewTree: "views",
+  viewGrid: "views",
+  viewMap: "map",
+  relocations: "relocate",
+  aiSettings: "ai",
+  cut: "copy",
+  paste: "copy",
+  rename: "copy",
+  newFolder: "keys",
+};
+
+const itemDom = (id: string) => `help-i-${id}`;
+const sectionDom = (id: string) => `help-s-${id}`;
+
+/** The item or section a topic opens at, as a DOM id; null when there is none. */
+function topicTarget(topic: string | undefined): string | null {
+  if (!topic) return null;
+  const id = TOPIC_ALIAS[topic] ?? topic;
+  for (const s of SECTIONS) {
+    if (s.items.some((i) => i.id === id)) return itemDom(id);
+  }
+  return SECTIONS.some((s) => s.id === topic) ? sectionDom(topic) : null;
+}
+
+function blockText(b: Block): string {
+  if (typeof b === "string") return b;
+  if ("list" in b) return b.list.join(" ");
+  if ("steps" in b) return b.steps.join(" ");
+  if ("tip" in b) return b.tip;
+  return [...b.head, ...b.rows.flat()].join(" ");
+}
+
+/** Lower-case text an item is found by, marks taken out. */
+function haystack(s: Section, i: Item): string {
+  return [s.title, i.title, i.keys ?? "", ...i.blocks.map(blockText)].join(" ").replace(/[`*]/g, "").toLowerCase();
+}
+
+/** `code` and **bold** in a line of help. */
+function Rich({ text }: { text: string }) {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.startsWith("`") && p.endsWith("`") && p.length > 1 ? (
+          <code key={i}>{p.slice(1, -1)}</code>
+        ) : p.startsWith("**") && p.endsWith("**") && p.length > 3 ? (
+          <b key={i}>{p.slice(2, -2)}</b>
+        ) : (
+          <Fragment key={i}>{p}</Fragment>
+        ),
+      )}
+    </>
+  );
+}
+
+function BlockView({ block }: { block: Block }) {
+  if (typeof block === "string") {
+    return (
+      <p>
+        <Rich text={block} />
+      </p>
+    );
+  }
+  if ("list" in block) {
+    return (
+      <ul>
+        {block.list.map((t, i) => (
+          <li key={i}>
+            <Rich text={t} />
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if ("steps" in block) {
+    return (
+      <ol>
+        {block.steps.map((t, i) => (
+          <li key={i}>
+            <Rich text={t} />
+          </li>
+        ))}
+      </ol>
+    );
+  }
+  if ("tip" in block) {
+    return (
+      <p className="v07-help-tip">
+        <Rich text={block.tip} />
+      </p>
+    );
+  }
+  return (
+    <table className="v07-help-table">
+      <thead>
+        <tr>
+          {block.head.map((h) => (
+            <th key={h}>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {block.rows.map((r, i) => (
+          <tr key={i}>
+            {r.map((c, j) => (
+              <td key={j}>
+                <Rich text={c} />
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/**
+ * The help panel (F1). `topic`: a HELP_TIPS id, an item id or a section id ("start", "browse",
+ * "find", "organize", "adminMode", "liveSec", "aiSec", "keysSec", "trouble") to open at.
+ */
+export function Help({ onClose, topic }: { onClose(): void; topic?: string }) {
+  const [query, setQuery] = useState("");
+  const [guide, setGuide] = useState(false);
+  const search = useRef<HTMLInputElement>(null);
+  const target = useMemo(() => topicTarget(topic), [topic]);
+  const [focused, setFocused] = useState<string | null>(target);
+
+  const terms = useMemo(() => query.trim().toLowerCase().split(/\s+/).filter(Boolean), [query]);
+  const found = useMemo(() => {
+    if (!terms.length) return SECTIONS;
+    return SECTIONS.map((s) => ({ ...s, items: s.items.filter((i) => terms.every((t) => haystack(s, i).includes(t))) })).filter(
+      (s) => s.items.length > 0,
+    );
+  }, [terms]);
+  const count = found.reduce((n, s) => n + s.items.length, 0);
+
+  // Opened at a topic: that part is scrolled to and marked for a moment.
+  useEffect(() => {
+    if (!target) return;
+    setFocused(target);
+    const t = requestAnimationFrame(() => document.getElementById(target)?.scrollIntoView({ block: "start" }));
+    const off = setTimeout(() => setFocused(null), 2400);
+    return () => {
+      cancelAnimationFrame(t);
+      clearTimeout(off);
+    };
+  }, [target]);
+
+  // F1 or Ctrl+F while the help is open goes to its search box (the window's own F1 waits behind the dialog).
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (guide) return;
+      const ctrlF = (ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.key.toLowerCase() === "f";
+      if (ev.key !== "F1" && !ctrlF) return;
+      ev.preventDefault();
+      search.current?.focus();
+      search.current?.select();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [guide]);
+
+  const jump = (id: string) => {
+    const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    document.getElementById(sectionDom(id))?.scrollIntoView({ block: "start", behavior: still ? "auto" : "smooth" });
+  };
+
+  return (
+    // Esc clears a search first, then closes.
+    <Dialog className="v04-dialog v07-help" title="도움말" onClose={() => (query ? setQuery("") : onClose())}>
+      <div className="dlg-head">
+        <h3>도움말</h3>
+        <label className="field v07-help-search">
+          <input
+            ref={search}
+            type="search"
+            value={query}
+            autoFocus
+            placeholder="무엇이 궁금한가요? (예: UAC, 와일드카드, 휴지통)"
+            aria-label="도움말 찾기"
+            spellCheck={false}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        <button className="dlg-close" aria-label="닫기" onClick={onClose}>
+          ✕
+        </button>
+      </div>
+
+      <div className="v07-help-layout">
+        <nav className="v07-help-nav" aria-label="도움말 차례">
+          {SECTIONS.map((s) => {
+            const hits = found.find((f) => f.id === s.id)?.items.length ?? 0;
+            return (
+              <button key={s.id} className="v07-help-nav-item" disabled={!hits} onClick={() => jump(s.id)}>
+                <span>{s.title}</span>
+                {terms.length > 0 && hits > 0 && <span className="v07-count">{hits}</span>}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="v07-help-body" tabIndex={0} aria-label="도움말 내용">
+          {terms.length > 0 && (
+            <p className="muted v07-help-found" role="status">
+              {count ? `"${query.trim()}" ${count.toLocaleString()}곳` : `"${query.trim()}"에 맞는 도움말이 없어요. 다른 말로 찾아보세요.`}
+            </p>
+          )}
+          {found.map((s) => (
+            <section key={s.id} id={sectionDom(s.id)} className="v07-help-section">
+              <h4>{s.title}</h4>
+              {s.items.map((i) => (
+                <article key={i.id} id={itemDom(i.id)} className={`v07-help-item${focused === itemDom(i.id) ? " focus" : ""}`}>
+                  <h5>{i.title}</h5>
+                  {i.blocks.map((b, n) => (
+                    <BlockView key={n} block={b} />
+                  ))}
+                </article>
+              ))}
+            </section>
+          ))}
+        </div>
+      </div>
+
+      <div className="dlg-foot">
+        <button className="btn" onClick={() => setGuide(true)}>
+          처음 안내 다시 보기
+        </button>
+        <span className="spacer" />
+        <button className="btn" onClick={onClose}>
+          닫기
+        </button>
+      </div>
+
+      {guide && <FirstRunGuide force onDone={() => setGuide(false)} />}
+    </Dialog>
+  );
+}
+
+// ---- first-run guide ---------------------------------------------------------------
+
+const GUIDE_KEY = "fine-file.first-run";
+
+/** Dismissed in this run, for when the storage cannot keep it. */
+let guideDismissed = false;
+
+/** Whether the first-run guide was seen (finished or skipped). Storage that cannot be read counts as seen, so it never comes back every start. */
+export function firstRunDone(): boolean {
+  if (guideDismissed) return true;
+  try {
+    return localStorage.getItem(GUIDE_KEY) !== null;
+  } catch {
+    return true;
+  }
+}
+
+function rememberGuide() {
+  guideDismissed = true;
+  try {
+    localStorage.setItem(GUIDE_KEY, "done");
+  } catch {
+    /* storage blocked: it stays away until the app closes */
+  }
+}
+
+const GUIDE: { title: string; lines: string[] }[] = [
+  {
+    title: "드라이브를 스캔해요",
+    lines: [
+      '왼쪽 드라이브 목록에서 **"스캔"**을 누르면 모든 폴더의 크기를 재요. NTFS 드라이브는 파일 목록표를 직접 읽어 몇 초면 끝나요.',
+      "이때 관리자 권한을 묻는 UAC 창이 떠요. 목록만 읽고 바로 끝나요. 거절해도 일반 탐색으로 스캔해요.",
+      "한 번 스캔하면 그 뒤로는 실시간 반영과 빠른 동기화가 UAC 없이 맞춰 줘요.",
+    ],
+  },
+  {
+    title: "어디가 큰지 봐요",
+    lines: [
+      "폴더마다 크기와 파일 수가 바로 보여요. 열 머리를 눌러 큰 것부터 정렬할 수 있어요.",
+      '툴바의 보기 방식에서 **"지도"**를 고르면 크기만큼의 넓이로 그려서, 자리를 많이 차지하는 곳이 한눈에 보여요.',
+    ],
+  },
+  {
+    title: "치는 대로 찾아요",
+    lines: [
+      "`Ctrl+F`로 검색창에 가서 이름을 치면 스캔한 모든 드라이브에서 바로 찾아요.",
+      '띄어쓰기로 여러 단어를, `*.mp4`처럼 와일드카드를 쓸 수 있어요. **"이 폴더만"**을 켜면 지금 폴더 아래에서만 찾아요.',
+    ],
+  },
+  {
+    title: "안전하게 정리해요",
+    lines: [
+      "지우는 것은 **늘 휴지통으로만** 보내요. 중복 파일 찾기, 다른 드라이브로 옮기기, 프로그램 정리, 정리 계획은 확인을 거쳐야만 바뀌고, 계획은 되돌릴 수 있어요.",
+      "궁금한 게 있으면 언제든 `F1`을 눌러 도움말을 보세요.",
+    ],
+  },
+];
+
+/**
+ * A four-step intro shown once. Finishing or skipping it (Esc too) is remembered; `onDone` is then
+ * called, and at once when it was seen before. `force` shows it anyway (from the help).
+ */
+export function FirstRunGuide({ onDone, force = false }: { onDone(): void; force?: boolean }) {
+  const [show] = useState(() => force || !firstRunDone());
+  const [step, setStep] = useState(0);
+  const done = useRef(onDone);
+  useEffect(() => {
+    done.current = onDone;
+  });
+
+  useEffect(() => {
+    if (!show) done.current();
+  }, [show]);
+
+  if (!show) return null;
+
+  const finish = () => {
+    rememberGuide();
+    done.current();
+  };
+  const g = GUIDE[step];
+  const last = step === GUIDE.length - 1;
+
+  return (
+    <Dialog className="v07-guide" title={`처음 안내: ${g.title}`} onClose={finish}>
+      <div className="v07-guide-top">
+        <span className="v07-guide-num" aria-hidden="true">
+          {step + 1}
+        </span>
+        <span className="muted">
+          처음 안내 · {step + 1} / {GUIDE.length}
+        </span>
+      </div>
+      <h3>{g.title}</h3>
+      {g.lines.map((l, i) => (
+        <p key={i}>
+          <Rich text={l} />
+        </p>
+      ))}
+      <div className="v07-guide-dots" aria-hidden="true">
+        {GUIDE.map((_, i) => (
+          <span key={i} className={i === step ? "on" : undefined} />
+        ))}
+      </div>
+      <div className="actions v07-guide-actions">
+        <button onClick={finish}>건너뛰기</button>
+        <span className="spacer" />
+        {step > 0 && <button onClick={() => setStep((s) => s - 1)}>이전</button>}
+        <button className="primary" autoFocus onClick={() => (last ? finish() : setStep((s) => s + 1))}>
+          {last ? "시작하기" : "다음"}
+        </button>
+      </div>
+    </Dialog>
+  );
+}
