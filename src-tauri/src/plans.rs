@@ -356,9 +356,11 @@ pub async fn plan_execute(app: tauri::AppHandle, id: String) -> Result<(), Strin
     crate::blocking(move || launch(Store::app(), id, Work::Execute, app)).await?
 }
 
-/// Undoes every done step of a plan, last first.
+/// Undoes every done step of a plan, last first. Not while the app runs
+/// elevated (ops::ELEVATED_JOURNALS): the journal is in the plan file.
 #[tauri::command]
 pub async fn plan_undo(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    ops::journals_refused()?;
     crate::blocking(move || launch(Store::app(), id, Work::Undo, app)).await?
 }
 
@@ -1860,6 +1862,8 @@ fn undo(store: &Store, id: &str, events: &dyn Events) {
         return;
     };
     let todo: Vec<usize> = (0..file.journal.len()).filter(|&j| !file.journal[j].undone).rev().collect();
+    let ctx = Ctx::now();
+    let root = file.plan.root.clone();
     let mut progress = Progress::new(id, todo.len() as u32);
     progress.send(events, "running", true);
     // The Recycle Bin is listed once, when the first item is to come back.
@@ -1881,7 +1885,12 @@ fn undo(store: &Store, id: &str, events: &dyn Events) {
         if let Some(i) = step {
             progress.at(events, Path::new(&file.plan.steps[i].from));
         }
-        let undone = catch_unwind(AssertUnwindSafe(|| undo_one(&mut entry.undo, events, &mut bin)));
+        let action = step.map_or("", |i| file.plan.steps[i].action.as_str());
+        let undone = catch_unwind(AssertUnwindSafe(|| {
+            // Checked again right before it runs, as a step is.
+            check_undo(&ctx, &root, action, &entry.undo)?;
+            undo_one(&mut entry.undo, events, &mut bin)
+        }));
         let result = undone.unwrap_or_else(|_| Err(PANICKED.into()));
         if result.is_ok() {
             entry.undone = true;
@@ -1908,6 +1917,63 @@ fn undo(store: &Store, id: &str, events: &dyn Events) {
     persist(store, &file, &mut progress, events, None);
     progress.current = None;
     progress.send(events, &file.plan.state, true);
+}
+
+/// Checks one undo right before it runs, as `check` does a step: the journal
+/// is in the plan file, which any program of this account can write, and a
+/// folder on the way may have become a junction since the step ran. What the
+/// undo takes and where it puts it back must be in the plan's folder, with
+/// no short (8.3) name and no junction or link on the way below it, and
+/// nowhere that must stay as it is (`place_refusal` for `action`, the step's,
+/// and `why_into` where something is put back).
+fn check_undo(ctx: &Ctx, root: &str, action: &str, undo: &Inverse) -> Result<(), String> {
+    let root = norm(root).ok_or(BAD_ROOT)?;
+    let is_dir = |p: &str| meta_of(p).is_ok_and(|m| m.is_dir());
+    match undo {
+        Inverse::Rmdir { path } => undo_place(ctx, &root, action, path, true, false),
+        Inverse::MoveBack { from, to } => {
+            let dir = is_dir(to);
+            undo_place(ctx, &root, action, to, dir, false)?;
+            undo_place(ctx, &root, action, from, dir, true)
+        }
+        Inverse::Restore { path, real, .. } => {
+            // In the bin nothing tells a folder from a file: it must pass as either.
+            for dir in [false, true] {
+                undo_place(ctx, &root, action, path, dir, true)?;
+                // Where it really was may be outside the plan's folder (a junction above it): only what must stay counts there.
+                if let Some(real) = norm(real) {
+                    place_refusal(ctx, action, &real, dir)?;
+                    if parent_of(&real).is_some_and(|p| ctx.guards.why_into(Path::new(p)).is_some()) {
+                        return Err(PROTECTED.into());
+                    }
+                }
+            }
+            Ok(())
+        }
+        Inverse::Decompress { files } => files.iter().try_for_each(|f| undo_place(ctx, &root, action, &f.path, false, false)),
+        Inverse::Unrelocate { original, .. } => undo_place(ctx, &root, action, original, true, false),
+    }
+}
+
+/// `check`'s checks on one path an undo works on (`into`: one it puts
+/// something back at): a full path in the plan's folder `root`, not a drive
+/// root, with no short name and no link on the way below `root`, and
+/// nothing that must stay where it is.
+fn undo_place(ctx: &Ctx, root: &str, action: &str, path: &str, is_dir: bool, into: bool) -> Result<(), String> {
+    let path = norm(path).ok_or(BAD_PATH)?;
+    if is_drive_root(&path) {
+        return Err(DRIVE_ROOT.into());
+    }
+    if !below(&path, root) {
+        return Err(OUTSIDE_ROOT.into());
+    }
+    long_names(&path)?;
+    links_between(root, &path)?;
+    place_refusal(ctx, action, &path, is_dir)?;
+    if into && parent_of(&path).is_some_and(|p| ctx.guards.why_into(Path::new(p)).is_some()) {
+        return Err(PROTECTED.into());
+    }
+    Ok(())
 }
 
 /// Undoes one done step. When only part of it could be undone (some files

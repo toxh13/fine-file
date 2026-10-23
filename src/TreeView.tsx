@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, type Entry, type Listing } from "./api";
 import { RenameBox } from "./FileTable";
-import { formatDate, formatSize, isSameOrInside, pathKey } from "./format";
+import { formatDate, formatSize, isSameOrInside, pathKey, shown, sortItems } from "./format";
 import { watchPress } from "./shell";
 
 const ROW = 28;
@@ -10,9 +10,6 @@ const CAP = 200;
 const INDENT = 18;
 const COLUMNS = "minmax(260px, 3fr) minmax(150px, 1.4fr) 90px 140px";
 const FILES_KEY = "fine-file.tree-files";
-
-const cmp = new Intl.Collator("ko", { numeric: true }).compare;
-const bySize = (a: Entry, b: Entry) => b.size - a.size || cmp(a.name, b.name);
 
 /** A folder's children, sorted once when they arrive (big folders hold 100k entries). */
 interface Node {
@@ -27,7 +24,8 @@ interface Node {
 }
 
 function makeNode(path: string, l: Listing): Node {
-  const all = [...l.entries].sort(bySize);
+  // Biggest first, then by name: names are compared only where the sizes are equal.
+  const all = sortItems(l.entries, (e) => e.size, true);
   return { path, all, dirs: all.filter((e) => e.is_dir), sized: l.indexed, loaded: true, error: null };
 }
 
@@ -201,12 +199,12 @@ export function TreeView(p: Props) {
     // of the child it is in; a folder that went away takes what is cached below it along.
     const hit = (k: string) =>
       dirs === null || dirs.some((d) => isSameOrInside(d, k)) || gone.some((g) => isSameOrInside(k, g));
-    const shown = new Set<string>();
-    for (const r of rows) if (r.kind === "entry" && r.open) shown.add(r.key);
+    const onScreen = new Set<string>();
+    for (const r of rows) if (r.kind === "entry" && r.open) onScreen.add(r.key);
     const drop: string[] = [];
     for (const [key, node] of nodes) {
       if (!hit(pathKey(node.path))) continue;
-      if (shown.has(key)) load(node.path);
+      if (onScreen.has(key)) load(node.path);
       else {
         drop.push(key);
         reqs.current.set(key, (reqs.current.get(key) ?? 0) + 1);
@@ -341,10 +339,10 @@ export function TreeView(p: Props) {
   const total = p.listing?.current?.size ?? 0;
   const first = Math.max(0, Math.floor(scrollTop / ROW) - 8);
   const last = Math.min(rows.length, Math.ceil((scrollTop + height) / ROW) + 8);
-  const shown: number[] = [];
-  for (let i = first; i < last; i++) shown.push(i);
+  const drawn: number[] = [];
+  for (let i = first; i < last; i++) drawn.push(i);
   // The row being renamed stays mounted while scrolled away, so the typed name is not lost.
-  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) shown.push(renameAt);
+  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) drawn.push(renameAt);
 
   const emptyText = rootNode
     ? !showFiles && rootNode.all.length
@@ -383,7 +381,7 @@ export function TreeView(p: Props) {
       <div className="tbody" ref={scroller} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
         {rows.length === 0 && <div className="empty">{emptyText}</div>}
         <div style={{ height: rows.length * ROW, position: "relative" }}>
-          {shown.map((i) => {
+          {drawn.map((i) => {
             const r = rows[i];
             const style = { top: i * ROW, gridTemplateColumns: COLUMNS };
             const indent = { paddingLeft: r.depth * INDENT };
@@ -392,8 +390,8 @@ export function TreeView(p: Props) {
                 <div key={r.key} className="tr note" style={style}>
                   <div className={`td name ${r.kind === "note" && r.error ? "danger" : "muted"}`} style={indent}>
                     <span className="twisty" />
-                    <span className="label" title={r.text}>
-                      {r.text}
+                    <span className="label" title={shown(r.text)}>
+                      {shown(r.text)}
                     </span>
                   </div>
                 </div>
@@ -425,7 +423,7 @@ export function TreeView(p: Props) {
                   p.onContextMenu(ev, e);
                 }}
               >
-                <div className="td name" title={e.path} style={indent}>
+                <div className="td name" title={shown(e.path)} style={indent}>
                   <span
                     className="twisty"
                     // Opening and closing is not a double-click on the row (that enters the folder).
@@ -438,7 +436,7 @@ export function TreeView(p: Props) {
                   {renaming === e.path && p.onRenameDone ? (
                     <RenameBox entry={e} onDone={p.onRenameDone} />
                   ) : (
-                    <span className="label">{e.name}</span>
+                    <span className="label">{shown(e.name)}</span>
                   )}
                 </div>
                 <div className="td size right">

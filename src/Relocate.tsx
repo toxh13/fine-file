@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { opEvents, v04, type DriveInfo, type Entry, type JobInfo, type Relocation } from "./api";
 import { Dialog } from "./Duplicates";
-import { driveKey, formatDate, formatSize, normalizePath } from "./format";
+import { driveKey, formatDate, formatSize, normalizePath, shown } from "./format";
 import "./v04.css";
 
 const FOLDER_NAME = "fine-file 옮긴 폴더";
@@ -105,9 +105,9 @@ export function RelocateDialog({
         }}
       >
         <div className="reloc-source">
-          <b title={source.path}>{source.name}</b>
+          <b title={shown(source.path)}>{shown(source.name)}</b>
           <span className="muted">
-            {source.size > 0 ? formatSize(source.size) : "크기 모름"} · {source.path}
+            {source.size > 0 ? formatSize(source.size) : "크기 모름"} · {shown(source.path)}
           </span>
         </div>
 
@@ -123,7 +123,7 @@ export function RelocateDialog({
                   <input type="radio" name={group} checked={on} disabled={!ok} onChange={() => pickDrive(d)} />
                   <span className="reloc-drive-main">
                     <span className="drive-name">
-                      {d.label || "로컬 디스크"} ({d.letter})
+                      {d.label ? shown(d.label) : "로컬 디스크"} ({d.letter})
                     </span>
                     <span className="usage">
                       <span className={used > 0.9 ? "full" : undefined} style={{ width: `${(used * 100).toFixed(1)}%` }} />
@@ -146,7 +146,7 @@ export function RelocateDialog({
         </label>
         {dest && target && (
           <div className="reloc-final muted">
-            새 위치: {dest.endsWith("\\") ? `${dest}${source.name}` : `${dest}\\${source.name}`}
+            새 위치: {shown(dest.endsWith("\\") ? `${dest}${source.name}` : `${dest}\\${source.name}`)}
           </div>
         )}
 
@@ -161,7 +161,7 @@ export function RelocateDialog({
         </ul>
 
         {problem && <div className="v04-error">{problem}</div>}
-        {error && <div className="v04-error">{error}</div>}
+        {error && <div className="v04-error">{shown(error)}</div>}
         {started && <div className="v04-ok">옮기기를 시작했어요. 진행 상황은 작업 창에 보여요.</div>}
 
         <div className="actions">
@@ -276,8 +276,8 @@ export function Relocations({ onClose }: { onClose(): void }) {
         </button>
       </div>
       <div className="dlg-body">
-        {error && <div className="v04-error">{error}</div>}
-        {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{notice.text}</div>}
+        {error && <div className="v04-error">{shown(error)}</div>}
+        {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{shown(notice.text)}</div>}
         {list === null && !error && <p className="muted v04-intro">불러오는 중…</p>}
         {list?.length === 0 && (
           <p className="muted v04-intro">아직 옮긴 폴더가 없어요. 다른 드라이브로 옮긴 폴더가 여기에 남아요.</p>
@@ -289,8 +289,8 @@ export function Relocations({ onClose }: { onClose(): void }) {
               return (
                 <li key={r.id} className={`reloc-item ${r.state}`}>
                   <div className="reloc-top">
-                    <b className="reloc-name" title={r.original}>
-                      {baseName(r.original)}
+                    <b className="reloc-name" title={shown(r.original)}>
+                      {shown(baseName(r.original))}
                     </b>
                     <span className={`v04-tag ${r.state}`}>{STATE_LABEL[r.state]}</span>
                     <span className="muted">{formatSize(r.size)}</span>
@@ -300,9 +300,9 @@ export function Relocations({ onClose }: { onClose(): void }) {
                     </button>
                   </div>
                   <div className="reloc-paths">
-                    <span title={r.original}>{r.original}</span>
+                    <span title={shown(r.original)}>{shown(r.original)}</span>
                     <span className="reloc-arrow">→</span>
-                    <span title={r.target}>{r.target}</span>
+                    <span title={shown(r.target)}>{shown(r.target)}</span>
                   </div>
                   <div className="reloc-when muted">
                     {formatDate(r.created_at) ? `${formatDate(r.created_at)}에 옮김` : "옮긴 날짜 모름"}
@@ -328,10 +328,10 @@ export function Relocations({ onClose }: { onClose(): void }) {
         <Dialog title="원래 자리로 되돌릴까요?" onClose={() => setConfirm(null)} onBackdrop={() => setConfirm(null)}>
           <h3>원래 자리로 되돌릴까요?</h3>
           <p>
-            <b>{baseName(confirm.original)}</b> · {formatSize(confirm.size)}
+            <b>{shown(baseName(confirm.original))}</b> · {formatSize(confirm.size)}
           </p>
           <p className="muted">
-            {confirm.target}에 있는 폴더를 {confirm.original}(으)로 다시 옮기고, 남겨 둔 링크를 없애요. 원래 드라이브에 빈
+            {shown(confirm.target)}에 있는 폴더를 {shown(confirm.original)}(으)로 다시 옮기고, 남겨 둔 링크를 없애요. 원래 드라이브에 빈
             공간이 있어야 하고, 옮기는 동안에는 이 폴더를 쓰는 프로그램을 꺼 두세요.
           </p>
           <div className="actions">

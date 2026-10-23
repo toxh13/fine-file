@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from "react";
+import { shown } from "./format";
 import "./v071.css";
 
 // ---- AI answers as formatted text ------------------------------------------------------
@@ -8,10 +9,6 @@ import "./v071.css";
 // It builds React elements only (no HTML is ever parsed or injected), so a tag in an answer shows as
 // text. Links show their text and address as plain text: nothing in an answer can be clicked or loaded
 // (no images either). Paths and file names keep their characters (see LITERAL).
-
-// Bidi controls in AI text can make a name read as something else ("exe.txt" shown as "txt.exe"):
-// they are made visible, as everywhere else that shows untrusted names.
-const BIDI = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/g;
 
 /** ANSI colour and cursor codes a CLI may leave in its output. */
 const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-Z\\-_]/g;
@@ -38,7 +35,10 @@ const TEXT_FIELDS = ["answer", "text", "content", "result", "message", "explanat
  * and a fence wrapped around the whole answer (a JSON one holding the text is read for the text).
  */
 export function cleanAiText(raw: string): string {
-  let t = stripBare(raw.replace(/\r\n?/g, "\n").replace(ANSI, "")).replace(CONTROL, "").replace(BIDI, "\uFFFD");
+  // A byte order mark a CLI may put first goes. Marks that would make a name in it read as
+  // something else show (shown), as everywhere else.
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+  let t = shown(stripBare(raw.replace(/\r\n?/g, "\n").replace(ANSI, "")).replace(CONTROL, ""));
   const lines = t.split("\n");
   const kept: string[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -58,7 +58,7 @@ export function cleanAiText(raw: string): string {
     if (lang === "json" || plain) {
       const fromJson = /^[[{"]/.test(inner) ? jsonText(inner) : null;
       // Escapes in the JSON (\u202E) come out as the characters themselves: made visible again.
-      if (fromJson !== null) return fromJson.replace(/\r\n?/g, "\n").replace(CONTROL, "").replace(BIDI, "\uFFFD");
+      if (fromJson !== null) return shown(fromJson.replace(/\r\n?/g, "\n").replace(CONTROL, ""));
       // JSON that is not one text stays a code block: as paragraphs it would read worse.
       if (lang === "json" || /^[[{]/.test(inner)) return t;
     }
@@ -509,6 +509,6 @@ export function Markdown({ text, className }: { text: string; className?: string
  * app writes itself (a rule's reason): that is plain text, its paths and names shown as they are.
  */
 export function MarkdownInline({ text }: { text: string }) {
-  const t = stripBare(text.replace(ANSI, "")).replace(CONTROL, " ").replace(BIDI, "\uFFFD").replace(/\s*\n\s*/g, " ");
+  const t = shown(stripBare(text.replace(ANSI, "")).replace(CONTROL, " ")).replace(/\s*\n\s*/g, " ");
   return <>{inline(t, "i")}</>;
 }

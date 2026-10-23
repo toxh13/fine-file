@@ -8,7 +8,7 @@ import {
   type HierarchyRectangularNode,
 } from "d3-hierarchy";
 import { methodNote, v04, v05, type Category, type DiffInfo, type DiffNode, type MapNode } from "./api";
-import { driveKey, folderTitle, formatDate, formatSize, parentOf, pathKey } from "./format";
+import { driveKey, folderTitle, formatDate, formatSize, parentOf, pathKey, shown } from "./format";
 import "./v04.css";
 
 type Mode = "icicle" | "sunburst" | "treemap" | "mindmap";
@@ -121,7 +121,8 @@ function toItem(n: MapNode, root = false): Item {
   if (rest > 0) kids.push(restItem(n.path, rest, n.other_count));
   return {
     key: n.path,
-    name: (root ? "" : n.name) || folderTitle(n.path),
+    // Only shown (labels, the tooltip): marks that turn it around made visible.
+    name: shown((root ? "" : n.name) || folderTitle(n.path)),
     path: n.path,
     size: n.size,
     files: n.files,
@@ -929,11 +930,11 @@ export function MapView({
   return (
     <div className="map-view">
       <div className="map-head">
-        <button className="tool" disabled={!up} title={up ? `위로: ${up}` : undefined} onClick={() => up && onNavigate(up)}>
+        <button className="tool" disabled={!up} title={up ? `위로: ${shown(up)}` : undefined} onClick={() => up && onNavigate(up)}>
           ↑ 위로
         </button>
-        <div className="map-title" title={path}>
-          <b>{folderTitle(path)}</b>
+        <div className="map-title" title={shown(path)}>
+          <b>{shown(folderTitle(path))}</b>
           {tree && loaded?.path === path && (
             <span className="muted">
               {formatSize(total)} · 파일 {tree.files.toLocaleString()}개
@@ -982,7 +983,7 @@ export function MapView({
           {!comparedHere ? (
             <span className="muted">지난 스캔과 비교하는 중…</span>
           ) : comparedHere.error ? (
-            <span>{comparedHere.error}</span>
+            <span>{shown(comparedHere.error)}</span>
           ) : (
             comparedHere.root && (
               <>
@@ -1041,7 +1042,7 @@ export function MapView({
         {layout?.mode === "mindmap" && !message && (
           <div className="map-mind-help">끌어서 옮기고 휠로 확대·축소해요. ＋/− 를 누르면 가지를 펼치거나 접어요.</div>
         )}
-        {message && <div className={`map-message${loaded?.error ? " error" : ""}`}>{message}</div>}
+        {message && <div className={`map-message${loaded?.error ? " error" : ""}`}>{shown(message)}</div>}
         <div ref={tip} className="map-tip" hidden={!hovered}>
           {hovered && (
             <>
@@ -1087,7 +1088,7 @@ export function MapView({
                   <ul>
                     {removed.slice(0, 5).map((r) => (
                       <li key={r.path}>
-                        <span>{r.name}</span>
+                        <span>{shown(r.name)}</span>
                         <span className="muted">−{formatSize(r.prev_size)}</span>
                       </li>
                     ))}

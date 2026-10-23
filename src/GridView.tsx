@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ops, type Entry } from "./api";
 import { pressItem } from "./FileTable";
-import { formatSize } from "./format";
+import { formatSize, shown } from "./format";
 import { focusTakenByConflict } from "./Transfers";
 import "./components.css";
 
@@ -232,16 +232,16 @@ export function GridView(p: GridViewProps) {
   const lastSeen = Math.min(rows - 1, Math.floor((scrollTop + size.height - PAD) / TILE_H));
   const first = Math.max(0, firstSeen - OVERSCAN) * columns;
   const last = Math.min(p.entries.length, (lastSeen + 1 + OVERSCAN) * columns);
-  const shown: number[] = [];
-  for (let i = first; i < last; i++) shown.push(i);
+  const drawn: number[] = [];
+  for (let i = first; i < last; i++) drawn.push(i);
   // The tile being renamed stays mounted while scrolled away, so the typed name is not lost.
-  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) shown.push(renameAt);
+  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) drawn.push(renameAt);
 
   return (
     <div className="grid-view" ref={scroller} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
       {p.entries.length === 0 && <div className="empty">{p.emptyText}</div>}
       <div style={{ height: rows > 0 ? rows * TILE_H + PAD * 2 : 0, position: "relative" }}>
-        {shown.map((i) => {
+        {drawn.map((i) => {
           const row = Math.floor(i / columns);
           return (
             <Tile
@@ -281,7 +281,10 @@ function Tile({ index, e, x, y, visible, sel, focused, grid }: TileProps) {
     <div
       className={`tile ${sel ? "sel" : ""} ${focused ? "focus" : ""} ${e.hidden || e.system ? "dim" : ""}`}
       style={{ left: x, top: y, width: TILE_W - 4, height: TILE_H - 4 }}
-      title={e.path}
+      title={shown(e.path)}
+      // The path as it is (the tooltip has hidden marks made visible): Explorer's middle click
+      // finds the tile's entry by it.
+      data-tile-path={e.path}
       data-path={grid.dropFolders && e.is_dir ? e.path : undefined}
       onMouseDown={(ev) => {
         if (ev.button !== 0) return;
@@ -297,7 +300,7 @@ function Tile({ index, e, x, y, visible, sel, focused, grid }: TileProps) {
       {grid.renaming === e.path ? (
         <TileRename entry={e} onDone={grid.onRenameDone} />
       ) : (
-        <div className="tile-name">{e.name}</div>
+        <div className="tile-name">{shown(e.name)}</div>
       )}
       <div className="tile-size">{sizeText}</div>
     </div>
@@ -311,7 +314,7 @@ export function Glyph({ e }: { e: Entry }) {
   const ext = dot > 0 ? e.name.slice(dot + 1, dot + 5).toUpperCase() : "";
   return (
     <span className="glyph file">
-      <span className="glyph-ext">{ext}</span>
+      <span className="glyph-ext">{shown(ext)}</span>
     </span>
   );
 }

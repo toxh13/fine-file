@@ -3,7 +3,7 @@ import { desktopDir, documentDir, downloadDir, homeDir } from "@tauri-apps/api/p
 import { api, ops, places as placesApi, type PinnedPlace, type Place, type PlaceKind, type PlacesConfig } from "./api";
 import { Icon, MenuButton, MenuRow } from "./CommandBar";
 import { tip } from "./Explorer";
-import { folderTitle, normalizePath, pathKey } from "./format";
+import { folderTitle, normalizePath, pathKey, shown } from "./format";
 import { watchPress } from "./shell";
 import "./sidebar.css";
 
@@ -1228,8 +1228,8 @@ export function FavoritesSection({ places, path, onGo, onOpenTab, toast, onHelp 
             aria-label={it.missing ? `${it.label}, 폴더를 찾을 수 없어요` : it.label}
             title={
               it.missing
-                ? `${it.path}\n폴더를 찾을 수 없어요. 지워졌거나 옮겨졌을 수 있어요`
-                : `${it.path}\n가운데 클릭: 새 탭${pinned ? " · 끌거나 Alt+↑/↓로 순서 바꾸기" : ""}`
+                ? `${shown(it.path)}\n폴더를 찾을 수 없어요. 지워졌거나 옮겨졌을 수 있어요`
+                : `${shown(it.path)}\n가운데 클릭: 새 탭${pinned ? " · 끌거나 Alt+↑/↓로 순서 바꾸기" : ""}`
             }
             onClick={() => open(it)}
             onMouseDown={(ev) => {
@@ -1250,7 +1250,7 @@ export function FavoritesSection({ places, path, onGo, onOpenTab, toast, onHelp 
           >
             <FavIcon path={it.missing ? null : it.path} kind={it.kind} />
             <span className="fav-text">
-              <span className="fav-label">{it.label}</span>
+              <span className="fav-label">{shown(it.label)}</span>
               {it.missing && <span className="fav-note">폴더를 찾을 수 없어요</span>}
             </span>
             {pinned && !it.missing && (
@@ -1335,7 +1335,7 @@ export function FavoritesSection({ places, path, onGo, onOpenTab, toast, onHelp 
         {places.ready && !pins.length && "폴더를 여기로 끌어 놓거나, 폴더 메뉴의 \"즐겨찾기에 고정\"을 고르면 여기에 고정돼요"}
       </div>
       {places.offer && (
-        <div className="fav-offer" role="status" title={places.offer.join("\n")}>
+        <div className="fav-offer" role="status" title={shown(places.offer.join("\n"))}>
           <span>탐색기 즐겨찾기에 고정한 폴더 {places.offer.length}개를 여기로 가져올까요?</span>
           <span className="fav-offer-actions">
             <button type="button" className="primary" onClick={places.takeOffer} {...tip("importPins")}>

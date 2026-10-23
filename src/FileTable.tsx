@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { JEV_SHOW, riskConfidence, type Entry, type JudgeEngine, type Risk } from "./api";
-import { formatDate, formatSize, typeLabel } from "./format";
+import { formatDate, formatSize, shown, typeLabel } from "./format";
 import { watchPress } from "./shell";
 import { focusTakenByConflict } from "./Transfers";
 
@@ -158,10 +158,10 @@ export function FileTable(p: Props) {
   const template = p.columns.map((c) => c.width).join(" ");
   const first = Math.max(0, Math.floor(scrollTop / ROW) - 8);
   const last = Math.min(p.entries.length, Math.ceil((scrollTop + height) / ROW) + 8);
-  const shown: number[] = [];
-  for (let i = first; i < last; i++) shown.push(i);
+  const drawn: number[] = [];
+  for (let i = first; i < last; i++) drawn.push(i);
   // The row being renamed stays mounted while scrolled away, so the typed name is not lost.
-  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) shown.push(renameAt);
+  if (renameAt >= 0 && (renameAt < first || renameAt >= last)) drawn.push(renameAt);
 
   // What is in sight, for what is asked about the rows shown (the judge's 위험도).
   const onRange = p.onRange;
@@ -191,7 +191,7 @@ export function FileTable(p: Props) {
       <div className="tbody" ref={scroller} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
         {p.entries.length === 0 && <div className="empty">{p.emptyText}</div>}
         <div style={{ height: p.entries.length * ROW, position: "relative" }}>
-          {shown.map((i) => {
+          {drawn.map((i) => {
             const e = p.entries[i];
             const sel = p.selected.has(e.path);
             return (
@@ -251,14 +251,14 @@ function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, r
       const other = alias?.(e);
       const also = other && other.trim().toLowerCase() !== e.name.toLowerCase() ? other.trim() : null;
       return (
-        <div className="td name" title={also ? `${also}\n${e.path}` : e.path}>
+        <div className="td name" title={shown(also ? `${also}\n${e.path}` : e.path)}>
           <span className={`icon ${e.is_dir ? "dir" : "file"} ${e.reparse ? "link" : ""}`} />
           {renaming === e.path ? (
             <RenameBox entry={e} onDone={onRenameDone} />
           ) : (
             <>
-              <span className="label">{e.name}</span>
-              {also && <span className="alias">{also}</span>}
+              <span className="label">{shown(e.name)}</span>
+              {also && <span className="alias">{shown(also)}</span>}
             </>
           )}
         </div>
@@ -279,11 +279,11 @@ function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, r
     case "modified":
       return <div className="td muted">{formatDate(e.modified)}</div>;
     case "type":
-      return <div className="td muted">{typeLabel(e.name, e.is_dir)}</div>;
+      return <div className="td muted">{shown(typeLabel(e.name, e.is_dir))}</div>;
     case "location":
       return (
-        <div className="td muted" title={e.path}>
-          {e.path.slice(0, Math.max(0, e.path.length - e.name.length - 1))}
+        <div className="td muted" title={shown(e.path)}>
+          {shown(e.path.slice(0, Math.max(0, e.path.length - e.name.length - 1)))}
         </div>
       );
     case "change": {
@@ -326,7 +326,7 @@ function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, r
       // (The tiny bit keeps 0.29 from reading as 28.999…%.)
       const pct = Math.floor(Math.max(0, Math.min(1, s.score)) * 100 + 1e-9);
       return (
-        <div className="td score" title={`${s.label ? `${s.label}\n` : ""}일치도 ${pct}% (${s.by}${s.by === "jev" ? "가" : "이"} 본 값, 참고용)`}>
+        <div className="td score" title={`${s.label ? `${shown(s.label)}\n` : ""}일치도 ${pct}% (${s.by}${s.by === "jev" ? "가" : "이"} 본 값, 참고용)`}>
           <span className={`score-badge ${scoreTone(s.score)}`}>{pct}%</span>
         </div>
       );

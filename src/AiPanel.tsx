@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ai, plans, type AiPayloadPreview, type AiSettings as Settings, type KeyStatus } from "./api";
 import { tip } from "./Explorer";
-import { formatSize, pathKey } from "./format";
+import { formatSize, pathKey, shown } from "./format";
 import { Markdown } from "./markdown";
 import "./components.css";
 import "./v04.css";
@@ -386,7 +386,7 @@ export function HelperPane(p: HelperPaneProps) {
           <span className="helper-mark" aria-hidden="true">
             📍
           </span>
-          <b title={t.path}>{t.name}</b>
+          <b title={shown(t.path)}>{shown(t.name)}</b>
           {/* Not "고정" alone: that is the sidebar's 즐겨찾기 (즐겨찾기에 고정). */}
           <button
             type="button"
@@ -399,7 +399,7 @@ export function HelperPane(p: HelperPaneProps) {
             이 항목에 고정
           </button>
         </div>
-        <span className="muted helper-path">{t.path}</span>
+        <span className="muted helper-path">{shown(t.path)}</span>
         <span className="muted helper-follow">
           {p.pinned
             ? "이 항목에 고정했어요. 다른 곳으로 가도 이 항목을 봐요"
@@ -409,13 +409,13 @@ export function HelperPane(p: HelperPaneProps) {
 
       {other && (
         <div className="helper-busy" role="status">
-          ⟳ {other.name}
+          ⟳ {shown(other.name)}
           {isRule(other.id) ? "의 계획을 만드는 중…" : "에 대해 묻는 중…"}
           <span className="muted">
             {isRule(other.id)
               ? " 끝나면 여기서도 쓸 수 있어요. 만든 계획은 정리 계획 목록에 남아요."
               : other.id === "explain"
-                ? ` 끝나면 여기서도 물을 수 있어요. 그 답은 ${other.name}에 남아요.`
+                ? ` 끝나면 여기서도 물을 수 있어요. 그 답은 ${shown(other.name)}에 남아요.`
                 : " 끝나면 여기서도 물을 수 있어요. 받은 계획은 정리 계획 목록에 남아요."}
           </span>
         </div>
@@ -477,7 +477,7 @@ export function HelperPane(p: HelperPaneProps) {
         )}
         {m.error?.where === "ai" && (
           <div className="v04-error">
-            {m.error.text} {settingsLink}
+            {shown(m.error.text)} {settingsLink}
           </div>
         )}
         {m.preview && (
@@ -520,7 +520,7 @@ export function HelperPane(p: HelperPaneProps) {
               </button>
             ))}
           </div>
-          {m.error?.where === "rules" && <div className="v04-error">{m.error.text}</div>}
+          {m.error?.where === "rules" && <div className="v04-error">{shown(m.error.text)}</div>}
           {made("rules")}
         </section>
       )}
@@ -569,7 +569,7 @@ function SendBox(p: {
         {p.label} · 보낼 곳: <b>{PROVIDER_LABEL[payload.provider as Settings["provider"]] ?? payload.provider}</b> ·{" "}
         {formatSize(payload.bytes)}. 아래 내용이 그대로 가요. {contentsNote(payload.provider)}
       </p>
-      <pre className="v06-code ai-preview-text">{payload.text}</pre>
+      <pre className="v06-code ai-preview-text">{shown(payload.text)}</pre>
       <p className="v06-note">
         "보내기"를 누르면 보낼 내용을 다시 만들어 이것과 같을 때만 보내요. AI 설정에서 "보내기 전에 미리 보기"를 끄면 묻지 않고
         보내요.

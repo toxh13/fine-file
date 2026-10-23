@@ -17,7 +17,7 @@ import {
   type DupReport,
   type JobInfo,
 } from "./api";
-import { driveKey, formatDate, formatSize, normalizePath } from "./format";
+import { driveKey, formatDate, formatSize, normalizePath, shown } from "./format";
 import "./components.css";
 import "./v04.css";
 
@@ -264,8 +264,8 @@ function ownersText(paths: string[]): string {
     count.set(o, (count.get(o) ?? 0) + 1);
   }
   const names = [...count].sort((a, b) => b[1] - a[1]).map(([o]) => o);
-  const shown = names.slice(0, 3).join(", ");
-  return names.length > 3 ? `${shown} 외 ${(names.length - 3).toLocaleString()}곳` : shown;
+  const first = shown(names.slice(0, 3).join(", "));
+  return names.length > 3 ? `${first} 외 ${(names.length - 3).toLocaleString()}곳` : first;
 }
 
 /** Items of a job that went wrong; `errors` may hold only some of them (JobInfo.error_count). */
@@ -704,7 +704,7 @@ export function Duplicates({
     });
   };
 
-  const shown = groups.slice(0, limit);
+  const listed = groups.slice(0, limit);
 
   /** Files in a program's folder (inAppFolder). */
   const appFiles = useMemo(() => {
@@ -1025,8 +1025,8 @@ export function Duplicates({
         <span style={linkFrac === null ? undefined : { width: `${linkFrac * 100}%` }} />
       </div>
       {linkJob?.current && (
-        <div className="job-current" title={linkJob.current}>
-          {baseName(linkJob.current)}
+        <div className="job-current" title={shown(linkJob.current)}>
+          {shown(baseName(linkJob.current))}
         </div>
       )}
       <div className="muted">
@@ -1061,10 +1061,10 @@ export function Duplicates({
 
   const noticeBox = notice && (
     <div className={`dup-notice${notice.error ? " error" : ""}`}>
-      <div>{notice.text}</div>
+      <div>{shown(notice.text)}</div>
       {notice.failed?.map(([why, paths]) => (
         <div key={why} className="dup-notice-why">
-          {paths.length.toLocaleString()}개는 {notice.failVerb ?? "옮기지 못했어요"}: {why}
+          {paths.length.toLocaleString()}개는 {notice.failVerb ?? "옮기지 못했어요"}: {shown(why)}
         </div>
       ))}
       {notice.left && notice.left.length > 0 && (
@@ -1073,7 +1073,7 @@ export function Duplicates({
           있으니 직접 지워 주세요:
           <ul className="dup-notice-paths">
             {notice.left.slice(0, 5).map((p) => (
-              <li key={p}>{p}</li>
+              <li key={p}>{shown(p)}</li>
             ))}
             {notice.left.length > 5 && (
               <li className="muted">외 {(notice.left.length - 5).toLocaleString()}개 (작업 목록에 있어요)</li>
@@ -1134,7 +1134,7 @@ export function Duplicates({
       </form>
 
       <div className="dlg-body">
-        {error && <div className="v04-error">{error}</div>}
+        {error && <div className="v04-error">{shown(error)}</div>}
         {/* Before any results: a merge started before this opened, and how it ended. */}
         {!report && linkBox}
         {!report && noticeBox}
@@ -1229,7 +1229,7 @@ export function Duplicates({
             )}
             {autoNote && groups.length > 0 && <div className="dup-caveat">{autoNote}</div>}
 
-            {shown.map((g) => {
+            {listed.map((g) => {
               const anySel = g.files.some((f) => selected.has(f.path));
               return (
                 <section key={`${g.size}|${g.hash}`} className="dup-group">
@@ -1246,7 +1246,7 @@ export function Duplicates({
                     const lastOne = !on && g.files.every((x) => x.path === f.path || selected.has(x.path));
                     return (
                       <div key={f.path} className={`dup-file${on ? " sel" : ""}`}>
-                        <label className="dup-file-pick" title={lastOne ? "묶음마다 하나는 남겨요" : f.path}>
+                        <label className="dup-file-pick" title={lastOne ? "묶음마다 하나는 남겨요" : shown(f.path)}>
                           <input
                             type="checkbox"
                             checked={on}
@@ -1254,8 +1254,8 @@ export function Duplicates({
                             onChange={() => toggle(g, f.path)}
                           />
                           <span className="dup-file-name">
-                            <span className="dup-file-base">{baseName(f.path)}</span>
-                            <span className="dup-file-dir">{dirOf(f.path)}</span>
+                            <span className="dup-file-base">{shown(baseName(f.path))}</span>
+                            <span className="dup-file-dir">{shown(dirOf(f.path))}</span>
                           </span>
                         </label>
                         {appFiles.has(f.path) && (

@@ -484,19 +484,26 @@ pub fn other_instances() -> u32 {
 }
 
 fn known_folder(id: &GUID) -> Option<String> {
+    known_folder_path(id).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// A known folder's path (`FOLDERID_*`) as Windows has it for this account,
+/// when it has one: never from an environment variable, which whoever starts
+/// the process sets.
+pub(crate) fn known_folder_path(id: &GUID) -> Option<PathBuf> {
     unsafe {
         let mut p: PWSTR = null_mut();
         let hr = SHGetKnownFolderPath(id, 0, null_mut(), &mut p);
         let result = if hr >= 0 && !p.is_null() {
             let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-            Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)))
+            Some(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(p, len))))
         } else {
             None
         };
         if !p.is_null() {
             CoTaskMemFree(p.cast());
         }
-        result.filter(|s| !s.is_empty())
+        result.filter(|p| !p.as_os_str().is_empty())
     }
 }
 

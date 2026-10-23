@@ -44,11 +44,25 @@ import { HELP_TIPS } from "./Help";
 import { MapView } from "./MapView";
 import { PlansInbox, PlanView } from "./PlanView";
 import { Preview } from "./Preview";
-import { Programs, shown } from "./Programs";
+import { Programs } from "./Programs";
 import { RelocateDialog, Relocations } from "./Relocate";
 import { dragOut, dragRefusal, screenPoint } from "./shell";
 import { TreeView, type TreeRefresh } from "./TreeView";
-import { driveKey, folderTitle, formatDate, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, typeLabel } from "./format";
+import {
+  driveKey,
+  folderTitle,
+  formatDate,
+  formatSize,
+  isSameOrInside,
+  normalizePath,
+  parentOf,
+  pathKey,
+  shown,
+  sortItems,
+  typeLabel,
+  type NameOrder,
+  type SortBy,
+} from "./format";
 import "./v09.css";
 
 export type View = "list" | "tree" | "grid" | "map";
@@ -331,17 +345,15 @@ function sameListing(a: string, b: string) {
   return a.replace(/\\$/, "").toLowerCase() === b.replace(/\\$/, "").toLowerCase();
 }
 
-// One collator for every sort: localeCompare with an options object builds a new one per call.
-const cmp = new Intl.Collator("ko", { numeric: true }).compare;
-
+// What a column sorts its rows by (sortItems makes it once per row, then compares numbers).
 // "변화" sorts by the comparison and "일치도" by jev's scores, which only the tab has.
-const SORTERS: Record<Exclude<SortKey, "change" | "score">, (a: Entry, b: Entry) => number> = {
-  name: (a, b) => cmp(a.name, b.name),
-  size: (a, b) => a.size - b.size,
-  files: (a, b) => a.files - b.files,
-  modified: (a, b) => a.modified - b.modified,
-  type: (a, b) => cmp(typeLabel(a.name, a.is_dir), typeLabel(b.name, b.is_dir)),
-  location: (a, b) => cmp(a.path, b.path),
+const SORT_BY: Record<Exclude<SortKey, "change" | "score">, SortBy<Entry>> = {
+  name: "name",
+  size: (e) => e.size,
+  files: (e) => e.files,
+  modified: (e) => e.modified,
+  type: { text: (e) => typeLabel(e.name, e.is_dir) },
+  location: { text: (e) => e.path },
 };
 
 /**
@@ -1326,39 +1338,29 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   // Sorting by the change needs the column, and by 일치도 an AI 검색's results; without them the
   // list goes by size.
   const sortKey = (sort.key === "change" && !diffWanted) || (sort.key === "score" && !jevRes) ? "size" : sort.key;
-  const changeSort = useMemo(
-    () =>
-      sortKey !== "change"
-        ? null
-        : changes
-          ? (a: Entry, b: Entry) => {
-              const da = changes.find(a);
-              const db = changes.find(b);
-              return (da ? a.size - da.prev_size : 0) - (db ? b.size - db.prev_size : 0);
-            }
-          : // While the comparison loads.
-            SORTERS.size,
-    [sortKey, changes],
-  );
-  const scoreSort = useMemo(
-    () =>
-      jevRes
-        ? (a: Entry, b: Entry) => (jevRes.hits.get(a.path)?.score ?? 0) - (jevRes.hits.get(b.path)?.score ?? 0)
-        : SORTERS.size,
-    [jevRes],
-  );
+  const sortBy = useMemo((): SortBy<Entry> => {
+    if (sortKey === "change") {
+      // While the comparison loads, by size.
+      if (!changes) return SORT_BY.size;
+      return (e) => {
+        const d = changes.find(e);
+        return d ? e.size - d.prev_size : 0;
+      };
+    }
+    if (sortKey === "score") return jevRes ? (e) => jevRes.hits.get(e.path)?.score ?? 0 : SORT_BY.size;
+    return SORT_BY[sortKey];
+  }, [sortKey, changes, jevRes]);
+  // The names in collation order, for the next sort of the same names (the other way, another
+  // column, a live reload): it compares numbers then.
+  const nameOrder = useRef<NameOrder>({ ranks: null });
   const rows = useMemo(() => {
     let list = shownRes ? shownRes.items : (fresh?.entries ?? adminEntries ?? []);
     // An AI 검색 shows the hits scored under JEV_SHOW only when asked to ("40% 미만도 보기").
     if (jevRes && !jevLow) list = list.filter((e) => (jevRes.hits.get(e.path)?.score ?? 0) >= JEV_SHOW);
-    const dir = sort.desc ? -1 : 1;
-    const by = sortKey === "change" ? changeSort! : sortKey === "score" ? scoreSort : SORTERS[sortKey];
-    return [...list].sort((a, b) => {
-      // Folders first in name/type order, like Explorer.
-      if ((sortKey === "name" || sortKey === "type") && a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-      return by(a, b) * dir || cmp(a.name, b.name);
-    });
-  }, [shownRes, fresh, adminEntries, sort.desc, sortKey, changeSort, jevRes, jevLow, scoreSort]);
+    // Folders first in name/type order, like Explorer.
+    const first = sortKey === "name" || sortKey === "type" ? (e: Entry) => e.is_dir : undefined;
+    return sortItems(list, sortBy, sort.desc, { first, names: nameOrder.current });
+  }, [shownRes, fresh, adminEntries, sort.desc, sortKey, sortBy, jevRes, jevLow]);
   // Hits an AI 검색 shows at first, and those it keeps back.
   const jevMatched = jevRes ? jevRes.found.items.filter((h) => h.score >= JEV_SHOW).length : 0;
   const jevHidden = jevRes ? jevRes.found.items.length - jevMatched : 0;
@@ -2908,7 +2910,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                 spellCheck={false}
               />
             ) : (
-              <div ref={crumbsBox} className="crumbs" title={path} onClick={() => setEditingAddress(true)}>
+              <div ref={crumbsBox} className="crumbs" title={shown(path)} onClick={() => setEditingAddress(true)}>
                 {crumbs.map((c, i) => (
                   <span key={i} className="crumb-wrap">
                     {i > 0 && <span className="sep">›</span>}
@@ -2920,7 +2922,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                         navigate(crumbs.slice(0, i + 1).join("\\") + (i === 0 ? "\\" : ""));
                       }}
                     >
-                      {c}
+                      {shown(c)}
                     </button>
                   </span>
                 ))}
@@ -3120,7 +3122,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         <div className="banner error">
           <span className="grow">
             이 폴더는 지금 권한으로 열 수 없어요. 관리자 권한으로 안의 항목을 볼 수 있어요 (읽기 전용).
-            <span className="banner-detail">{loadError}</span>
+            <span className="banner-detail">{shown(loadError)}</span>
           </span>
           <button disabled={adminAsking} onClick={() => readAsAdmin(path, true)} {...tip("admin")}>
             {adminAsking ? "권한을 받는 중…" : "관리자 권한으로 보기"}
@@ -3156,10 +3158,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
             <span className="grow">
               이 폴더는 지금 권한으로 열 수 없어요. 관리자 권한으로 보기는 이 컴퓨터의 드라이브에서만 할 수 있어요
               (네트워크 위치는 안 돼요).
-              <span className="banner-detail">{loadError}</span>
+              <span className="banner-detail">{shown(loadError)}</span>
             </span>
           ) : (
-            loadError
+            shown(loadError)
           )}
         </div>
       )}
@@ -3169,7 +3171,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           {!compared ? (
             <span className="muted">지난 스캔과 비교하는 중…</span>
           ) : compared.error || !changes ? (
-            <span>{compared.error}</span>
+            <span>{compared.error && shown(compared.error)}</span>
           ) : (
             <DiffSummary
               root={changes.root}
@@ -3263,8 +3265,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           }}
           onMouseDown={(ev) => {
             if (ev.button !== 1 || !gridShown) return;
-            // GridView has no middle click of its own; a tile's tooltip is its path.
-            const at = (ev.target as HTMLElement).closest(".tile")?.getAttribute("title");
+            // GridView has no middle click of its own; a tile carries its path in data-tile-path
+            // (not the tooltip: that one shows hidden marks as "�").
+            const at = (ev.target as HTMLElement).closest(".tile")?.getAttribute("data-tile-path");
             const e = at ? rows.find((r) => r.path === at) : undefined;
             if (e?.is_dir) {
               ev.preventDefault();
@@ -3634,7 +3637,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>휴지통으로 옮길까요?</h3>
             <p>
-              {confirmTrash.length === 1 ? confirmTrash[0].name : `${confirmTrash.length.toLocaleString()}개 항목`} ·{" "}
+              {confirmTrash.length === 1 ? shown(confirmTrash[0].name) : `${confirmTrash.length.toLocaleString()}개 항목`} ·{" "}
               {formatSize(confirmTrash.reduce((s, e) => s + e.size, 0))}
             </p>
             <p className="muted">
@@ -3716,7 +3719,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
             <b>{PROVIDER_NAME[dialog.payload.provider as AiConfig["provider"]] ?? dialog.payload.provider}</b> ·{" "}
             {formatSize(dialog.payload.bytes)}. 아래 내용이 그대로 가요. {contentsNote(dialog.payload.provider)}
           </p>
-          <pre className="v06-code ai-preview-text">{dialog.payload.text}</pre>
+          <pre className="v06-code ai-preview-text">{shown(dialog.payload.text)}</pre>
           <p className="v06-note">
             "보내기"를 누르면 보낼 내용을 다시 만들어 이것과 같을 때만 보내요. 받은 계획은 바로 실행하지 않아요. 계획 창에서 단계를
             확인하고 실행해야 바뀌어요. AI 설정에서 "보내기 전에 미리 보기"를 끄면 묻지 않고 보내요.
@@ -3753,7 +3756,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               <h3>위험도를 볼까요?</h3>
               <p>
                 켜 두는 동안 이 탭의 목록에 보이는 항목(한 번에 {RISK_BATCH.ollama}개까지)의 경로, 이름, 종류, 크기, 날짜, 분류를
-                Ollama 주소 <b>{dialog.url}</b>로 보내 로컬 모델의 위험도를 받아요. 다른 폴더로 가면 그 폴더에서 보이는 항목도 보내요.
+                Ollama 주소 <b>{shown(dialog.url)}</b>로 보내 로컬 모델의 위험도를 받아요. 다른 폴더로 가면 그 폴더에서 보이는 항목도 보내요.
               </p>
               <div className="v06-warn">이 주소는 이 컴퓨터가 아니에요. 보낸 정보는 그 컴퓨터로 가요.</div>
               <p className="muted">
@@ -3807,7 +3810,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           ) : (
             <>
               <p>
-                AI 검색에서 Enter를 누를 때마다 찾는 말과 후보 항목을 Ollama 주소 <b>{dialog.url}</b>로 보내 로컬 모델에게 한
+                AI 검색에서 Enter를 누를 때마다 찾는 말과 후보 항목을 Ollama 주소 <b>{shown(dialog.url)}</b>로 보내 로컬 모델에게 한
                 항목씩 물어요. 파일은 최대 {LOCAL_FILE_MAX}개의 경로와 수정한 날짜를(오늘 날짜와 함께), 게임·프로그램은 최대{" "}
                 {LOCAL_APP_MAX}개의 이름과 설치 폴더를 보내요. 글자를 치는 동안에는 보내지 않아요.
               </p>
@@ -4040,7 +4043,7 @@ function JevSummary(p: {
   const app = f.target === "app";
   const engine = engineOf(f);
   const out = jevLeftOut(f);
-  const where = p.res.scope === null ? "모든 드라이브에서" : `"${folderTitle(p.res.scope)}" 폴더에서`;
+  const where = p.res.scope === null ? "모든 드라이브에서" : `"${shown(folderTitle(p.res.scope))}" 폴더에서`;
   return (
     <>
       <b>AI 검색</b>
@@ -4051,8 +4054,8 @@ function JevSummary(p: {
       >
         {JUDGE_NAME[engine]}
       </span>
-      <span className="jev-query" title={p.res.query}>
-        “{p.res.query}”
+      <span className="jev-query" title={shown(p.res.query)}>
+        “{shown(p.res.query)}”
       </span>
       {/* Stopped early: what was judged before is all there is (Enter asks the rest; the answers
           so far come from the cache). */}
@@ -4068,7 +4071,7 @@ function JevSummary(p: {
           {app
             ? "설치된 게임·프로그램 중에서 골랐어요"
             : f.terms.length
-              ? `이름과 폴더 이름에 든 낱말로 후보를 모았어요: ${f.terms.join(", ")}`
+              ? `이름과 폴더 이름에 든 낱말로 후보를 모았어요: ${shown(f.terms.join(", "))}`
               : "종류와 기간으로 후보를 모았어요"}
         </span>
       )}
@@ -4096,7 +4099,7 @@ function JevSummary(p: {
         <span className="muted">Enter를 누르면 지금 쓴 말로 새로 찾아요</span>
       ) : (
         p.moved && (
-          <span className="diff-method" title={p.res.scope ?? undefined}>
+          <span className="diff-method" title={p.res.scope === null ? undefined : shown(p.res.scope)}>
             범위가 바뀌었어요. 이 결과는 {where} 찾았어요. Enter를 누르면 새로 찾아요
           </span>
         )
@@ -4191,7 +4194,7 @@ function UninstallAsk(p: { prog: ProgramRef; path: string; onClose: () => void; 
       <p className="muted">
         {facts.join(" · ")}
         <br />
-        <span className="uninstall-path" title={p.path}>
+        <span className="uninstall-path" title={shown(p.path)}>
           {shown(p.path)}
         </span>
       </p>
@@ -4243,8 +4246,8 @@ function DiffSummary(p: { root: DiffNode; size: number; info: DiffInfo | null; r
   const delta = p.size - p.root.prev_size;
   const pct = percentText(delta, p.root.prev_size);
   const gone = p.removed.reduce((s, c) => s + c.prev_size, 0);
-  const shown = p.removed.slice(0, 10).map((c) => c.name);
-  const names = shown.join(", ") + (p.removed.length > shown.length ? ` 외 ${p.removed.length - shown.length}개` : "");
+  const listed = p.removed.slice(0, 10).map((c) => c.name);
+  const names = shown(listed.join(", ")) + (p.removed.length > listed.length ? ` 외 ${p.removed.length - listed.length}개` : "");
   const here =
     p.root.status === "new"
       ? "지난 스캔 뒤에 생겼어요"

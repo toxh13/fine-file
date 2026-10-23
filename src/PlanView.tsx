@@ -18,7 +18,7 @@ import {
   type Risk,
 } from "./api";
 import { Dialog } from "./Duplicates";
-import { driveKey, folderTitle, formatDate, formatSize, parentOf } from "./format";
+import { driveKey, folderTitle, formatDate, formatSize, parentOf, shown } from "./format";
 import { Markdown, MarkdownInline } from "./markdown";
 import "./components.css";
 import "./v04.css";
@@ -134,11 +134,6 @@ function errText(err: unknown): string {
     return String(err);
   }
 }
-
-// Bidi controls in a name can make it read as something else ("exe.txt" shown as "txt.exe"). Names,
-// reasons and summaries from AI or MCP are untrusted: they show as text, with such marks made visible.
-const BIDI = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/g;
-const shown = (s: string) => s.replace(BIDI, "\uFFFD");
 
 function baseName(p: string): string {
   const t = p.replace(/[\\/]+$/, "");
@@ -296,7 +291,7 @@ function NameRef({ s, name, onNavigate }: { s: PlanStep; name: string; onNavigat
   return (
     <>
       &lsquo;
-      <button className="plan-name" title={`${s.from}\n이 항목이 있는 폴더로 가기`} onClick={() => onNavigate(stepFolder(s))}>
+      <button className="plan-name" title={`${shown(s.from)}\n이 항목이 있는 폴더로 가기`} onClick={() => onNavigate(stepFolder(s))}>
         {shown(name)}
       </button>
       &rsquo;
@@ -384,9 +379,9 @@ function StepSentence({ s, root, onNavigate }: { s: PlanStep; root: string; onNa
 
 /** The full paths of a step, for its tooltip. */
 function pathsTip(s: PlanStep): string {
-  if (s.action === "mkdir") return `새로 만들 폴더: ${s.from}`;
-  if (s.action === "trash") return `${s.from}\n→ 휴지통`;
-  return s.to ? `${s.from}\n→ ${s.to}` : s.from;
+  if (s.action === "mkdir") return `새로 만들 폴더: ${shown(s.from)}`;
+  if (s.action === "trash") return `${shown(s.from)}\n→ 휴지통`;
+  return shown(s.to ? `${s.from}\n→ ${s.to}` : s.from);
 }
 
 interface StepGroup {
@@ -643,7 +638,7 @@ function TreeRows({ n, side }: { n: TreeNode; side: "before" | "after" }) {
     <ul className="plan-tree">
       {kids.map((k) => (
         <li key={k.name.toLowerCase()} className={k.mark ? `mk-${k.mark}` : k.change && side === "before" ? "chg" : undefined}>
-          <div className="plan-tree-row" title={k.note ? `${k.name}\n${k.note}` : k.change && side === "before" ? CHANGE_LABEL[k.change] : k.name}>
+          <div className="plan-tree-row" title={k.note ? shown(`${k.name}\n${k.note}`) : k.change && side === "before" ? CHANGE_LABEL[k.change] : shown(k.name)}>
             <span className={`icon ${isDir(k) ? "dir" : "file"}`} aria-hidden="true" />
             <span className="plan-tree-name">{shown(k.name)}</span>
             {side === "after" && k.mark && <span className={`plan-mark mk-${k.mark}`}>{MARK_LABEL[k.mark]}</span>}
@@ -665,7 +660,7 @@ function BeforeAfter({ plan }: { plan: Plan }) {
         <section className="plan-ba-col">
           <h5>정리 전</h5>
           <div className="plan-ba-tree">
-            <div className="plan-tree-row plan-tree-top" title={plan.root}>
+            <div className="plan-tree-row plan-tree-top" title={shown(plan.root)}>
               <span className="icon dir" aria-hidden="true" />
               <span className="plan-tree-name">{shown(before.name)}</span>
             </div>
@@ -675,7 +670,7 @@ function BeforeAfter({ plan }: { plan: Plan }) {
         <section className="plan-ba-col">
           <h5>정리 후</h5>
           <div className="plan-ba-tree">
-            <div className="plan-tree-row plan-tree-top" title={plan.root}>
+            <div className="plan-tree-row plan-tree-top" title={shown(plan.root)}>
               <span className="icon dir" aria-hidden="true" />
               <span className="plan-tree-name">{shown(after.name)}</span>
             </div>
@@ -1199,9 +1194,9 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
   const [aiSummary, appSummary] = !plan ? ["", ""] : fromAi ? splitSummary(plan.summary).map((x) => x.trim()) : ["", plan.summary.trim()];
 
   return (
-    <Dialog className="v04-dialog plan-view" title={plan ? `정리 계획: ${plan.title}` : "정리 계획"} onClose={onClose}>
+    <Dialog className="v04-dialog plan-view" title={plan ? `정리 계획: ${shown(plan.title)}` : "정리 계획"} onClose={onClose}>
       <div className="dlg-head">
-        <h3 title={plan?.title}>{plan ? shown(plan.title || KIND_LABEL[plan.kind] || "정리 계획") : "정리 계획"}</h3>
+        <h3 title={plan ? shown(plan.title) : undefined}>{plan ? shown(plan.title || KIND_LABEL[plan.kind] || "정리 계획") : "정리 계획"}</h3>
         {plan && <SourceTag source={plan.source} />}
         {plan && <StateTag state={progress?.state === "running" ? "running" : plan.state} />}
         <button className="dlg-close" aria-label="닫기" onClick={onClose}>
@@ -1214,7 +1209,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
           <span>{KIND_LABEL[plan.kind] ?? plan.kind}</span>
           {formatDate(plan.created_at) && <span>· {formatDate(plan.created_at)}에 만듦</span>}
           <span>·</span>
-          <button className="plan-root" title={`${plan.root}\n이 폴더로 가기`} onClick={() => onNavigate(plan.root)}>
+          <button className="plan-root" title={`${shown(plan.root)}\n이 폴더로 가기`} onClick={() => onNavigate(plan.root)}>
             {shown(plan.root)}
           </button>
         </div>
@@ -1257,7 +1252,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
       )}
 
       <div className="dlg-body">
-        {loadError && <div className="v04-error">계획을 불러오지 못했어요: {loadError}</div>}
+        {loadError && <div className="v04-error">계획을 불러오지 못했어요: {shown(loadError)}</div>}
         {!plan && !loadError && <p className="muted v04-intro">불러오는 중…</p>}
         {plan && (
           <>
@@ -1278,7 +1273,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
                 폴더의 항목은 실행하지 않아요.
               </div>
             )}
-            {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{notice.text}</div>}
+            {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{shown(notice.text)}</div>}
             {ended && !notice && <div className={ended.error ? "v04-error" : "v04-ok"}>{ended.text}</div>}
 
             {running && (
@@ -1296,7 +1291,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
                   {progress && progress.total > 0 ? `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()} 단계` : "시작하는 중…"}
                 </div>
                 {progress?.current && (
-                  <div className="job-current" title={progress.current}>
+                  <div className="job-current" title={shown(progress.current)}>
                     {shown(progress.current)}
                   </div>
                 )}
@@ -1416,7 +1411,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
                                 edit((x) => (ids.has(x.id) ? on : null));
                               }}
                             />
-                            <button className="plan-group-toggle" aria-expanded={!shut} title={g.folder} onClick={() => toggleGroup(g.key)}>
+                            <button className="plan-group-toggle" aria-expanded={!shut} title={shown(g.folder)} onClick={() => toggleGroup(g.key)}>
                               <span className="plan-chev" aria-hidden="true">
                                 {shut ? "▸" : "▾"}
                               </span>
@@ -1453,13 +1448,13 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
                                         <StepSentence s={s} root={plan.root} onNavigate={onNavigate} />
                                       </div>
                                       {s.reason && (
-                                        <div className="plan-reason" title={s.reason}>
+                                        <div className="plan-reason" title={shown(s.reason)}>
                                           {/* A rule's reason names paths as they are (which copy stays): no marks read in it. */}
                                           {fromAi ? <MarkdownInline text={s.reason} /> : shown(s.reason)}
                                         </div>
                                       )}
                                       {s.error && (
-                                        <div className="plan-err" title={s.error}>
+                                        <div className="plan-err" title={shown(s.error)}>
                                           {shown(s.error)}
                                         </div>
                                       )}
@@ -1554,7 +1549,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
         )}
         <span className="spacer" />
         {saveText && (
-          <span className={`plan-save ${save.state}`} title={save.text}>
+          <span className={`plan-save ${save.state}`} title={save.text && shown(save.text)}>
             {saveText}
           </span>
         )}
@@ -1759,7 +1754,7 @@ export function PlansInbox({ onOpen, onClose }: { onOpen(id: string): void; onCl
         </button>
       </div>
       <div className="dlg-body">
-        {error && <div className="v04-error">계획 목록을 읽지 못했어요: {error}</div>}
+        {error && <div className="v04-error">계획 목록을 읽지 못했어요: {shown(error)}</div>}
         {list === null && !error && <p className="muted v04-intro">불러오는 중…</p>}
         {list?.length === 0 && (
           <p className="muted v04-intro">
@@ -1793,7 +1788,7 @@ export function PlansInbox({ onOpen, onClose }: { onOpen(id: string): void; onCl
                       {p.state === "draft" ? ` · 고른 ${sel.length.toLocaleString()}개 · ${formatSize(sumSize(sel))}` : ""}
                       {formatDate(p.created_at) ? ` · ${formatDate(p.created_at)}` : ""}
                     </span>
-                    <span className="inbox-root muted" title={p.root}>
+                    <span className="inbox-root muted" title={shown(p.root)}>
                       {shown(p.root)}
                     </span>
                   </button>

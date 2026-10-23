@@ -1591,10 +1591,30 @@ pub fn run_scan_helper(args: &[String]) -> i32 {
     scan::run_helper(args)
 }
 
+/// Keeps the window on the app's own pages (`own_page`): any other place it
+/// is sent to (a link in a previewed PDF that targets the whole window,
+/// script that got in somehow) is turned down, so no page from elsewhere can
+/// stand in for the app's screens. Frames are the CSP's (`frame-src`).
+fn navigation_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("navigation-guard").on_navigation(|_, url| own_page(url)).build()
+}
+
+/// Whether `url` is on the app's own origin: the built app's
+/// (`http://tauri.localhost` on Windows, `tauri://localhost` elsewhere) or,
+/// when the app runs from the dev server (`tauri::is_dev`: built without
+/// `custom-protocol`, which `tauri build` turns on whatever the profile), the
+/// dev server's (`build.devUrl` in tauri.conf.json).
+fn own_page(url: &tauri::Url) -> bool {
+    let origin = (url.scheme(), url.host_str(), url.port());
+    matches!(origin, ("http", Some("tauri.localhost"), None) | ("tauri", Some("localhost"), None))
+        || (tauri::is_dev() && origin == ("http", Some("localhost"), Some(1420)))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(navigation_guard())
         .plugin(tauri_plugin_drag::init())
         // Updates (v0.8): plugins.updater in tauri.conf.json; checked and installed from Updater.tsx.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1611,7 +1631,9 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::Builder::new().name("auto sync".into()).spawn(move || auto_sync(handle))?;
             // A relocation or undo cut short by a crash or a power cut is put right (ops.rs).
-            std::thread::Builder::new().name("relocation recovery".into()).spawn(ops::recover_relocations)?;
+            // Not while the app runs elevated: then a job that fails says it waits for a normal start.
+            let handle = app.handle().clone();
+            std::thread::Builder::new().name("relocation recovery".into()).spawn(move || ops::recover_relocations(handle))?;
             // So is a merge of duplicates into hard links; what it did shows as a job.
             let handle = app.handle().clone();
             std::thread::Builder::new().name("link recovery".into()).spawn(move || ops::recover_links(handle))?;
@@ -1774,6 +1796,79 @@ mod tests {
         assert_eq!(updater.windows.unwrap().install_mode.to_string(), "passive");
         let key = base64::engine::general_purpose::STANDARD.decode(updater.pubkey.trim()).unwrap();
         assert!(String::from_utf8(key).unwrap().starts_with("untrusted comment: minisign public key: 8453D46DA3F3AACE\n"));
+    }
+
+    /// The directives of a policy, each with its sources.
+    fn directives(policy: &str) -> HashMap<String, Vec<String>> {
+        policy
+            .split(';')
+            .filter_map(|d| {
+                let mut words = d.split_whitespace().map(str::to_string);
+                Some((words.next()?, words.collect()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_window_loads_only_the_apps_own_code_and_frames_only_previews() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &conf["app"]["security"];
+        let csp = directives(security["csp"].as_str().expect("a CSP for the built app"));
+        let only = |name: &str, want: &[&str]| {
+            let mut got = csp.get(name).unwrap_or_else(|| panic!("no {name}")).clone();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{name}");
+        };
+        // Scripts only from the app itself: no inline script, no eval, nothing from elsewhere.
+        only("default-src", &["'self'"]);
+        only("script-src", &["'self'"]);
+        only("object-src", &["'none'"]);
+        only("base-uri", &["'none'"]);
+        only("form-action", &["'none'"]);
+        only("frame-ancestors", &["'none'"]);
+        // The PDF preview is the only frame, and it never goes anywhere but a file of the asset protocol.
+        only("frame-src", &["asset:", "http://asset.localhost"]);
+        // Thumbnails and shell icons are data: URLs; previews come through the asset protocol.
+        only("img-src", &["'self'", "asset:", "http://asset.localhost", "data:", "blob:"]);
+        only("media-src", &["'self'", "asset:", "http://asset.localhost", "blob:"]);
+        // Commands and events: Tauri's IPC. AI and updates go out from Rust, not from the page.
+        only("connect-src", &["'self'", "ipc:", "http://ipc.localhost"]);
+        only("style-src", &["'self'", "'unsafe-inline'"]);
+        only("font-src", &["'self'", "data:"]);
+        assert!(csp.values().flatten().all(|s| !s.contains("unsafe-eval") && !s.starts_with("https:") && s != "*"));
+        // In development the dev server's own inline script and hot reload work; nothing else opens up.
+        let dev = directives(security["devCsp"].as_str().expect("a dev policy"));
+        assert_eq!(dev["frame-src"], csp["frame-src"]);
+        assert_eq!(dev["object-src"], csp["object-src"]);
+        assert!(dev["connect-src"].iter().all(|s| csp["connect-src"].contains(s) || s == "ws://localhost:1420"));
+    }
+
+    #[test]
+    fn the_window_stays_on_the_apps_own_pages() {
+        let page = |url: &str| own_page(&tauri::Url::parse(url).unwrap());
+        assert!(page("http://tauri.localhost/"));
+        assert!(page("http://tauri.localhost/index.html#x"));
+        assert!(page("tauri://localhost/"));
+        // The dev server, when the app runs from it (tests do: `cargo test` never turns on custom-protocol).
+        assert!(page("http://localhost:1420/"));
+        for elsewhere in [
+            "https://tauri.localhost/",
+            "http://tauri.localhost:8080/",
+            "http://tauri.localhost.example.com/",
+            "http://asset.localhost/C%3A%5Cx.pdf",
+            "http://ipc.localhost/",
+            "http://localhost:1421/",
+            "http://localhost/",
+            "https://example.com/",
+            "file:///C:/Windows/win.ini",
+            "about:blank",
+            "javascript:alert(1)",
+            "data:text/html,<p>x</p>",
+        ] {
+            assert!(!page(elsewhere), "{elsewhere}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { v04, v07, type Leftover, type Plan, type Program } from "./api";
 import { ensureAdmin } from "./AdminSession";
 import { Dialog } from "./Duplicates";
-import { filetimeToDate, formatSize, parentOf } from "./format";
+import { filetimeToDate, formatSize, parentOf, shown } from "./format";
 import "./components.css";
 import "./v04.css";
 import "./v06.css";
@@ -83,12 +83,6 @@ function errText(err: unknown): string {
     return String(err);
   }
 }
-
-// Names come from the registry and the disk, which any program can write: direction marks in them
-// are made visible, so a name cannot read as something else.
-const BIDI = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
-/** A name as shown: the marks that turn text around are replaced (Explorer's uninstall question too). */
-export const shown = (s: string) => s.replace(BIDI, "\ufffd");
 
 function baseName(p: string): string {
   const t = p.replace(/[\\/]+$/, "");
@@ -526,7 +520,7 @@ export function Programs({
               </span>
             </div>
             {prefetchNote && <div className={prefetchNote.error ? "v04-error" : "v04-ok"}>{prefetchNote.text}</div>}
-            {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{notice.text}</div>}
+            {notice && <div className={notice.error ? "v04-error" : "v04-ok"}>{shown(notice.text)}</div>}
             {listError && (
               <div className="v04-error">
                 설치된 프로그램을 읽지 못했어요: {listError}{" "}

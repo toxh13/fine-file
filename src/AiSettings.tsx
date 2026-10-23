@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ai, isLocalUrl, judgeModel, judgeOf, type AiProvider, type AiSettings as Settings, type JudgeEngine, type KeyStatus } from "./api";
 import { Dialog } from "./Duplicates";
+import { shown } from "./format";
 import "./components.css";
 import "./v04.css";
 import "./v06.css";
@@ -657,8 +658,9 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
                         >
                           <option value="">설치된 모델에서 고르기…</option>
                           {models.map((m) => (
+                            // The value is the name as Ollama gave it (what is saved); the text shows its marks.
                             <option key={m} value={m}>
-                              {m}
+                              {shown(m)}
                             </option>
                           ))}
                         </select>
@@ -670,7 +672,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
                           : models
                             ? "Ollama에 받은 모델이 없어요. 아래 명령으로 받아 주세요"
                             : modelsError
-                              ? `설치된 모델을 읽지 못했어요: ${modelsError}`
+                              ? `설치된 모델을 읽지 못했어요: ${shown(modelsError)}`
                               : ""}
                       </span>
                     )}

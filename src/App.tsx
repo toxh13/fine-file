@@ -36,7 +36,7 @@ import { dragOverWindow, keysNow, pagePoint, takeOwnDrop, trackModifiers } from 
 import { FavoritesSection, SidebarSection, pinDropAt, sideNavKeys, usePlaces } from "./Sidebar";
 import { Transfers } from "./Transfers";
 import { UpdateBanner, UpdateSettingsDialog, useUpdateOffered } from "./Updater";
-import { driveKey, folderTitle, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, timeAgo } from "./format";
+import { driveKey, folderTitle, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, shown, timeAgo } from "./format";
 import "./App.css";
 
 /** v0.2 had one view for the window: the first tab gets it when no tabs were saved. */
@@ -1241,7 +1241,7 @@ export default function App() {
                   {...tip("drive")}
                 >
                   <div className="drive-name">
-                    {d.label || (d.kind === "unresponsive" ? "응답 없음" : "로컬 디스크")} ({d.letter})
+                    {d.label ? shown(d.label) : d.kind === "unresponsive" ? "응답 없음" : "로컬 디스크"} ({d.letter})
                   </div>
                   <div className="usage">
                     <span className={pct > 90 ? "full" : ""} style={{ width: `${pct}%` }} />
@@ -1378,7 +1378,7 @@ export default function App() {
               role="tab"
               aria-selected={t.id === activeId}
               className={`tab ${t.id === activeId ? "on" : ""}`}
-              title={t.path}
+              title={shown(t.path)}
               // Files dropped here go where this tab takes them (see the drop above).
               data-tab-drop={t.id}
               onMouseDown={(ev) => {
@@ -1389,7 +1389,7 @@ export default function App() {
                 } else if (ev.button === 0) setActiveId(t.id);
               }}
             >
-              <span className="tab-label">{folderTitle(t.path)}</span>
+              <span className="tab-label">{shown(folderTitle(t.path))}</span>
               {tabs.length > 1 && (
                 <button
                   className="tab-close"
@@ -1460,8 +1460,9 @@ export default function App() {
 
       <div className="toasts">
         {toasts.map((t) => (
+          // Toasts name files and folders as they are on disk.
           <div key={t.id} className={`toast ${t.kind}`}>
-            {t.text}
+            {shown(t.text)}
           </div>
         ))}
       </div>

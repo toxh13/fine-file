@@ -99,7 +99,7 @@ const SAME_PLACE: &str = "옮길 곳이 지금 자리와 같아요";
 const INTO_ITSELF: &str = "폴더를 그 안으로 옮길 수는 없어요";
 const RENAME_ELSEWHERE: &str = "rename은 같은 폴더 안에서 이름만 바꿔요. 다른 폴더로 옮기려면 move를 쓰세요";
 const SAME_NAME: &str = "새 이름이 지금 이름과 같아요";
-const HIDDEN_CHARS: &str = "새 이름에 글자 방향을 바꾸는 보이지 않는 문자가 있어요";
+pub(crate) const HIDDEN_CHARS: &str = "새 이름에 글자 방향을 바꾸는 보이지 않는 문자가 있어요";
 const EXT_CHANGE: &str = "파일의 확장자는 바꿀 수 없어요 (여는 프로그램이 달라져요)";
 const NO_BIN: &str = "이 드라이브에는 휴지통이 없어요";
 const TOO_MANY_STEPS: &str = "한 계획에는 500단계까지만 넣을 수 있어요";
@@ -959,7 +959,8 @@ fn same_extension(from: &str, to: &str, is_dir: bool) -> Result<(), &'static str
 
 /// Characters that change the direction text is shown in: in a new name they
 /// can make a name ending in `gpj.exe` after U+202E look like one ending in `exe.jpg`.
-fn is_bidi(c: char) -> bool {
+/// Plans from an AI provider are held to the same (ai.rs).
+pub(crate) fn is_bidi(c: char) -> bool {
     matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 

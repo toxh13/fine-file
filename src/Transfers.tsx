@@ -1,7 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { api, ops, opEvents, type Conflict, type ConflictChoice, type JobInfo } from "./api";
-import { formatDate, formatSize, parentOf, typeLabel } from "./format";
+import { formatDate, formatSize, parentOf, shown, typeLabel } from "./format";
 import "./components.css";
 
 type Toast = (text: string, kind?: "info" | "error") => void;
@@ -432,13 +432,13 @@ function JobRow({ j, cancelling, errorsOpen, lost, onLostAnswer, onCancel, onDis
   return (
     <div className={`job ${j.state}`}>
       <div className="job-top">
-        <span className="job-title" title={j.dest || undefined}>
+        <span className="job-title" title={j.dest ? shown(j.dest) : undefined}>
           {/* A hard-link job has no destination; its folder, when it names one, is where it works. */}
           {j.op === "link"
             ? j.dest
-              ? `${OP_LABEL[j.op]} · ${baseName(j.dest) || j.dest}`
+              ? `${OP_LABEL[j.op]} · ${shown(baseName(j.dest) || j.dest)}`
               : OP_LABEL[j.op]
-            : `${OP_LABEL[j.op]} → ${baseName(j.dest) || j.dest}`}
+            : `${OP_LABEL[j.op]} → ${shown(baseName(j.dest) || j.dest)}`}
         </span>
         <span className="job-state">
           {untidy(j) || (j.state === "done" && errors > 0 && linkLeft(j) === errors)
@@ -458,13 +458,13 @@ function JobRow({ j, cancelling, errorsOpen, lost, onLostAnswer, onCancel, onDis
         )}
       </div>
       {active && (
-        <div className="job-current" title={j.current ?? undefined}>
+        <div className="job-current" title={j.current ? shown(j.current) : undefined}>
           {j.state === "waiting" && lost
-            ? `${baseName(j.current ?? "") || "항목"}: 이름이 같은 항목이 있는데, 묻는 창을 다시 띄울 수 없어요`
+            ? `${shown(baseName(j.current ?? "")) || "항목"}: 이름이 같은 항목이 있는데, 묻는 창을 다시 띄울 수 없어요`
             : j.state === "waiting"
               ? "이름이 같은 항목이 있어서 답을 기다리고 있어요"
               : j.current
-                ? baseName(j.current)
+                ? shown(baseName(j.current))
                 : "준비 중…"}
         </div>
       )}
@@ -521,9 +521,9 @@ const JobErrors = memo(
     return (
       <ul className="job-errors">
         {errors.map(([path, why], i) => (
-          <li key={i} title={path}>
-            <span className="job-error-name">{baseName(path) || path}</span>
-            <span className="muted">{why}</span>
+          <li key={i} title={shown(path)}>
+            <span className="job-error-name">{shown(baseName(path) || path)}</span>
+            <span className="muted">{shown(why)}</span>
           </li>
         ))}
         {hidden > 0 && (
@@ -697,8 +697,8 @@ function ConflictDialog({ c, op, more, onAnswer }: ConflictProps) {
     <div className="modal-bg">
       <div ref={box} className="modal conflict" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
         <h3 id="conflict-title">같은 이름의 {tgtDir === true ? "폴더가" : tgtDir === false ? "파일이" : "항목이"} 있어요</h3>
-        <p className="conflict-name" title={c.target}>
-          {baseName(c.target)}
+        <p className="conflict-name" title={shown(c.target)}>
+          {shown(baseName(c.target))}
         </p>
         <div className="conflict-cmp">
           <Side
@@ -779,7 +779,7 @@ function Side({ label, path, isDir, link, differs, looking, size, modified, newe
     <div className="conflict-side">
       <div className="conflict-label">{label}</div>
       <div className="conflict-row">
-        {isDir === null ? (looking ? "확인하는 중…" : "종류 모름") : typeLabel(baseName(path), isDir)}
+        {isDir === null ? (looking ? "확인하는 중…" : "종류 모름") : shown(typeLabel(baseName(path), isDir))}
         {link && <span className="conflict-tag">링크</span>}
         {differs && <span className="conflict-tag">종류 다름</span>}
       </div>
@@ -791,8 +791,8 @@ function Side({ label, path, isDir, link, differs, looking, size, modified, newe
         {formatDate(modified) || "날짜 모름"}
         {newer && <span className="conflict-tag">더 최근</span>}
       </div>
-      <div className="conflict-folder" title={folder}>
-        {folder}
+      <div className="conflict-folder" title={shown(folder)}>
+        {shown(folder)}
       </div>
     </div>
   );

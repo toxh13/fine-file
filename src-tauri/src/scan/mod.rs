@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 /// Whether a reparse tag is one of the cloud-files tags
@@ -54,8 +55,14 @@ pub fn scan_walk(drive: &str) -> io::Result<Index> {
 /// data" option removes `%LOCALAPPDATA%\<identifier>`.
 const APP_ID: &str = "com.toxh13.fine-file";
 
+/// `%LOCALAPPDATA%` as Windows has it for this account (SHGetKnownFolderPath),
+/// not the environment variable: whoever starts the app sets that one, and an
+/// elevated start must not be pointed at records somebody else wrote. The
+/// same folder in every ordinary case.
 fn local_app_data() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| win::known_folder_path(&FOLDERID_LocalAppData).unwrap_or_else(std::env::temp_dir)).clone()
 }
 
 pub fn data_dir() -> PathBuf {

@@ -3,7 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { adminCanRead, adminError, ensureAdmin } from "./AdminSession";
 import { ops, v04, type DriveInfo, type Entry, type PreviewInfo } from "./api";
 import { Icon } from "./CommandBar";
-import { folderTitle, formatDate, formatSize, parentOf, pathKey, typeLabel } from "./format";
+import { folderTitle, formatDate, formatSize, parentOf, pathKey, shown, typeLabel } from "./format";
 import { Glyph } from "./GridView";
 import "./components.css";
 
@@ -75,7 +75,7 @@ function shareText(part: number, whole: number): string {
 
 /** The share of its folder an item (or a selection in one folder) takes, with a bar. */
 function Share({ size, parent, folder }: { size: number; parent: number; folder: string }) {
-  const name = folderTitle(folder);
+  const name = shown(folderTitle(folder));
   const where = /^[A-Za-z]:$/.test(name) ? `${name} 드라이브` : `${name} 폴더`;
   return (
     <>
@@ -98,7 +98,7 @@ function Location({ text, onCopy }: { text: string; onCopy: () => void }) {
     <>
       <dt>위치</dt>
       <dd className="details-loc">
-        <span className="preview-path">{text}</span>
+        <span className="preview-path">{shown(text)}</span>
         <button type="button" className="details-copy" aria-label="경로 복사" title={COPY_TITLE} onClick={onCopy}>
           <Icon.copyPath />
         </button>
@@ -108,7 +108,7 @@ function Location({ text, onCopy }: { text: string; onCopy: () => void }) {
 }
 
 export function Preview({ entry, selection, parentSize, onCopyPaths, sized, adminFolder, drives }: PreviewProps) {
-  const [shown, setShown] = useState<Shown | null>(null);
+  const [loaded, setLoaded] = useState<Shown | null>(null);
   // Media the page could not play after all (a codec WebView2 lacks): the shell thumbnail stands in.
   const [broken, setBroken] = useState<string | null>(null);
   const [thumb, setThumb] = useState<{ key: string; url: string | null } | null>(null);
@@ -121,7 +121,7 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
   // longer selected is dropped.
   useEffect(() => {
     if (!entry) {
-      setShown(null);
+      setLoaded(null);
       return;
     }
     const e = entry;
@@ -136,7 +136,7 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
           error = String(err);
         }
       }
-      if (!stale) setShown({ key: entryKey(e), entry: e, info, error });
+      if (!stale) setLoaded({ key: entryKey(e), entry: e, info, error });
     }, DEBOUNCE);
     return () => {
       stale = true;
@@ -146,10 +146,10 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
 
   // An online-only cloud file is not loaded at all: <img>, <video> or the PDF viewer would have
   // the sync app download the whole of it.
-  const kind: PreviewInfo["kind"] | null = !shown
+  const kind: PreviewInfo["kind"] | null = !loaded
     ? null
-    : shown.info && !shown.info.online_only && broken !== shown.key
-      ? shown.info.kind
+    : loaded.info && !loaded.info.online_only && broken !== loaded.key
+      ? loaded.info.kind
       : "none";
 
   // The shell thumbnail only where it adds something: folders, files the page cannot show (online-
@@ -157,10 +157,10 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
   // icon at the top and their preview. Images, video, PDFs and text are shown in full below, so
   // the top keeps their type's icon: no second read of the file (a slow one on a network drive),
   // and the thumbnail workers stay free for the icon view.
-  const thumbKey = shown && (kind === "none" || kind === "audio") ? shown.key : null;
+  const thumbKey = loaded && (kind === "none" || kind === "audio") ? loaded.key : null;
   useEffect(() => {
-    if (!shown || thumbKey === null) return;
-    const path = shown.entry.path;
+    if (!loaded || thumbKey === null) return;
+    const path = loaded.entry.path;
     let stale = false;
     ops
       .thumbnail(path, THUMB)
@@ -175,11 +175,11 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
   const thumbDone = !!thumb && thumb.key === thumbKey;
   const thumbUrl = thumbDone ? thumb.url : null;
 
-  const loading = entry !== null && shown?.key !== key;
-  const fresh = shown && shown.key === key ? shown : null;
+  const loading = entry !== null && loaded?.key !== key;
+  const fresh = loaded && loaded.key === key ? loaded : null;
 
   // What the admin session read for the entry shown, once it is in.
-  const elevated = shown && adminRead?.key === shown.key ? adminRead.info : null;
+  const elevated = loaded && adminRead?.key === loaded.key ? adminRead.info : null;
   // A file this account may not read, or one with nothing to show in a folder read with
   // administrator rights: it can be read through the admin session (read-only, no download of
   // an online-only cloud file). Not on a network place, which the helper cannot read.
@@ -219,7 +219,7 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
 
   // Files only: a folder's thumbnail is the icon at the top. Another file's preview stays, dimmed,
   // while this one's loads.
-  const preview = shown && !shown.entry.is_dir && !entry.is_dir ? shown : null;
+  const preview = loaded && !loaded.entry.is_dir && !entry.is_dir ? loaded : null;
   const fill = !!preview && (!!elevated || (kind !== null && FILLS.has(kind)));
 
   return (
@@ -228,14 +228,14 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
         <span className="details-icon">
           {fresh && thumbUrl ? <img src={thumbUrl} alt="" draggable={false} /> : <Glyph e={entry} />}
         </span>
-        <span className="details-title" title={entry.path}>
-          {entry.name}
+        <span className="details-title" title={shown(entry.path)}>
+          {shown(entry.name)}
         </span>
       </div>
 
       <dl className="preview-meta">
         <dt>종류</dt>
-        <dd title={fresh?.info?.mime ?? undefined}>{typeLabel(entry.name, entry.is_dir)}</dd>
+        <dd title={fresh?.info?.mime ?? undefined}>{shown(typeLabel(entry.name, entry.is_dir))}</dd>
         <dt>크기</dt>
         <dd>{sizeText}</dd>
         {folderKnown && (
@@ -282,7 +282,7 @@ export function Preview({ entry, selection, parentSize, onCopyPaths, sized, admi
                 <button disabled={adminBusy === fresh.key} onClick={() => readAsAdmin(fresh)}>
                   {adminBusy === fresh.key ? "읽는 중…" : "관리자 권한으로 읽기"}
                 </button>
-                {adminRead?.key === fresh.key && adminRead.error && <p className="preview-note error">{adminRead.error}</p>}
+                {adminRead?.key === fresh.key && adminRead.error && <p className="preview-note error">{shown(adminRead.error)}</p>}
                 <p className="muted">앞부분 256 KB만 읽고, 파일은 바꾸지 않아요.</p>
               </div>
             )}
@@ -382,7 +382,7 @@ function Body({ s, kind, thumb, thumbDone, broken, onBroken }: BodyProps) {
         </div>
       );
     case "pdf":
-      return <iframe key={s.key} className="preview-pdf" src={src} title={s.entry.name} />;
+      return <iframe key={s.key} className="preview-pdf" src={src} title={shown(s.entry.name)} />;
     case "text":
       return (
         <>
@@ -408,7 +408,7 @@ function Body({ s, kind, thumb, thumbDone, broken, onBroken }: BodyProps) {
             thumbDone && !note && !s.error && <p className="preview-note">미리 볼 수 있는 내용이 없어요</p>
           )}
           {note && <p className="preview-note">{note}</p>}
-          {s.error && <p className="preview-note error">{s.error}</p>}
+          {s.error && <p className="preview-note error">{shown(s.error)}</p>}
         </div>
       );
     }

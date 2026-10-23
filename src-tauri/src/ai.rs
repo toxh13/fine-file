@@ -1812,8 +1812,13 @@ impl Space<'_, '_> {
         Ok(missing)
     }
 
-    /// A new name must be one Windows takes exactly as it is.
+    /// A new name must be one Windows takes exactly as it is, with nothing in
+    /// it that turns the text around (`mcp::is_bidi`, as for MCP plans): such
+    /// a name can show `exe` as `pdf`.
     fn new_name_ok(&self, name: &str) -> Result<(), String> {
+        if name.chars().any(crate::mcp::is_bidi) {
+            return Err(crate::mcp::HIDDEN_CHARS.into());
+        }
         match crate::ops::check_name(name) {
             Ok(n) if n == name => Ok(()),
             Ok(_) => Err("이름 앞뒤의 공백이나 끝의 점은 쓸 수 없어요".into()),
@@ -3085,6 +3090,25 @@ mod tests {
         assert_eq!(kept, ["mkdir box2", "move x.txt", "rename E.TXT"]);
         assert_eq!(c.dropped.len(), 11, "{:?}", c.dropped);
         assert!(c.dropped[0].1.contains("덮어쓰지 않아요"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_names_never_turn_their_text_around() {
+        let root = temp_root("bidi");
+        fs::write(root.join("report.exe"), "x").unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        // `report\u{202E}fdp.exe` shows as `reportexe.pdf`.
+        let c = check(&root, &AI_ACTIONS, &[
+            step("rename", "report.exe", Some("report\u{202E}fdp.exe")),
+            step("rename", "a.txt", Some("b\u{2067}.txt")),
+            step("mkdir", "new\u{200F}", None),
+            step("move", "a.txt", Some("box\u{061C}\\a.txt")),
+            step("rename", "a.txt", Some("b.txt")),
+        ]);
+        assert_eq!(c.dropped.len(), 4, "{:?}", c.dropped);
+        assert!(c.dropped.iter().all(|(_, why)| why == crate::mcp::HIDDEN_CHARS), "{:?}", c.dropped);
+        assert_eq!(c.steps.iter().map(|s| last(s.to.as_deref().unwrap_or(&s.from))).collect::<Vec<_>>(), ["b.txt"]);
         let _ = fs::remove_dir_all(&root);
     }
 
