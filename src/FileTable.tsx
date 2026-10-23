@@ -1,28 +1,30 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { Entry, Risk } from "./api";
+import { JEV_SHOW, riskConfidence, type Entry, type JudgeEngine, type Risk } from "./api";
 import { formatDate, formatSize, typeLabel } from "./format";
 import { watchPress } from "./shell";
 import { focusTakenByConflict } from "./Transfers";
 
-/** "score": v0.9's 일치도, the results of a 뜻으로 찾기 (jev) only. */
+/** "score": v0.9's 일치도, the results of an AI 검색 only. */
 export type SortKey = "name" | "size" | "files" | "modified" | "type" | "location" | "change" | "score";
 
-/** A column: one the list sorts by, or "risk" (jev's 위험도, which comes in a while after and is not sorted by). */
+/** A column: one the list sorts by, or "risk" (the judge's 위험도, which comes in a while after and is not sorted by). */
 export type ColumnKey = SortKey | "risk";
 
-/** A row's "위험도" cell: jev's answer, "asking" while it is on its way, null for nothing to show. */
+/** A row's "위험도" cell: the judge's answer, "asking" while it is on its way, null for nothing to show. */
 export type RiskCell = Risk | "asking" | null;
 
 const RISK_LABEL: Record<Risk["level"], string> = { safe: "안전", caution: "주의", danger: "위험" };
 
-/** A row's "일치도" cell (뜻으로 찾기): jev's score, 0..1, and the program or game it found, if named. */
+/** A row's "일치도" cell (AI 검색): the judge's score, 0..1, and the program or game it found, if named. */
 export interface ScoreCell {
   score: number;
   label: string | null;
+  /** Who rated it, as the app names it ("jev", "로컬 모델"). */
+  by: string;
 }
 
-/** The 일치도 badge's tone: what the list shows at first is 0.5 and over. */
-const scoreTone = (s: number) => (s >= 0.8 ? "high" : s >= 0.5 ? "mid" : "low");
+/** The 일치도 badge's tone: what the list shows at first (JEV_SHOW and over) is "mid" or "high". */
+const scoreTone = (s: number) => (s >= 0.8 ? "high" : s >= JEV_SHOW ? "mid" : "low");
 
 /** A row's "변화" cell: its change since the scan before, as shown and explained. */
 export interface ChangeCell {
@@ -70,11 +72,15 @@ interface Props {
   change?: (entry: Entry) => ChangeCell | undefined;
   /** The "위험도" column's cell for a row. */
   risk?: (entry: Entry) => RiskCell;
-  /** The "일치도" column's cell for a row (뜻으로 찾기). */
+  /** Who answers the "위험도" column (its header and badges say so): jev, or a local model. */
+  riskEngine?: JudgeEngine;
+  /** The local model's Ollama address when it is another computer's (what the column asks about goes there); null: this PC. */
+  riskRemote?: string | null;
+  /** The "일치도" column's cell for a row (AI 검색). */
   score?: (entry: Entry) => ScoreCell | undefined;
   /**
-   * Another name for a row, shown muted after its own and in its tooltip: the program or game a
-   * 뜻으로 찾기 found in that folder ("Counter-Strike 2" for "Counter-Strike Global Offensive").
+   * Another name for a row, shown muted after its own and in its tooltip: the program or game an
+   * AI 검색 found in that folder ("Counter-Strike 2" for "Counter-Strike Global Offensive").
    */
   alias?: (entry: Entry) => string | null | undefined;
   /** The rows drawn now (from `first`, up to but not including `last`), scrolled into view or about to be. */
@@ -157,7 +163,7 @@ export function FileTable(p: Props) {
   // The row being renamed stays mounted while scrolled away, so the typed name is not lost.
   if (renameAt >= 0 && (renameAt < first || renameAt >= last)) shown.push(renameAt);
 
-  // What is in sight, for what is asked about the rows shown (jev's 위험도).
+  // What is in sight, for what is asked about the rows shown (the judge's 위험도).
   const onRange = p.onRange;
   useEffect(() => onRange?.(first, last), [onRange, first, last]);
 
@@ -170,13 +176,7 @@ export function FileTable(p: Props) {
             <div
               key={key}
               className="th static"
-              title={
-                "위험도 (TypeSafe jev): 이 항목을 지워도 되는지 jev가 본 판정이에요 (안전·주의·위험).\n" +
-                "· 참고용이에요. 아무것도 지우거나 고르지 않아요\n" +
-                "· 경로·이름·크기·날짜 같은 정보만 보내요 (파일 내용은 보내지 않아요)\n" +
-                "· 내 jev API 키로 물어서, 요금은 jev 조건대로 키 주인에게 청구돼요\n" +
-                '· 툴바의 "위험도"로 켜고 꺼요. 이 열로는 정렬하지 않아요'
-              }
+              title={riskHeadTitle(p.riskEngine ?? "jev", p.riskRemote ?? null)}
             >
               {c.label}
             </div>
@@ -225,7 +225,26 @@ export function FileTable(p: Props) {
   );
 }
 
-function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, score, alias }: { col: Column; e: Entry } & Props) {
+/** The "위험도" header's tooltip: who judges, what goes where, what it costs. `remote`: another computer's Ollama. */
+function riskHeadTitle(engine: JudgeEngine, remote: string | null): string {
+  return engine === "ollama"
+    ? `위험도 (로컬 모델 · Ollama): 이 항목을 지워도 되는지 ${remote ? "다른 컴퓨터의" : "이 PC의"} 모델이 본 판정이에요 (안전·주의·위험).\n` +
+        "· 참고용이에요. 아무것도 지우거나 고르지 않아요\n" +
+        (remote
+          ? `· 경로·이름·크기·날짜 같은 정보를 Ollama 주소 ${remote}(그 컴퓨터)로 보내요 (파일 내용은 보내지 않아요)\n` +
+            "· 요금은 없어요\n"
+          : "· 경로·이름·크기·날짜 같은 정보만 모델에 줘요 (파일 내용은 주지 않아요)\n" +
+            "· 요금은 없고, 아무것도 밖으로 나가지 않아요\n") +
+        '· 로컬 모델은 신뢰도를 매기지 않아요("로컬" 배지). jev보다 느리고 덜 정확할 수 있어요\n' +
+        '· 툴바의 "위험도"로 켜고 꺼요. 이 열로는 정렬하지 않아요'
+    : "위험도 (TypeSafe jev): 이 항목을 지워도 되는지 jev가 본 판정이에요 (안전·주의·위험).\n" +
+        "· 참고용이에요. 아무것도 지우거나 고르지 않아요\n" +
+        "· 경로·이름·크기·날짜 같은 정보만 보내요 (파일 내용은 보내지 않아요)\n" +
+        "· 내 jev API 키로 물어서, 요금은 jev 조건대로 키 주인에게 청구돼요\n" +
+        '· 툴바의 "위험도"로 켜고 꺼요. 이 열로는 정렬하지 않아요';
+}
+
+function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, riskEngine, score, alias }: { col: Column; e: Entry } & Props) {
   switch (col.key) {
     case "name": {
       // Only a name that says more than the folder's own.
@@ -277,23 +296,37 @@ function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, s
     }
     case "risk": {
       const r = risk?.(e) ?? null;
-      if (r === "asking") return <div className="td risk muted" title="jev에 묻는 중이에요">…</div>;
+      const local = riskEngine === "ollama";
+      if (r === "asking") {
+        return (
+          <div className="td risk muted" title={local ? "로컬 모델이 판정하는 중이에요" : "jev에 묻는 중이에요"}>
+            …
+          </div>
+        );
+      }
       if (!r) return <div className="td risk" />;
       const regen = r.regenerable !== null ? ` · 지워도 프로그램이 다시 만들 확률 ${Math.round(r.regenerable * 100)}%` : "";
+      // Whose answer it is comes from the engine alone; a local model gives no confidence, and its
+      // badge says "로컬" (as the plan's "로컬 안전"). jev may leave one out too: "신뢰도 없음".
+      const conf = riskConfidence(r);
+      const sure = conf === null ? " · 신뢰도 없음" : ` · 신뢰도 ${Math.round(conf * 100)}%`;
       return (
-        <div className="td risk" title={`jev 위험도 (참고용) · 신뢰도 ${Math.round(r.confidence * 100)}%${regen}`}>
-          <span className={`risk-badge ${r.level}`}>{RISK_LABEL[r.level] ?? r.level}</span>
+        <div className="td risk" title={`${local ? "로컬 모델" : "jev"} 위험도 (참고용)${sure}${regen}`}>
+          <span className={`risk-badge ${r.level}`}>
+            {local && "로컬 "}
+            {RISK_LABEL[r.level] ?? r.level}
+          </span>
         </div>
       );
     }
     case "score": {
       const s = score?.(e);
       if (!s) return <div className="td score" />;
-      // Rounded down, as the list's 50% line is: 0.497 shows as 49%, with the hits under it.
+      // Rounded down, as the list's line (JEV_SHOW, 40%) is: 0.397 shows as 39%, with the hits under it.
       // (The tiny bit keeps 0.29 from reading as 28.999…%.)
       const pct = Math.floor(Math.max(0, Math.min(1, s.score)) * 100 + 1e-9);
       return (
-        <div className="td score" title={`${s.label ? `${s.label}\n` : ""}일치도 ${pct}% (jev가 본 값, 참고용)`}>
+        <div className="td score" title={`${s.label ? `${s.label}\n` : ""}일치도 ${pct}% (${s.by}${s.by === "jev" ? "가" : "이"} 본 값, 참고용)`}>
           <span className={`score-badge ${scoreTone(s.score)}`}>{pct}%</span>
         </div>
       );

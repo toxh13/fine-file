@@ -87,7 +87,8 @@ function errText(err: unknown): string {
 // Names come from the registry and the disk, which any program can write: direction marks in them
 // are made visible, so a name cannot read as something else.
 const BIDI = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
-const shown = (s: string) => s.replace(BIDI, "\ufffd");
+/** A name as shown: the marks that turn text around are replaced (Explorer's uninstall question too). */
+export const shown = (s: string) => s.replace(BIDI, "\ufffd");
 
 function baseName(p: string): string {
   const t = p.replace(/[\\/]+$/, "");
@@ -626,7 +627,8 @@ export function Programs({
                                 !p.can_uninstall
                                   ? p.kind === "store"
                                     ? "Windows가 지우지 못하게 한 앱이에요"
-                                    : "이 프로그램은 제거 프로그램을 Windows에 등록해 두지 않았어요. Windows 설정 → 앱에서 확인해 주세요"
+                                    : // No uninstaller registered, one that is not there, or removing turned off (NoRemove).
+                                      "여기서는 제거할 수 없어요. Windows 설정 → 앱에서 확인해 주세요"
                                   : p.kind === "store"
                                     ? "한 번 물은 뒤 이 계정에서 바로 제거해요. 제거 창이 따로 뜨지 않고, 앱의 데이터도 함께 지워져요"
                                     : "이 프로그램의 공식 제거 프로그램을 실행해요"

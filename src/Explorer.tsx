@@ -1,25 +1,36 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ai,
+  aiEvents,
   api,
+  JEV_SHOW,
+  JUDGE_NAME,
+  judgeModel,
+  judgeOf,
+  judgeRemote,
+  judgeTarget,
   methodNote,
   ops,
   places,
   plans,
   v04,
   v05,
+  v07,
   type AiPayloadPreview,
   type AiSettings as AiConfig,
   type DiffInfo,
   type DiffNode,
   type DriveInfo,
   type Entry,
+  type FindProgress,
   type JevFound,
   type JevHit,
   type JevKind,
   type JevWhen,
+  type JudgeEngine,
   type KeyStatus,
   type Listing,
+  type ProgramRef,
   type Risk,
 } from "./api";
 import { AdminBar, adminCanRead, adminError, ensureAdmin } from "./AdminSession";
@@ -33,7 +44,7 @@ import { HELP_TIPS } from "./Help";
 import { MapView } from "./MapView";
 import { PlansInbox, PlanView } from "./PlanView";
 import { Preview } from "./Preview";
-import { Programs } from "./Programs";
+import { Programs, shown } from "./Programs";
 import { RelocateDialog, Relocations } from "./Relocate";
 import { dragOut, dragRefusal, screenPoint } from "./shell";
 import { TreeView, type TreeRefresh } from "./TreeView";
@@ -144,8 +155,10 @@ const FOLDER_DIFF_COLUMNS: Column[] = [
   ...FOLDER_COLUMNS.slice(2),
 ];
 
-/** With the toolbar's "위험도" on (jev): its badge for each row, last. */
+/** With the toolbar's "위험도" on (jev or a local model): its badge for each row, last. */
 const RISK_COLUMN: Column = { key: "risk", label: "위험도", width: "64px" };
+// A local model's badges say "로컬" too ("로컬 안전").
+const RISK_COLUMN_LOCAL: Column = { ...RISK_COLUMN, width: "84px" };
 
 const SEARCH_COLUMNS: Column[] = [
   { key: "name", label: "이름", width: "minmax(200px, 2fr)" },
@@ -154,27 +167,43 @@ const SEARCH_COLUMNS: Column[] = [
   { key: "modified", label: "수정한 날짜", width: "140px" },
 ];
 
-/** A 뜻으로 찾기's results: jev's score right after the name, as it is what they are ordered by. */
-const JEV_COLUMNS: Column[] = [
+/** JEV_SHOW as the app says it: "40%". */
+const SHOW_PCT = `${Math.round(JEV_SHOW * 100)}%`;
+
+/** An AI 검색's results: the judge's score right after the name, as it is what they are ordered by. */
+const aiColumns = (title: string): Column[] => [
   SEARCH_COLUMNS[0],
-  {
-    key: "score",
-    label: "일치도",
-    width: "72px",
-    title:
-      "일치도 (TypeSafe jev): 찾는 말에 얼마나 맞는지 jev가 이름·경로 같은 정보만 보고 매긴 값이에요 (파일 내용은 안 봐요, 참고용).\n" +
-      "50% 미만은 처음에 숨겨요. 누르면 이 열로 정렬해요",
-  },
+  { key: "score", label: "일치도", width: "72px", title: `${title}\n${SHOW_PCT} 미만은 처음에 숨겨요. 누르면 이 열로 정렬해요` },
   ...SEARCH_COLUMNS.slice(1),
 ];
+const AI_COLUMNS: Record<JudgeEngine, Column[]> = {
+  jev: aiColumns(
+    "일치도 (TypeSafe jev): 찾는 말에 얼마나 맞는지 jev가 이름·경로 같은 정보만 보고 매긴 값이에요 (파일 내용은 안 봐요, 참고용).",
+  ),
+  // A local model answers in three steps (맞아요 90%, 아마 60%, 아니에요 10%), not a fine score.
+  ollama: aiColumns(
+    "일치도 (로컬 모델): 찾는 말에 맞는지 로컬 모델(Ollama)이 이름·경로 같은 정보만 보고 고른 값이에요 (파일 내용은 안 봐요, 참고용).\n" +
+      "로컬 모델은 맞아요(90%) · 아마(60%) · 아니에요(10%) 세 단계로만 답해요.",
+  ),
+};
 
-// ---- v0.9: 뜻으로 찾기 (jev) ----
+// ---- v0.9: AI 검색 (v0.9 "뜻으로 찾기"; v0.10 jev or a local model) ----
 
-/** What the list shows of a 뜻으로 찾기 at first: the hits jev scored this high or more. */
-const JEV_SHOW = 0.5;
-/** Candidates a 뜻으로 찾기 asks jev about at most (meaning.rs): files, and games·programs. */
+/**
+ * Candidates an AI 검색 asks the judge about at most (meaning.rs): files, and games·programs; for
+ * what the asking dialogs say (a search's own cap comes with it: JevFound.cap). A local model is
+ * asked one candidate at a time, so it is asked about fewer.
+ */
 const JEV_FILE_MAX = 240;
 const JEV_APP_MAX = 400;
+const LOCAL_FILE_MAX = 100;
+const LOCAL_APP_MAX = 150;
+
+/** The engine that answered a search. */
+const engineOf = (f: JevFound): JudgeEngine => (f.engine === "ollama" ? "ollama" : "jev");
+
+/** "jev가", "로컬 모델이": the judge as the subject of a sentence. */
+const judgeSubject = (e: JudgeEngine) => (e === "ollama" ? "로컬 모델이" : "jev가");
 
 const JEV_KIND: Record<JevKind, string> = {
   document: "문서",
@@ -197,48 +226,77 @@ const JEV_WHEN: Record<JevWhen, string> = {
   older: "작년보다 전",
 };
 
-/** What the list says with no row to show of a 뜻으로 찾기. `hidden`: hits kept back under JEV_SHOW. */
+/** What the list says with no row to show of an AI 검색. `hidden`: hits kept back under JEV_SHOW. */
 function jevEmpty(f: JevFound, hidden: number): string {
-  if (hidden > 0) return `jev가 맞다고 본 항목이 없어요. 위의 "50% 미만도 보기"로 나머지 ${hidden.toLocaleString()}개를 볼 수 있어요`;
+  const who = judgeSubject(engineOf(f));
+  if (hidden > 0) return `${who} 맞다고 본 항목이 없어요. 위의 "${SHOW_PCT} 미만도 보기"로 나머지 ${hidden.toLocaleString()}개를 볼 수 있어요`;
+  // Stopped before anything was judged (even before the query was read: no candidates, "file"),
+  // which says nothing about the candidates.
+  if (stoppedEarly(f)) return "멈췄어요. 아직 확인한 항목이 없어요. Enter를 누르면 다시 찾아요";
+  if (f.cancelled) return `멈췄어요. 확인한 ${f.asked.toLocaleString()}개 중에는 ${who} 맞다고 본 항목이 없어요`;
   if (f.candidates === 0) {
     return f.target === "app"
       ? "후보가 될 게임·프로그램을 찾지 못했어요. 설치한 드라이브를 스캔했는지 확인해 주세요"
       : "후보가 될 파일을 찾지 못했어요. 이름에 들어 있을 만한 낱말로 바꿔 보세요";
   }
-  return "jev가 맞다고 본 항목이 없어요. 다른 말로 찾아 보세요";
+  return `${who} 맞다고 본 항목이 없어요. 다른 말로 찾아 보세요`;
+}
+
+/** An AI 검색 stopped before the judge answered for any candidate. */
+const stoppedEarly = (f: JevFound) => f.cancelled && f.asked === 0;
+/** Stopped before the query was read (what to look for, how to gather): its target and kind mean nothing. */
+const stoppedUnread = (f: JevFound) => f.cancelled && f.candidates === 0;
+
+/**
+ * What an AI 검색 left out. `capped`: more candidates than the cap, which only the first `cap`
+ * of were asked about (files: those with the most words; games·programs: the biggest, as they are
+ * all of them whatever the words). `unanswered`: under the cap, a request the judge did not
+ * answer; a search stopped early (`cancelled`) leaves out the rest by that instead.
+ */
+function jevLeftOut(f: JevFound) {
+  const cap = Math.min(f.candidates, f.cap);
+  return { cap, capped: f.candidates > f.cap, unanswered: f.cancelled ? 0 : Math.max(0, cap - f.asked) };
 }
 
 /**
- * What a 뜻으로 찾기 left out. `capped`: more candidates than the cap, which only the first `cap`
- * of were asked about (files: those with the most words; games·programs: the biggest, as they are
- * all of them whatever the words). `unanswered`: under the cap, a request jev did not answer.
+ * The status bar's line for an AI 검색: how many fit, what was asked, how long it took, what the
+ * judge took it for, what was left out. "jev 요청 R번" for jev; "로컬 모델 · 요청 R번" for a local one.
  */
-function jevLeftOut(f: JevFound) {
-  const max = f.target === "app" ? JEV_APP_MAX : JEV_FILE_MAX;
-  const cap = Math.min(f.candidates, max);
-  return { cap, capped: f.candidates > max, unanswered: Math.max(0, cap - f.asked) };
-}
-
-/** The status bar's line for a 뜻으로 찾기: how many fit, what was asked, how long it took, what jev took it for, what was left out. */
 function jevLine(f: JevFound, matched: number): string {
   const app = f.target === "app";
+  const engine = engineOf(f);
   const what = app
     ? "게임·프로그램"
     : [f.kind && `종류: ${JEV_KIND[f.kind] ?? f.kind}`, f.when && `기간: ${JEV_WHEN[f.when] ?? f.when}`]
         .filter(Boolean)
         .join(" · ") || "파일·폴더";
-  const asked = f.requests === 0 ? "jev 요청 0번 (저장해 둔 답)" : `jev 요청 ${f.requests.toLocaleString()}번`;
+  const requests = `${engine === "ollama" ? "로컬 모델 · 요청" : "jev 요청"} ${f.requests.toLocaleString()}번`;
+  const asked = f.requests === 0 ? `${requests} (저장해 둔 답)` : requests;
+  if (stoppedUnread(f)) return `AI 검색: 멈췄어요 — 아직 확인한 항목이 없어요 · ${requests} · ${jevTime(f.elapsed_ms)}`;
   const out = jevLeftOut(f);
   const notes = [
     out.capped && (app ? `큰 것부터 ${out.cap.toLocaleString()}개만 확인` : `후보가 많아 ${out.cap.toLocaleString()}개만 확인`),
-    out.unanswered > 0 && `jev가 답하지 않은 ${out.unanswered.toLocaleString()}개 빠짐`,
+    out.unanswered > 0 && `${judgeSubject(engine)} 답하지 않은 ${out.unanswered.toLocaleString()}개 빠짐`,
     f.unplaced > 0 && `폴더를 찾지 못한 프로그램 ${f.unplaced.toLocaleString()}개 빠짐`,
   ].filter(Boolean);
   return (
-    `뜻으로 찾기: 맞는 항목 ${matched.toLocaleString()}개 · 후보 ${f.candidates.toLocaleString()}개 중 ` +
+    `AI 검색: ${f.cancelled ? `멈췄어요 — 확인한 ${f.asked.toLocaleString()}개만 보여요 · ` : ""}` +
+    `맞는 항목 ${matched.toLocaleString()}개 · 후보 ${f.candidates.toLocaleString()}개 중 ` +
     `${f.asked.toLocaleString()}개 확인 · ${asked} · ${jevTime(f.elapsed_ms)} · ${what}` +
     notes.map((n) => ` · ${n}`).join("")
   );
+}
+
+/** What "제거 (제어판처럼)…" does for a program, or why it cannot (the item is then off). */
+function uninstallNote(p: ProgramRef): string {
+  if (!p.can_uninstall) {
+    // Win32: no uninstaller registered, one that is not there (or not a full path), or removing
+    // turned off (NoRemove). Which one is not known here, so none is named.
+    return p.kind === "store"
+      ? "Windows가 지우지 못하게 한 앱이에요"
+      : "여기서는 제거할 수 없어요. Windows 설정 → 앱에서 확인해 주세요";
+  }
+  return p.kind === "store" ? `${shown(p.name)} · 이 사용자에서 제거해요` : `${shown(p.name)}의 제거 프로그램을 실행해요`;
 }
 
 /** "0.8초"; a search the cache answered is quicker than that. */
@@ -396,20 +454,41 @@ function aiBlocker(s: AiState | null): string | null {
   return null;
 }
 
-/** jev's 위험도 can be asked for: it is on in the settings and its key is saved. */
-const jevReady = (s: AiState | null): s is AiState => !!s && s.settings.jev_enabled && s.keys.jev;
+/**
+ * Why the judge (위험도, AI 검색) cannot be asked now, in words the user can act on; "" when it
+ * can: the master switch is on and the engine is ready (jev: its key saved; a local model: a model
+ * named; whether Ollama runs is known only once asked).
+ */
+function judgeBlocker(s: AiState | null): string {
+  if (!s) return "AI 설정을 읽지 못했어요. 잠시 뒤에 다시 해 주세요";
+  if (!s.settings.jev_enabled) return 'AI 판정이 꺼져 있어요. AI 설정에서 "AI 판정 쓰기"를 켜 주세요';
+  if (judgeOf(s.settings) === "jev") {
+    return s.keys.jev ? "" : "jev 키가 없어요. AI 설정에서 jev 키를 넣거나, 무료 로컬 모델(Ollama)을 골라 주세요";
+  }
+  return judgeModel(s.settings) ? "" : "판정할 로컬 모델이 없어요. AI 설정에서 Ollama 모델 이름(예: qwen3:4b)을 넣어 주세요";
+}
 
-/** Items asked about at once (what is in sight of the list; jev_risk takes at most 400). */
-const RISK_BATCH = 200;
-/** An item jev gave no answer for (or a request that failed) is asked about again after this long. */
+/** The judge can be asked (see judgeBlocker). */
+const judgeReady = (s: AiState | null): s is AiState => judgeBlocker(s) === "";
+
+/** Which judge answers, and with what (a local model's name, its address): answers of two never mix. */
+const judgeKey = (s: AiConfig) =>
+  judgeOf(s) === "jev" ? "jev" : `ollama:${judgeModel(s)}@${(s.ollama_url ?? "").trim()}`;
+
+/**
+ * Items asked about at once (what is in sight of the list; jev_risk takes at most 500). A local
+ * model takes a while for each: fewer, so the badges come in bit by bit.
+ */
+const RISK_BATCH: Record<JudgeEngine, number> = { jev: 200, ollama: 40 };
+/** An item the judge gave no answer for (or a request that failed) is asked about again after this long. */
 const RISK_RETRY_MS = 5 * 60 * 1000;
 /** After a failed request a tab waits this long before it asks again. */
 const RISK_PAUSE_MS = 30 * 1000;
 const RISK_CACHE_MAX = 20000;
 
 /**
- * jev's answers by pathKey, shared by every tab: an item is asked about once, whichever tab shows
- * it. `risk` null: asked, nothing to show (no answer, or the request failed).
+ * The judge's answers by judgeKey and pathKey, shared by every tab: an item is asked about once,
+ * whichever tab shows it. `risk` null: asked, nothing to show (no answer, or the request failed).
  */
 const riskCache = new Map<string, { risk: Risk | null; at: number }>();
 function rememberRisk(key: string, risk: Risk | null) {
@@ -430,19 +509,52 @@ type TabDialog =
   | { kind: "relocate"; source: Entry }
   // v0.6: the AI panel for a folder or file, the AI settings, the plans, one plan.
   | { kind: "ai"; path: string; file: boolean }
-  | { kind: "aiSettings" }
+  // `thenAi`: opened from AI 검색's "AI 설정 열기": closed with a judge ready, the box turns to AI.
+  | { kind: "aiSettings"; thenAi?: boolean }
   | { kind: "plans" }
   // `inbox`: opened from the list of plans, which comes back when it closes.
   | { kind: "plan"; id: string; inbox?: boolean }
   // What an AI plan asked for from the menu would send, before it goes ("보내기 전에 미리 보기").
   // `changed`: made again on "보내기", it was not what had been shown (shown again, nothing sent).
   | { kind: "aiSend"; task: AiPlanTask; path: string; payload: AiPayloadPreview; changed?: boolean }
-  // Turning the list's 위험도 on, when the settings say to ask before sending.
-  | { kind: "jevAsk" }
-  // v0.9: turning the search box's "뜻으로" on, the first time in this tab, likewise.
-  | { kind: "jevFindAsk" }
+  // Turning the list's 위험도 on, when the settings say to ask before sending and it would leave
+  // this PC (jev, an Ollama elsewhere): `engine` and `url` say where to.
+  | { kind: "riskAsk"; engine: JudgeEngine; url: string; target: string }
+  // v0.9: the search box's AI 검색, likewise: the first time in this tab, and again on Enter
+  // when the judge's destination (`target`, judgeTarget) changed since. `run`: agreed, it searches.
+  // `changed`: another destination was said before (the warning says it changed).
+  | { kind: "aiFindAsk"; engine: JudgeEngine; url: string; target: string; run?: boolean; changed?: boolean }
+  // v0.10: AI 검색 with no judge ready: the two ways to get one (`why`: what is missing).
+  | { kind: "aiHow"; why: string }
+  // v0.10: "제거 (제어판처럼)…": a folder that is an installed program's own.
+  | { kind: "uninstall"; prog: ProgramRef; path: string }
   // v0.7: installed programs and the folders removed ones left behind.
   | { kind: "programs" };
+
+/**
+ * v0.10: the AI 검색 out, one at a time for the whole window (the backend's ai_find_cancel stops
+ * whichever runs, and its progress events name none): every tab asking the same waits for it
+ * (sent once, billed once), one asking something else waits for it to end. `waiters`: the tabs
+ * that wait for its answer; once none does, it is stopped (findCancel). `watch`: the tabs that
+ * wait, told when the waiters change (their stop button says what it does: stop, or stop waiting).
+ */
+const aiRun: {
+  current: { key: string; done: Promise<JevFound>; waiters: Set<number> } | null;
+  watch: Set<() => void>;
+} = { current: null, watch: new Set() };
+
+const aiRunChanged = () => {
+  for (const f of aiRun.watch) f();
+};
+
+/** Tab `id` no longer waits for the AI 검색 out: stopped once no tab does. */
+function leaveAiRun(id: number) {
+  const run = aiRun.current;
+  if (!run || !run.waiters.delete(id)) return;
+  aiRunChanged();
+  if (run.waiters.size) return;
+  ai.findCancel().catch(() => {});
+}
 
 /** A folder this account cannot open, as the admin session read it. */
 interface AdminListing {
@@ -456,7 +568,7 @@ interface Results {
   items: Entry[];
   total: number;
   ms: number;
-  /** v0.9: the answer of a 뜻으로 찾기 (jev): `items` are its hits' entries, `hits` them by path. */
+  /** v0.9: the answer of an AI 검색: `items` are its hits' entries, `hits` them by path. */
   jev?: JevResults;
 }
 
@@ -468,7 +580,7 @@ interface JevResults {
   hits: Map<string, JevHit>;
 }
 
-/** Results of a 뜻으로 찾기 whose hits are `hits` (the answer, or it patched after a rename or trash). */
+/** Results of an AI 검색 whose hits are `hits` (the answer, or it patched after a rename or trash). */
 function jevResults(key: string, query: string, scope: string | null, found: JevFound, hits: JevHit[]): Results {
   return {
     key,
@@ -479,9 +591,9 @@ function jevResults(key: string, query: string, scope: string | null, found: Jev
   };
 }
 
-// A 뜻으로 찾기 is not asked again after a change (that costs jev requests): its results follow
-// the change instead, an item renamed here under its new name, one gone (trash, another program)
-// left out.
+// An AI 검색 is not asked again after a change (jev bills it, a local model takes its time): its
+// results follow the change instead, an item renamed here under its new name, one gone (trash,
+// another program, an uninstaller) left out.
 function jevRenamed(r: Results, j: JevResults, from: string, to: string): Results {
   const name = to.slice(to.lastIndexOf("\\") + 1);
   const hits = j.found.items.map((h) => {
@@ -561,7 +673,7 @@ export interface ExplorerProps {
 
 /** One tab: its own history, folder, view, search, selection and tree. */
 export function Explorer({ ref, ...p }: ExplorerProps) {
-  const { id, active, toast, onState, onChanged } = p;
+  const { id, active, toast, onState, onChanged, onAiChanged } = p;
 
   // History and position live in one state so a move never reads a stale position.
   const [nav, setNav] = useState<{ list: string[]; pos: number }>(() => ({ list: [p.initialPath], pos: 0 }));
@@ -572,9 +684,17 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const [listing, setListing] = useState<Listing | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // The search box: its two modes (v0.10), each with its own query and results. "name": the name
+  // search, as one types (`query`, `results`); "ai": AI 검색, on Enter (`aiQuery`, `aiRes`).
+  const [mode, setMode] = useState<"name" | "ai">("name");
   const [query, setQuery] = useState("");
+  const [aiQuery, setAiQuery] = useState("");
   const [scopeHere, setScopeHere] = useState(false);
   const [results, setResults] = useState<Results | null>(null);
+  const [aiRes, setAiRes] = useState<Results | null>(null);
+  // As of the last render, for callbacks made once (navigate) and for live changes.
+  const aiResRef = useRef<Results | null>(null);
+  const modeRef = useRef(mode);
   const [searchNonce, setSearchNonce] = useState(0);
   const shownSearch = useRef("");
   const [editingAddress, setEditingAddress] = useState(false);
@@ -619,8 +739,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const [diff, setDiff] = useState<Compared | null>(null);
   // Where files dropped on this tab go (dropTarget), as of the last render.
   const dropRef = useRef<DropInto | null>(null);
-  // The list's "위험도" column (jev), this tab's own switch; the rows in sight it asks about; a
-  // bump when answers come in.
+  // The list's "위험도" column (the judge: jev or a local model), this tab's own switch; the rows
+  // in sight it asks about; a bump when answers come in.
   const [riskOn, setRiskOn] = useState(false);
   const [range, setRange] = useState<[number, number]>([0, 0]);
   const [riskTick, setRiskTick] = useState(0);
@@ -629,24 +749,35 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const planning = useRef(false);
   // "보내기" in an AI preview: what goes is being made again to compare with what was shown.
   const [sendCheck, setSendCheck] = useState(false);
-  // v0.9: the search box's "뜻으로" (jev), this tab's own switch. While it is on, typing searches
-  // nothing (every run costs jev requests): Enter asks (runJev). `jevAgreed`: what goes was said
-  // once in this tab ("보내기 전에 미리 보기"). `jevRun`: the run out, kept until it ends even once
-  // the tab stopped waiting for it (Esc): what it sent is billed either way, and the next Enter
-  // waits for it rather than sending alongside it. `jevBusy`: the tab waits for the run that
-  // `jevReq` names (bumped, its answer is dropped); `jevQueued`: for the one before it to end.
-  // `jevLow`: the hits under JEV_SHOW show too.
-  const [meaningOn, setMeaningOn] = useState(false);
-  const jevAgreed = useRef(false);
-  const jevRun = useRef<{ key: string; done: Promise<JevFound> } | null>(null);
+  // v0.9: AI 검색, the search box's "AI" mode. Typing searches nothing (jev bills each run, a
+  // local model takes its time): Enter asks (runAi). `aiAgreed`: where what goes was said to go,
+  // once in this tab ("보내기 전에 미리 보기"; judgeTarget). The run itself is aiRun (one for the
+  // window). `jevBusy`: the tab waits for the run that `jevReq` names (bumped, its answer is
+  // dropped); `jevQueued`: for the one before it to end; `aiWait`: that run's key. `aiStopping`:
+  // the stop button (or Esc) asked it to stop; what was answered comes once the request out ends.
+  // `aiProgress`: its requests answered (a local model's: candidates). `aiEngine`: the judge it asked. `jevLow`: the hits under
+  // JEV_SHOW show too.
+  const aiAgreed = useRef<string | null>(null);
   const jevReq = useRef(0);
+  const aiWait = useRef<string | null>(null);
   const [jevBusy, setJevBusy] = useState(false);
   const [jevQueued, setJevQueued] = useState(false);
+  const [aiStopping, setAiStopping] = useState(false);
+  const [aiProgress, setAiProgress] = useState<FindProgress | null>(null);
+  const [aiEngine, setAiEngine] = useState<JudgeEngine>("jev");
   const [jevLow, setJevLow] = useState(false);
+  // v0.10: the installed program a folder of the menu is ("제거 (제어판처럼)…"), as program_at
+  // answered; an uninstaller being started.
+  const [menuProg, setMenuProg] = useState<{ path: string; prog: ProgramRef | null } | null>(null);
+  const progReq = useRef(0);
+  const [uninstalling, setUninstalling] = useState(false);
 
+  // Opening a folder leaves the name search; AI 검색's results give way to the folder too (they
+  // are kept: "AI" shows them again), while with none on screen the box stays in AI mode.
   const navigate = useCallback((to: string) => {
     const target = normalizePath(to);
     setQuery("");
+    if (modeRef.current === "ai" && aiResRef.current) setMode("name");
     if (!target) return;
     // Opening the folder already shown adds no history entry (Back would seem to do nothing).
     setNav((n) =>
@@ -663,6 +794,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       return p >= 0 && p < n.list.length ? { ...n, pos: p } : n;
     });
     setQuery("");
+    if (modeRef.current === "ai" && aiResRef.current) setMode("name");
   }, []);
 
   // Reads a folder this account may not open through the admin session. `ask`: the user asked
@@ -754,9 +886,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const activeRef = useRef(active);
   const busyRef = useRef(false);
   const dialogRef = useRef(dialog);
-  // "뜻으로" on: name searches neither run nor land.
-  const meaningRef = useRef(meaningOn);
-  // A 뜻으로 찾기's answer on screen, for live changes (apply).
+  // An AI 검색's answer, shown or kept for the "AI" mode, for live changes (apply).
   const jevShown = useRef<JevResults | null>(null);
   useLayoutEffect(() => {
     pathRef.current = path;
@@ -766,8 +896,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     activeRef.current = active;
     busyRef.current = confirmTrash !== null || dialog !== null;
     dialogRef.current = dialog;
-    meaningRef.current = meaningOn;
-    jevShown.current = results?.jev ?? null;
+    // In AI mode name searches neither run again for changes nor land.
+    modeRef.current = mode;
+    aiResRef.current = aiRes;
+    jevShown.current = aiRes?.jev ?? null;
   });
 
   // Search runs. Typing (or a scan, rename, trash) starts one at once. A live re-run waits for
@@ -785,8 +917,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       s.busy++;
       try {
         const r = await api.search(q, scope);
-        // An older run's answer, or one for a query or scope no longer shown, or "뜻으로" came on.
-        if (seq < s.shown || key !== searchKey.current || meaningRef.current) return;
+        // An older run's answer, or one for a query or scope no longer shown, or the box turned to AI.
+        if (seq < s.shown || key !== searchKey.current || modeRef.current === "ai") return;
         s.shown = seq;
         setResults({ key, items: r.items, total: r.total, ms: r.elapsed_ms });
         if (key !== shownSearch.current) {
@@ -797,7 +929,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         }
       } catch (e) {
         // A live re-run fails quietly; the next change tries again.
-        if (!live && key === searchKey.current && !meaningRef.current) toast(String(e), "error");
+        if (!live && key === searchKey.current && modeRef.current === "name") toast(String(e), "error");
       } finally {
         s.busy--;
         s.ended = Date.now();
@@ -813,8 +945,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     const s = searchRuns.current;
     if (!s.wanted || s.busy || s.timer !== null || document.hidden || !activeRef.current) return;
     const q = queryRef.current.trim();
-    // A 뜻으로 찾기 is not run again by itself: each run costs jev requests.
-    if (!q || meaningRef.current) {
+    // In AI mode the name search waits: it runs again as the box turns back to 이름. (An AI 검색 is
+    // never run again by itself.)
+    if (!q || modeRef.current === "ai") {
       s.wanted = false;
       return;
     }
@@ -833,23 +966,36 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     pumpRef.current = pumpSearch;
   }, [pumpSearch]);
 
-  // Search as you type; with "뜻으로" on, only on Enter (runJev).
+  // The name search as you type, in 이름 mode (again as the box turns back to it); AI 검색 only on
+  // Enter (runAi).
   useEffect(() => {
+    if (mode === "ai") return;
     const q = query.trim();
     if (!q) {
       setResults(null);
       shownSearch.current = "";
-      // The box was emptied (Esc, another folder): a 뜻으로 찾기 still out is not waited for. It
-      // runs to its end all the same (jevRun): what it sent is billed.
-      jevReq.current++;
-      setJevBusy(false);
-      setJevQueued(false);
       return;
     }
-    if (meaningOn) return;
     const t = setTimeout(() => runSearch(q, under, false), 120);
     return () => clearTimeout(t);
-  }, [query, under, searchNonce, runSearch, meaningOn]);
+  }, [query, under, searchNonce, runSearch, mode]);
+
+  // The AI box emptied (Esc, cleared by hand): its results go and the run out is not waited for.
+  // It is stopped once no tab waits for it (what it already sent to jev is billed).
+  useEffect(() => {
+    if (aiQuery.trim()) return;
+    setAiRes(null);
+    jevReq.current++;
+    aiWait.current = null;
+    leaveAiRun(id);
+    setJevBusy(false);
+    setJevQueued(false);
+    setAiStopping(false);
+    setAiProgress(null);
+  }, [aiQuery, id]);
+
+  // A tab closed: the run it waited for is stopped when no other tab waits for it.
+  useEffect(() => () => leaveAiRun(id), [id]);
 
   // The folder shown is gone (removed, or renamed by another program): the nearest folder above
   // it that is still there takes its place in the history, so Back does not lead to it again.
@@ -948,8 +1094,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     search: false,
   });
 
-  // A 뜻으로 찾기's hits in folders that changed (another program, Windows' own menu, a move):
-  // looked for on disk, a batch at a time, and left out once gone. jev is not asked again.
+  // An AI 검색's hits in folders that changed (another program, Windows' own menu, a move, an
+  // uninstaller): looked for on disk, a batch at a time, and left out once gone. The judge is not
+  // asked again.
   const jevGone = useRef({ busy: false, paths: new Set<string>() });
   const checkJevGone = useCallback(async () => {
     const s = jevGone.current;
@@ -962,7 +1109,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         // Not readable is not gone.
         const kinds = await Promise.all(paths.map((p) => places.pathKind(p).catch(() => "file" as const)));
         const gone = paths.filter((_, i) => kinds[i] === "gone");
-        if (gone.length) setResults((r) => (r?.jev ? jevWithout(r, r.jev, gone) : r));
+        if (gone.length) setAiRes((r) => (r?.jev ? jevWithout(r, r.jev, gone) : r));
       }
     } finally {
       s.busy = false;
@@ -1021,8 +1168,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           }
         }
       }
-      // A 뜻으로 찾기 is not run again for changes (each run costs jev requests).
-      if (queryRef.current.trim() && !meaningRef.current) {
+      // An AI 검색 is not run again for changes; the name search not while the box is in AI mode
+      // (it runs again as the box turns back to 이름).
+      if (queryRef.current.trim() && modeRef.current === "name") {
         // A search of one folder only cares about changes in it, or to it.
         const scope = underRef.current === null ? null : pathKey(underRef.current);
         const touched =
@@ -1096,7 +1244,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
 
   useEffect(() => onState(id, path, view), [onState, id, path, view]);
 
-  const searching = results !== null;
+  // The results the box's mode shows: the name search's, or AI 검색's (kept while 이름 shows).
+  const aiMode = mode === "ai";
+  const shownRes = aiMode ? aiRes : results;
+  const searching = shownRes !== null;
   // The listing still on screen may be the previous folder's while the new one loads
   // (a slow network drive can take a minute): show nothing of it rather than act on it.
   const fresh = listing !== null && sameListing(listing.path, path) ? listing : null;
@@ -1131,9 +1282,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       removed: root.children.filter((c) => c.status === "removed"),
     };
   }, [compared]);
-  // A 뜻으로 찾기's answer on screen (v0.9).
-  const jevRes = results?.jev ?? null;
-  // Sorting by the change needs the column, and by 일치도 a 뜻으로 찾기's results; without them the
+  // An AI 검색's answer on screen (v0.9), and who judged it.
+  const jevRes = shownRes?.jev ?? null;
+  const jevEngine = jevRes ? engineOf(jevRes.found) : "jev";
+  // Sorting by the change needs the column, and by 일치도 an AI 검색's results; without them the
   // list goes by size.
   const sortKey = (sort.key === "change" && !diffWanted) || (sort.key === "score" && !jevRes) ? "size" : sort.key;
   const changeSort = useMemo(
@@ -1158,8 +1310,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     [jevRes],
   );
   const rows = useMemo(() => {
-    let list = searching ? results!.items : (fresh?.entries ?? adminEntries ?? []);
-    // A 뜻으로 찾기 shows the hits jev scored under JEV_SHOW only when asked to ("50% 미만도 보기").
+    let list = shownRes ? shownRes.items : (fresh?.entries ?? adminEntries ?? []);
+    // An AI 검색 shows the hits scored under JEV_SHOW only when asked to ("40% 미만도 보기").
     if (jevRes && !jevLow) list = list.filter((e) => (jevRes.hits.get(e.path)?.score ?? 0) >= JEV_SHOW);
     const dir = sort.desc ? -1 : 1;
     const by = sortKey === "change" ? changeSort! : sortKey === "score" ? scoreSort : SORTERS[sortKey];
@@ -1168,8 +1320,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       if ((sortKey === "name" || sortKey === "type") && a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       return by(a, b) * dir || cmp(a.name, b.name);
     });
-  }, [searching, results, fresh, adminEntries, sort.desc, sortKey, changeSort, jevRes, jevLow, scoreSort]);
-  // Hits a 뜻으로 찾기 shows at first, and those it keeps back.
+  }, [shownRes, fresh, adminEntries, sort.desc, sortKey, changeSort, jevRes, jevLow, scoreSort]);
+  // Hits an AI 검색 shows at first, and those it keeps back.
   const jevMatched = jevRes ? jevRes.found.items.filter((h) => h.score >= JEV_SHOW).length : 0;
   const jevHidden = jevRes ? jevRes.found.items.length - jevMatched : 0;
 
@@ -1233,15 +1385,26 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     };
   };
 
-  // The list's "위험도" column: jev's answer for the rows in sight of a folder's listing (not search
-  // results, nor a folder read with administrator rights), asked for in the background a moment
-  // after they come into sight. The list never waits for it, and a failed request shows nothing.
-  const jevOk = jevReady(p.ai);
-  const riskShown = riskOn && jevOk && view === "list" && !searching && !readOnly;
+  // The list's "위험도" column: the judge's answer (jev, or a local model) for the rows in sight of
+  // a folder's listing (not search results, nor a folder read with administrator rights), asked
+  // for in the background a moment after they come into sight. The list never waits for it, and a
+  // failed request shows nothing.
+  const judgeOk = judgeReady(p.ai);
+  const judge: JudgeEngine = p.ai ? judgeOf(p.ai.settings) : "jev";
+  // The local model's Ollama address when it is another computer's (what is judged goes there);
+  // null for jev and for this PC. What the app says about "이 PC" depends on it.
+  const judgeAway = p.ai ? judgeRemote(p.ai.settings) : null;
+  // Answers are kept by the judge that gave them: another engine, model or address asks again.
+  const riskJudge = p.ai && judgeOk ? judgeKey(p.ai.settings) : "";
+  const riskShown = riskOn && judgeOk && view === "list" && !searching && !readOnly;
   const riskWanted = riskShown && active && fresh !== null;
   const riskAsking = useRef(new Set<string>());
   const riskBusy = useRef(false);
   const riskPausedUntil = useRef(0);
+  // v0.10: why the last request failed, said once (a local model's "Ollama가 꺼져 있어요").
+  const riskError = useRef<string | null>(null);
+  // Where the column's requests were said to go when it was turned on (judgeTarget; null: this PC).
+  const riskAgreed = useRef<string | null>(null);
   const onRange = useCallback(
     (first: number, last: number) => setRange((r) => (r[0] === first && r[1] === last ? r : [first, last])),
     [],
@@ -1256,70 +1419,112 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         setRiskTick((n) => n + 1);
         return;
       }
+      const keyOf = (at: string) => `${riskJudge}\n${pathKey(at)}`;
       const want: string[] = [];
       for (const e of rows.slice(range[0], range[1])) {
-        const k = pathKey(e.path);
+        const k = keyOf(e.path);
         if (riskKnown(k) || riskAsking.current.has(k)) continue;
         want.push(e.path);
-        if (want.length >= RISK_BATCH) break;
+        if (want.length >= RISK_BATCH[judge]) break;
       }
       if (!want.length) return;
-      const keys = want.map(pathKey);
+      const keys = want.map(keyOf);
       riskBusy.current = true;
-      for (const k of keys) riskAsking.current.add(k);
-      setRiskTick((n) => n + 1);
-      ai.jevRisk(want)
-        .then(
-          (list) => {
-            const got = new Map(list.map((r) => [pathKey(r.path), r]));
-            for (const k of keys) rememberRisk(k, got.get(k) ?? null);
-          },
-          () => {
-            for (const k of keys) rememberRisk(k, null);
-            riskPausedUntil.current = Date.now() + RISK_PAUSE_MS;
-          },
-        )
-        .finally(() => {
+      // The backend asks the judge the settings name when the request goes, and they may have
+      // changed since this tab read them (AI 설정 saves with its window open, another window): read
+      // again first. Another judge (engine, model, address), or a destination not said when the
+      // column was turned on: nothing goes, App reads them again, and the column follows (asks the
+      // new judge, or turns off and says why).
+      const agreed = riskAgreed.current;
+      const send = async () => {
+        let s: AiConfig;
+        try {
+          s = await ai.getSettings();
+        } catch {
+          // Not known now: asked again after the pause, as after a failed request.
+          riskPausedUntil.current = Date.now() + RISK_PAUSE_MS;
+          return;
+        }
+        const target = judgeTarget(s);
+        if (judgeKey(s) !== riskJudge || (s.confirm_before_send && target !== null && target !== agreed)) {
+          onAiChanged();
+          return "moved";
+        }
+        for (const k of keys) riskAsking.current.add(k);
+        setRiskTick((n) => n + 1);
+        try {
+          const list = await ai.jevRisk(want);
+          riskError.current = null;
+          const got = new Map(list.map((r) => [keyOf(r.path), r]));
+          for (const k of keys) rememberRisk(k, got.get(k) ?? null);
+        } catch (err) {
+          for (const k of keys) rememberRisk(k, null);
+          riskPausedUntil.current = Date.now() + RISK_PAUSE_MS;
+          // The list shows nothing for it; the reason is said once, not on every try again.
+          const why = String(err);
+          if (why !== riskError.current) {
+            riskError.current = why;
+            toast(`위험도를 받지 못했어요: ${why}`, "error");
+          }
+        } finally {
           for (const k of keys) riskAsking.current.delete(k);
-          riskBusy.current = false;
-          // Shown, and the next rows in sight (scrolled meanwhile) asked about.
-          setRiskTick((n) => n + 1);
-        });
+        }
+      };
+      void send().then((r) => {
+        riskBusy.current = false;
+        // Shown, and the next rows in sight (scrolled meanwhile) asked about. Moved to another
+        // judge: once App has read the settings again (riskJudge, or the column turned off).
+        if (r !== "moved") setRiskTick((n) => n + 1);
+      });
     }, Math.max(400, pause + 50));
     return () => clearTimeout(t);
-  }, [riskWanted, rows, range, riskTick]);
+  }, [riskWanted, rows, range, riskTick, riskJudge, judge, toast, onAiChanged]);
   const riskCell = (e: Entry): RiskCell => {
-    const k = pathKey(e.path);
+    const k = `${riskJudge}\n${pathKey(e.path)}`;
     if (riskAsking.current.has(k)) return "asking";
     return riskCache.get(k)?.risk ?? null;
   };
-  // jev turned off in the settings, or its key removed: the column goes, and comes back off; so
-  // does "뜻으로", with its results (the box's name search runs again), and the question about
-  // turning either on, if open ("켜기" there would turn on a switch no longer shown).
+  // The judge turned off in the settings, or not ready any more (its key removed, no model): the
+  // column goes, and comes back off; the box turns back to 이름 (AI 검색's results are kept for
+  // when a judge is ready again), the run it waited for is not waited for, and the question about
+  // turning either on, if open, closes ("켜기" there would turn on what cannot run).
   useEffect(() => {
-    if (jevOk) return;
+    if (judgeOk) return;
     setRiskOn(false);
-    setMeaningOn(false);
     jevReq.current++;
+    aiWait.current = null;
+    leaveAiRun(id);
     setJevBusy(false);
     setJevQueued(false);
-    setResults((r) => (r?.jev ? null : r));
-    setDialog((d) => (d?.kind === "jevAsk" || d?.kind === "jevFindAsk" ? null : d));
-  }, [jevOk]);
+    setAiStopping(false);
+    setAiProgress(null);
+    if (modeRef.current === "ai") setMode("name");
+    setDialog((d) => (d?.kind === "riskAsk" || d?.kind === "aiFindAsk" ? null : d));
+  }, [judgeOk, id]);
+  // Another judge chosen while the column is on (jev, a local model, another address): when what it
+  // sends would now go where it was not said to, the column comes back off (turned on again, it says).
+  useEffect(() => {
+    if (!riskOn || !p.ai) return;
+    const target = judgeTarget(p.ai.settings);
+    if (!p.ai.settings.confirm_before_send || target === null || target === riskAgreed.current) return;
+    setRiskOn(false);
+    // Every tab with the column on turns it off; only the one shown says so (one toast, not one a tab).
+    if (activeRef.current) toast("판정 엔진이 바뀌어서 위험도를 껐어요. 다시 켜면 어디로 보내는지 먼저 물어요");
+  }, [riskOn, p.ai, toast]);
 
   const columnsShown = useMemo(() => {
-    if (searching) return jevRes ? JEV_COLUMNS : SEARCH_COLUMNS;
+    if (searching) return jevRes ? AI_COLUMNS[jevEngine] : SEARCH_COLUMNS;
     const base = diffWanted ? FOLDER_DIFF_COLUMNS : FOLDER_COLUMNS;
-    return riskShown ? [...base, RISK_COLUMN] : base;
-  }, [searching, jevRes, diffWanted, riskShown]);
+    return riskShown ? [...base, judge === "ollama" ? RISK_COLUMN_LOCAL : RISK_COLUMN] : base;
+  }, [searching, jevRes, jevEngine, diffWanted, riskShown, judge]);
 
-  // A row's 일치도, and the program or game jev found in that folder.
+  // A row's 일치도, and the program or game the judge found in that folder.
   const scoreCell = (e: Entry): ScoreCell | undefined => {
     const h = jevRes?.hits.get(e.path);
-    return h && { score: h.score, label: h.label };
+    return h && { score: h.score, label: h.label, by: JUDGE_NAME[jevEngine] };
   };
   const aliasOf = (e: Entry) => jevRes?.hits.get(e.path)?.label;
-  // The size bar of a 뜻으로 찾기's rows (by score, not size): the biggest of them.
+  // The size bar of an AI 검색's rows (by score, not size): the biggest of them.
   const jevBar = useMemo(() => (jevRes ? rows.reduce((m, e) => Math.max(m, e.size), 0) : 0), [jevRes, rows]);
 
   /**
@@ -1342,105 +1547,254 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       setRiskOn(false);
       return;
     }
+    riskError.current = null;
     const now = await freshAi();
-    if (!jevReady(now)) {
-      toast(now ? "jev 위험도가 꺼져 있거나 jev 키가 없어요. AI 설정에서 확인해 주세요" : "AI 설정을 읽지 못했어요. 잠시 뒤에 다시 해 주세요");
+    if (!judgeReady(now)) {
+      toast(judgeBlocker(now));
       return;
     }
     if (!activeRef.current || busyRef.current) return;
-    // What is sent, and to whom, is said first when the settings ask for it.
-    if (now.settings.confirm_before_send) openDialog({ kind: "jevAsk" });
-    else setRiskOn(true);
+    // What is sent, and to whom, is said first when the settings ask for it and it leaves this PC
+    // (a model on this PC sends nothing out).
+    const target = judgeTarget(now.settings);
+    if (now.settings.confirm_before_send && target !== null) {
+      openDialog({ kind: "riskAsk", engine: judgeOf(now.settings), url: (now.settings.ollama_url ?? "").trim(), target });
+    } else {
+      riskAgreed.current = target;
+      setRiskOn(true);
+    }
   };
 
-  // ---- v0.9: 뜻으로 찾기 (jev) ----
+  // ---- v0.9: AI 검색, the box's "AI" mode (v0.9 "뜻으로 찾기"; v0.10 jev or a local model) ----
 
-  // On: name search results give way (the list shows the folder until Enter), and the box takes
-  // the keyboard.
-  const startMeaning = () => {
-    setMeaningOn(true);
-    setResults(null);
-    shownSearch.current = "";
+  // New AI results came while the box showed 이름: they are ordered by 일치도 once AI shows them.
+  const aiSortDue = useRef(false);
+  /** New AI results on screen: ordered by 일치도, the selection starts over. */
+  const primeAiView = (key: string) => {
+    shownSearch.current = key;
+    setSelected(new Set());
+    setFocusPath(null);
+    anchor.current = null;
+    setSort({ key: "score", desc: true });
+    aiSortDue.current = false;
   };
-  // Off: back to the name search of what the box holds (the search effect runs it). A run still
-  // out is not waited for; it ends by itself (jevRun).
-  const stopMeaning = () => {
-    setMeaningOn(false);
-    jevReq.current++;
-    setJevBusy(false);
-    setJevQueued(false);
-    setResults((r) => (r?.jev ? null : r));
+
+  // switchMode asks for the box's focus (below).
+  const boxFocus = useRef(false);
+  /**
+   * The box turns to `to`: its text and results are that mode's own (이름's search runs again as it
+   * comes back, as live changes may have come meanwhile). The selection starts over.
+   */
+  const switchMode = (to: "name" | "ai") => {
+    setMode(to);
+    setSelected(new Set());
+    setFocusPath(null);
+    anchor.current = null;
+    // AI's as of now (an answer may have come while the settings were read).
+    const kept = aiResRef.current;
+    shownSearch.current = (to === "ai" ? kept?.key : results?.key) ?? "";
+    if (to === "ai" && aiSortDue.current && kept) primeAiView(kept.key);
+    boxFocus.current = true;
   };
+  // The box takes the keyboard once the mode shows: after a dialog that closed meanwhile gave the
+  // focus back to where it was.
   useEffect(() => {
-    if (meaningOn) searchBox.current?.focus();
-  }, [meaningOn]);
+    if (!boxFocus.current) return;
+    boxFocus.current = false;
+    searchBox.current?.focus();
+  });
 
-  /** The search box's "뜻으로". Turned on the first time in this tab, it says what goes when the settings ask for it. */
-  const toggleMeaning = async () => {
-    if (meaningOn) {
-      stopMeaning();
-      return;
-    }
-    const now = await freshAi();
-    if (!jevReady(now)) {
-      toast(now ? "jev가 꺼져 있거나 jev 키가 없어요. AI 설정에서 확인해 주세요" : "AI 설정을 읽지 못했어요. 잠시 뒤에 다시 해 주세요");
-      return;
-    }
-    if (!activeRef.current || busyRef.current) return;
-    if (now.settings.confirm_before_send && !jevAgreed.current) openDialog({ kind: "jevFindAsk" });
-    else startMeaning();
+  /** The question to ask before AI 검색 sends to `s`'s judge (jev, an Ollama elsewhere), or null when none is due. */
+  const findAsk = (s: AiState, run: boolean): TabDialog | null => {
+    const target = judgeTarget(s.settings);
+    if (!s.settings.confirm_before_send || target === null || aiAgreed.current === target) return null;
+    // "바뀌었어요" only when another destination was said before (not when none was asked about:
+    // "미리 보기" was off, or the model was on this PC).
+    const changed = run && aiAgreed.current !== null;
+    return { kind: "aiFindAsk", engine: judgeOf(s.settings), url: (s.settings.ollama_url ?? "").trim(), target, run, changed };
   };
 
   /**
-   * Enter with "뜻으로" on: asks jev what the box holds, within "이 폴더만" when it is on. The best
-   * hits come first. One run at a time, per tab: emptying the box (Esc) stops waiting for it, not
-   * the run, so asking the same again waits for that run (sent once, billed once), and asking
-   * something else starts once it ended.
+   * The box's [이름 | AI] (Ctrl+F, Ctrl+Shift+F). AI with no judge ready says the two ways to get
+   * one; the first time in this tab it says what goes where, when the settings ask for it (not for
+   * a model on this PC: nothing leaves it).
    */
-  const runJev = async () => {
-    const q = query.trim();
+  const selectMode = async (to: "name" | "ai") => {
+    if (to === modeRef.current) {
+      searchBox.current?.focus();
+      return;
+    }
+    if (to === "name") {
+      switchMode("name");
+      return;
+    }
+    const now = await freshAi();
+    if (!activeRef.current || busyRef.current) return;
+    if (!judgeReady(now)) {
+      openDialog({ kind: "aiHow", why: judgeBlocker(now) });
+      return;
+    }
+    const ask = findAsk(now, false);
+    if (ask) openDialog(ask);
+    else switchMode("ai");
+  };
+
+  /** This tab alone waits for the run out (the one it asked for): stopping it stops the run. */
+  const aiAlone = () => {
+    const run = aiRun.current;
+    return !!run && run.key === aiWait.current && run.waiters.has(id) && run.waiters.size === 1;
+  };
+  // Another tab came to wait for the same run, or left it: the stop button says again what it does.
+  const [, setAiRunSeen] = useState(0);
+  useEffect(() => {
+    if (!jevBusy) return;
+    const seen = () => setAiRunSeen((n) => n + 1);
+    aiRun.watch.add(seen);
+    return () => void aiRun.watch.delete(seen);
+  }, [jevBusy]);
+
+  /** Stops waiting for the run out (its answer is dropped); it is stopped once no tab waits for it. */
+  const quitAiWait = () => {
+    jevReq.current++;
+    aiWait.current = null;
+    leaveAiRun(id);
+    setJevBusy(false);
+    setJevQueued(false);
+    setAiStopping(false);
+    setAiProgress(null);
+  };
+
+  /**
+   * The stop button, and Esc while asking: the run this tab waits for stops before its next request
+   * (the one out finishes), and what was answered comes in, marked "멈췄어요". When another tab waits
+   * for it too, or it was asked to stop already, or another run is ahead of it, this tab only stops
+   * waiting.
+   */
+  const stopAi = () => {
+    if (jevBusy && !jevQueued && !aiStopping && aiAlone()) {
+      setAiStopping(true);
+      ai.findCancel().catch((err) => toast(String(err), "error"));
+      return;
+    }
+    quitAiWait();
+  };
+
+  // The run's requests as they are answered ("ai-find-progress": jev's batches, a local model's
+  // candidates one by one), for the run this tab waits for.
+  useEffect(() => {
+    if (!jevBusy || jevQueued) return;
+    let dead = false;
+    let off: (() => void) | undefined;
+    aiEvents
+      .findProgress((pr) => {
+        if (aiRun.current && aiRun.current.key === aiWait.current) setAiProgress(pr);
+      })
+      .then(
+        (u) => (dead ? u() : (off = u)),
+        () => {},
+      );
+    return () => {
+      dead = true;
+      off?.();
+    };
+  }, [jevBusy, jevQueued]);
+
+  /**
+   * Enter in AI mode: asks the judge about what the box holds, within "이 폴더만" when it is on.
+   * The best hits come first. One run at a time for the window (aiRun): the same search out is
+   * waited for (sent once, billed once), another one waits for it to end. A new Enter stops waiting
+   * for this tab's run before; emptying the box (Esc) too.
+   */
+  const runAi = async () => {
+    const q = aiQuery.trim();
     if (!q) return;
+    const s = p.ai;
+    if (!judgeReady(s)) {
+      openDialog({ kind: "aiHow", why: judgeBlocker(s) });
+      return;
+    }
+    // The judge's destination changed since it was said (the settings, another window): said again.
+    const ask = findAsk(s, true);
+    if (ask) {
+      openDialog(ask);
+      return;
+    }
+    let engine = judgeOf(s.settings);
     const scope = under;
-    const key = `jev:${q}\n${scope ?? ""}`;
+    const keyOf = (c: AiConfig) => `ai:${judgeKey(c)}:${q}\n${scope ?? ""}`;
+    let key = keyOf(s.settings);
+    if (aiWait.current !== null && aiWait.current !== key) leaveAiRun(id);
     const req = ++jevReq.current;
+    aiWait.current = key;
     setJevBusy(true);
+    setAiStopping(false);
+    setAiProgress(null);
+    setAiEngine(engine);
     try {
-      // Another search still out (the tab stopped waiting for it): this one goes once it ended,
-      // never alongside it.
-      while (jevRun.current && jevRun.current.key !== key) {
-        setJevQueued(true);
-        await jevRun.current.done.catch(() => {});
+      let run = aiRun.current;
+      for (;;) {
+        // Another search still out: this one goes once it ended, never alongside it.
+        while (aiRun.current && aiRun.current.key !== key) {
+          setJevQueued(true);
+          await aiRun.current.done.catch(() => {});
+          if (req !== jevReq.current) return;
+        }
+        setJevQueued(false);
+        // The same search still out: its answer, not a second run.
+        run = aiRun.current;
+        if (run) break;
+        // About to send. The backend asks the judge the settings name then, and they may have
+        // changed since Enter (above all while it waited: AI 설정 saved, another window): read
+        // again, and nothing goes to a destination not said. Another judge said or not asked
+        // about (another model, a model on this PC): this search is asked of it.
+        const now = await freshAi();
         if (req !== jevReq.current) return;
-      }
-      setJevQueued(false);
-      // The same search still out: its answer, not a second run billed again.
-      let run = jevRun.current;
-      if (!run) {
-        const mine = { key, done: ai.jevFind(q, scope) };
-        jevRun.current = run = mine;
+        if (!judgeReady(now)) {
+          toast(judgeBlocker(now));
+          return;
+        }
+        const again = findAsk(now, true);
+        if (again) {
+          // The question is this tab's: asked when it is shown with no other dialog, else said.
+          if (activeRef.current && !busyRef.current) openDialog(again);
+          else toast("판정 엔진이나 보낼 곳이 바뀌어서 AI 검색을 보내지 않았어요. 다시 Enter를 눌러 주세요");
+          return;
+        }
+        engine = judgeOf(now.settings);
+        key = keyOf(now.settings);
+        aiWait.current = key;
+        setAiEngine(engine);
+        // Another tab may have sent one while the settings were read: looked at again.
+        if (aiRun.current) continue;
+        const mine = { key, done: ai.jevFind(q, scope), waiters: new Set<number>() };
+        aiRun.current = run = mine;
         void mine.done
           .finally(() => {
-            if (jevRun.current === mine) jevRun.current = null;
+            if (aiRun.current === mine) aiRun.current = null;
           })
           .catch(() => {});
+        break;
       }
+      run.waiters.add(id);
+      aiRunChanged();
       const found = await run.done;
       if (req !== jevReq.current) return;
-      setResults(jevResults(key, q, scope, found, found.items));
-      if (key !== shownSearch.current) {
-        shownSearch.current = key;
-        setSelected(new Set());
-        setFocusPath(null);
-        anchor.current = null;
+      const isNew = key !== aiResRef.current?.key;
+      setAiRes(jevResults(key, q, scope, found, found.items));
+      if (isNew) {
         setJevLow(false);
-        setSort({ key: "score", desc: true });
+        if (modeRef.current === "ai") primeAiView(key);
+        else aiSortDue.current = true;
       }
     } catch (err) {
       if (req === jevReq.current) toast(String(err), "error");
     } finally {
       if (req === jevReq.current) {
+        aiWait.current = null;
         setJevBusy(false);
         setJevQueued(false);
+        setAiStopping(false);
+        setAiProgress(null);
       }
     }
   };
@@ -1582,7 +1936,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       });
       setFocusPath((f) => (f === e.path ? to : f));
       if (anchor.current === e.path) anchor.current = to;
-      setResults((r) => (r?.jev ? jevRenamed(r, r.jev, e.path, to) : r));
+      setAiRes((r) => (r?.jev ? jevRenamed(r, r.jev, e.path, to) : r));
       onChanged(id, changesOf([parentOf(e.path)], [e.path]));
       setSearchNonce((n) => n + 1);
       refreshTree();
@@ -1611,7 +1965,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         toast(`휴지통으로 ${r.moved.length.toLocaleString()}개 옮겼어요`);
         const moved = new Set(r.moved);
         setSelected((s) => new Set([...s].filter((p) => !moved.has(p))));
-        setResults((res) => (res?.jev ? jevWithout(res, res.jev, r.moved) : res));
+        setAiRes((res) => (res?.jev ? jevWithout(res, res.jev, r.moved) : res));
         // Read focus as it is now: the user may have moved on while the trash ran.
         if (next) {
           setFocusPath((f) => (f !== null && moved.has(f) ? next.path : f));
@@ -1813,9 +2167,11 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     const onKey = (ev: KeyboardEvent) => {
       const t = ev.target as HTMLElement;
       const typing = t instanceof HTMLInputElement ? t.type !== "checkbox" : t.isContentEditable;
-      if (ev.ctrlKey && isLetter(ev, "f")) {
+      // Ctrl+F: the box in 이름 mode; Ctrl+Shift+F: in AI mode (v0.10).
+      if (ev.ctrlKey && !ev.altKey && isLetter(ev, "f")) {
         ev.preventDefault();
-        searchBox.current?.focus();
+        if (ev.repeat) return;
+        void selectMode(ev.shiftKey ? "ai" : "name");
         return;
       }
       if (ev.altKey && ev.key === "ArrowLeft") {
@@ -1940,7 +2296,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   }, [menu]);
 
   // Keep the context menu inside the window: open it above or left of the cursor when it
-  // would not fit below or right of it.
+  // would not fit below or right of it. Again when "제거 (제어판처럼)…" comes in (menuProg), a
+  // moment after it opened.
   const menuItems = selectedEntries.length;
   useLayoutEffect(() => {
     const el = menuBox.current;
@@ -1952,7 +2309,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       at + size <= room - 4 ? at : Math.max(4, at - size);
     el.style.left = `${fit(menu.x, width, window.innerWidth)}px`;
     el.style.top = `${fit(menu.y, height, window.innerHeight)}px`;
-  }, [menu, menuItems, searching]);
+  }, [menu, menuItems, searching, menuProg]);
 
   // The divider between the list and the preview: dragged, it sets the preview's width.
   const startResize = (ev: React.PointerEvent<HTMLDivElement>) => {
@@ -1988,6 +2345,56 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const targetUp = target && !target.is_dir ? parentOf(target.path) : null;
   const targetParent = targetUp && pathKey(targetUp) !== pathKey(path) ? targetUp : null;
   const one = selectedEntries.length === 1 ? selectedEntries[0] : null;
+
+  // v0.10: "제거 (제어판처럼)…" for one folder of the list's menu (a folder's listing or search
+  // results; not a folder read with administrator rights) that is an installed program's own: an
+  // AI 검색 hit says which, else program_at is asked as the menu opens (it keeps its list a minute).
+  const menuFolder = menu && !menu.target && !menu.background && one?.is_dir && !readOnly ? one.path : null;
+  const hitProg = menuFolder ? (jevRes?.hits.get(menuFolder)?.program ?? null) : null;
+  useEffect(() => {
+    if (!menuFolder || hitProg) return;
+    const req = ++progReq.current;
+    v07.programAt(menuFolder).then(
+      (prog) => req === progReq.current && setMenuProg({ path: menuFolder, prog }),
+      () => req === progReq.current && setMenuProg({ path: menuFolder, prog: null }),
+    );
+  }, [menuFolder, hitProg]);
+  const menuProgram = hitProg ?? (menuFolder && menuProg?.path === menuFolder ? menuProg.prog : null);
+
+  /** Starts the program's own uninstaller (programs.rs, as 프로그램 정리 does); the folder is never deleted here. */
+  const runUninstall = async (d: Extract<TabDialog, { kind: "uninstall" }>) => {
+    setDialog(null);
+    if (uninstalling) return;
+    setUninstalling(true);
+    const name = shown(d.prog.name);
+    const store = d.prog.kind === "store";
+    try {
+      await v07.uninstall(d.prog.id);
+      // What the menu knew of the program is not kept: its uninstaller may leave the folder (files
+      // it keeps, or stopped halfway), and the menu then asks program_at again (the backend forgets
+      // its list of installed programs once an uninstaller starts), not the AI 검색 hit's copy.
+      const gone = (h: JevHit) => h.program?.id === d.prog.id;
+      setAiRes((r) => {
+        const j = r?.jev;
+        if (!r || !j || !j.found.items.some(gone)) return r;
+        const hits = j.found.items.map((h) => (gone(h) ? { ...h, program: null } : h));
+        return jevResults(r.key, j.query, j.scope, j.found, hits);
+      });
+      setMenuProg((m) => (m?.prog?.id === d.prog.id ? null : m));
+      // Gone from the disk, the folder leaves the listing and the results by itself (live changes).
+      toast(
+        store
+          ? `"${name}"을(를) 이 사용자에서 제거했어요. 다시 쓰려면 Microsoft Store에서 설치하면 돼요`
+          : `"${name}"의 제거 프로그램을 실행했어요. 뜨는 창의 안내를 따라 주세요. 제거가 끝나 폴더가 없어지면 목록에서도 빠져요`,
+      );
+    } catch (err) {
+      const why = String(err);
+      toast(store ? (why.startsWith("앱을 지우지 못했어요") ? why : `앱을 지우지 못했어요: ${why}`) : `제거 프로그램을 실행하지 못했어요: ${why}`, "error");
+    } finally {
+      setUninstalling(false);
+    }
+  };
+
   const previewEntry = treeShown ? (treeFocus?.e ?? null) : mapShown ? null : (rows[focus] ?? null);
   const previewSized = treeShown ? !!treeFocus?.sized : searching || !!fresh?.indexed;
   // The details pane: several items selected in the list or icons show as one summary.
@@ -2037,7 +2444,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         ? undefined
         : "먼저 항목을 골라 주세요";
   // The command bar folds into "⋯" in a narrow window; measured again when its buttons change.
-  const fold = useFold(cmdBar, `${view}|${jevOk}|${p.planDrafts > 0 ? (p.planDrafts > 99 ? 3 : String(p.planDrafts).length) : 0}`);
+  const fold = useFold(cmdBar, `${view}|${judgeOk}|${p.planDrafts > 0 ? (p.planDrafts > 99 ? 3 : String(p.planDrafts).length) : 0}`);
 
   // The breadcrumbs show their end (the folder shown) when the path is longer than the box.
   useLayoutEffect(() => {
@@ -2270,11 +2677,20 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     : readOnly
       ? "관리자 권한으로 읽는 폴더는 스캔 결과와 비교할 수 없어요"
       : "지난 스캔 뒤로 크기가 얼마나 늘고 줄었는지 보여 주는 열을 더해요";
+  // The stop button of an AI 검색 (stopAi): it stops the run only when this tab alone waits for it.
+  // `aiShared`: another tab waits for the same run.
+  const aiQuitOnly = jevBusy && (jevQueued || aiStopping || !aiAlone());
+  const aiShared =
+    jevBusy && !jevQueued && !aiStopping && aiRun.current?.key === aiWait.current && (aiRun.current?.waiters.size ?? 0) > 1;
   const riskTitle = searching
     ? "검색 결과에는 위험도 열이 없어요"
     : readOnly
-      ? "관리자 권한으로 읽는 폴더는 jev에 묻지 않아요"
-      : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)";
+      ? "관리자 권한으로 읽는 폴더는 위험도를 묻지 않아요"
+      : judge === "ollama"
+        ? judgeAway
+          ? `보이는 항목을 지워도 되는지 Ollama 주소 ${judgeAway}(다른 컴퓨터)의 로컬 모델에 물어 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보를 그 컴퓨터로 보내요)`
+          : "보이는 항목을 지워도 되는지 이 PC의 로컬 모델(Ollama)이 판정해 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보만 줘요)"
+        : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)";
   const aiTitle = readOnly
     ? "관리자 권한으로 읽는 폴더에서는 쓸 수 없어요"
     : aiBlocker(p.ai) === null
@@ -2374,54 +2790,67 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               </div>
             )}
           </form>
-          <div className={`search${jevOk ? " with-jev" : ""}${meaningOn ? " meaning" : ""}${jevBusy ? " busy" : ""}`}>
+          {/* v0.10: one box, two modes: [이름 | AI], each with its own text and results. */}
+          <div className={`search modes${aiMode ? " meaning" : ""}${aiMode && jevBusy ? " busy" : ""}`}>
+            <div className="search-mode" role="group" aria-label="검색 방식">
+              <button
+                type="button"
+                className={aiMode ? undefined : "on"}
+                aria-pressed={!aiMode}
+                onClick={() => void selectMode("name")}
+                {...tip("searchName")}
+              >
+                이름
+              </button>
+              <button
+                type="button"
+                className={`${aiMode ? "on" : ""}${judgeOk ? "" : " not-ready"}`}
+                aria-pressed={aiMode}
+                onClick={() => void selectMode("ai")}
+                {...tip("searchAi", judgeOk ? undefined : `${TIPS.searchAi} · 판정할 AI가 아직 없어요. 누르면 쓰는 방법을 알려 줘요`)}
+              >
+                AI
+              </button>
+            </div>
             <span className="search-icon">
               <Icon.search />
             </span>
             <input
               ref={searchBox}
               aria-label={
-                meaningOn
+                aiMode
                   ? scopeHere
-                    ? "이 폴더에서 뜻으로 찾기 (Enter)"
-                    : "모든 드라이브에서 뜻으로 찾기 (Enter)"
+                    ? "이 폴더에서 AI 검색 (Enter)"
+                    : "모든 드라이브에서 AI 검색 (Enter)"
                   : scopeHere
-                    ? "이 폴더에서 검색"
-                    : "모든 드라이브에서 검색"
+                    ? "이 폴더에서 이름으로 검색"
+                    : "모든 드라이브에서 이름으로 검색"
               }
-              aria-busy={jevBusy || undefined}
-              placeholder={
-                meaningOn
-                  ? "뜻으로 찾기: RPG 게임, 작년에 받은 전세 계약서 (Enter)"
-                  : scopeHere
-                    ? "이 폴더에서 검색 (Ctrl+F)"
-                    : "모든 드라이브에서 검색 (Ctrl+F)"
-              }
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              aria-busy={(aiMode && jevBusy) || undefined}
+              placeholder={aiMode ? "AI 검색: RPG 게임, 작년에 받은 전세 계약서 (Enter)" : "이름으로 검색 (Ctrl+F)"}
+              value={aiMode ? aiQuery : query}
+              onChange={(e) => (aiMode ? setAiQuery : setQuery)(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Escape") setQuery("");
-                // "뜻으로" on: Enter asks jev; typing alone never does, nor a held Enter, nor the
-                // Enter that ends a Hangul syllable being composed.
-                else if (e.key === "Enter" && meaningOn) {
+                if (e.key === "Escape") {
+                  // AI: Esc stops a search out first (what was answered comes in), then empties the box.
+                  if (!aiMode) setQuery("");
+                  else if (jevBusy && !aiStopping) stopAi();
+                  else setAiQuery("");
+                }
+                // AI: Enter asks; typing alone never does, nor a held Enter, nor the Enter that ends a
+                // Hangul syllable being composed.
+                else if (e.key === "Enter" && aiMode) {
                   e.preventDefault();
-                  if (!e.repeat && !e.nativeEvent.isComposing) void runJev();
+                  if (!e.repeat && !e.nativeEvent.isComposing) void runAi();
                 }
               }}
               spellCheck={false}
-              {...tip(meaningOn ? "meaning" : "search")}
+              {...tip(aiMode ? "meaning" : "search")}
             />
             <label className={`scope${scopeHere ? " on" : ""}`} {...tip("searchHere")}>
               <input type="checkbox" checked={scopeHere} onChange={(e) => setScopeHere(e.target.checked)} />
               이 폴더만
             </label>
-            {/* v0.9: jev on in the AI settings, with its key: this tab's 뜻으로 찾기. */}
-            {jevOk && (
-              <label className={`scope meaning${meaningOn ? " on" : ""}`} {...tip("meaning")}>
-                <input type="checkbox" checked={meaningOn} onChange={() => void toggleMeaning()} />
-                뜻으로
-              </label>
-            )}
           </div>
         </div>
 
@@ -2485,8 +2914,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               <span className="cmd-label">변화</span>
             </button>
           )}
-          {/* jev on in the AI settings, with its key: this tab's 위험도 column. */}
-          {fold < 1 && view === "list" && jevOk && (
+          {/* The judge on in the AI settings and ready (jev's key, or a local model): this tab's 위험도 column. */}
+          {fold < 1 && view === "list" && judgeOk && (
             <button
               className={`cmd ${riskOn ? "on" : ""}`}
               aria-pressed={riskOn}
@@ -2545,7 +2974,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                   >
                     <MenuRow check={diffOn} icon={<Icon.diff />} label="변화" />
                   </button>
-                  {jevOk && (
+                  {judgeOk && (
                     <button
                       role="menuitemcheckbox"
                       aria-checked={riskOn}
@@ -2695,28 +3124,63 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         </div>
       )}
 
-      {/* v0.9: "뜻으로" on: what the box does now, the run out, or what the answer shown took the query for. */}
-      {meaningOn && (jevBusy || jevRes || query.trim()) && (
+      {/* v0.9: AI mode: what the box does now, the run out (with its progress and the stop button),
+          or what the answer shown took the query for. */}
+      {aiMode && (jevBusy || jevRes || aiQuery.trim()) && (
         <div className="diff-bar jev-bar" role="status">
           {jevBusy ? (
             <>
-              <b className="jev-asking">jev에 묻는 중…</b>
+              <b className="jev-asking">
+                {aiStopping ? "멈추는 중…" : aiEngine === "ollama" ? "로컬 모델이 판정하는 중…" : "jev에 묻는 중…"}
+                {!jevQueued && aiProgress && aiProgress.total > 0 && (
+                  <span className="jev-progress">
+                    {" "}
+                    {Math.min(aiProgress.done, aiProgress.total)}/{aiProgress.total}
+                  </span>
+                )}
+              </b>
+              {/* As stopAi does: the run stops only when this tab alone waits for it; else this
+                  tab only stops waiting (its results dropped, the run goes on for the others). */}
+              <button
+                type="button"
+                className="btn small jev-stop"
+                title={
+                  aiQuitOnly
+                    ? "이 검색을 그만 기다리고 결과를 버려요 (Esc)"
+                    : "남은 후보는 묻지 않고, 지금까지 확인한 것만 보여요 (Esc)"
+                }
+                onClick={stopAi}
+              >
+                {aiQuitOnly ? "그만 기다리기" : "멈추기"}
+              </button>
               <span className="muted">
                 {jevQueued && "앞에서 보낸 검색이 끝나면 이어서 물어요. "}
-                검색창에서 Esc를 누르면 그만 기다려요. 이미 보낸 요청은 끝까지 가고 요금이 나가요
+                {aiStopping
+                  ? `지금 판정 중인 ${aiEngine === "ollama" ? "항목" : "묶음"}이 끝나면 확인한 것만 보여요`
+                  : aiShared
+                    ? "다른 탭도 이 검색을 기다려요. 그만 기다려도 그 탭의 검색은 계속돼요"
+                    : aiEngine === "ollama"
+                      ? `${judgeAway ? "다른 컴퓨터의 로컬 모델이" : "이 PC에서"} 한 항목씩 판정해서 수십 초 걸릴 수 있어요. 멈추면(Esc) 확인한 것만 보여요`
+                      : "멈추면(Esc) 확인한 것만 보여요. 이미 보낸 요청은 끝까지 가고 요금이 나가요"}
               </span>
             </>
           ) : jevRes ? (
             <JevSummary
               res={jevRes}
-              typed={query.trim() !== jevRes.query}
+              typed={aiQuery.trim() !== jevRes.query}
               moved={under !== jevRes.scope}
               hidden={jevHidden}
               showLow={jevLow}
               onShowLow={setJevLow}
             />
           ) : (
-            <span className="muted">Enter를 누르면 jev에 뜻으로 물어봐요. 글자를 치는 동안에는 보내지 않아요</span>
+            <span className="muted">
+              {judge === "ollama"
+                ? judgeAway
+                  ? `Enter를 누르면 Ollama 주소 ${judgeAway}(다른 컴퓨터)의 로컬 모델에 뜻으로 물어봐요 (요금 없음). 글자를 치는 동안에는 보내지 않아요`
+                  : "Enter를 누르면 로컬 모델이 뜻으로 판정해요 (이 PC에서, 요금 없음). 글자를 치는 동안에는 묻지 않아요"
+                : "Enter를 누르면 jev에 뜻으로 물어봐요. 글자를 치는 동안에는 보내지 않아요"}
+            </span>
           )}
         </div>
       )}
@@ -2805,7 +3269,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           {!treeShown && !gridShown && !mapShown && (
             <FileTable
               entries={rows}
-              resetKey={searching ? `search:${results!.key}` : readOnly ? `admin:${path}` : `dir:${fresh?.path ?? ""}`}
+              resetKey={shownRes ? `search:${shownRes.key}` : readOnly ? `admin:${path}` : `dir:${fresh?.path ?? ""}`}
               columns={columnsShown}
               sort={{ key: sortKey, desc: sort.desc }}
               onSort={(key) =>
@@ -2824,7 +3288,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               onContextMenu={rowMenu}
               renaming={renaming}
               onRenameDone={finishRename}
-              barTotal={jevRes ? jevBar : searching ? (results!.items[0]?.size ?? 0) : total}
+              barTotal={jevRes ? jevBar : shownRes ? (shownRes.items[0]?.size ?? 0) : total}
               sized={searching || !!fresh?.indexed}
               emptyText={emptyText}
               onMiddleClick={(e) => p.onOpenTab(e.path, false)}
@@ -2832,6 +3296,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               dropFolders={!readOnly}
               change={diffWanted ? changeCell : undefined}
               risk={riskShown ? riskCell : undefined}
+              riskEngine={judge}
+              riskRemote={judgeAway}
               onRange={riskShown ? onRange : undefined}
               score={jevRes ? scoreCell : undefined}
               alias={jevRes ? aliasOf : undefined}
@@ -2862,7 +3328,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           {jevRes
             ? jevLine(jevRes.found, jevMatched)
             : searching
-              ? `검색 결과 ${results!.total.toLocaleString()}개${results!.total > results!.items.length ? ` (큰 순서로 ${results!.items.length.toLocaleString()}개 표시)` : ""} · ${results!.ms}ms`
+              ? `검색 결과 ${shownRes!.total.toLocaleString()}개${shownRes!.total > shownRes!.items.length ? ` (큰 순서로 ${shownRes!.items.length.toLocaleString()}개 표시)` : ""} · ${shownRes!.ms}ms`
               : fresh
                 ? `항목 ${rows.length.toLocaleString()}개${fresh.indexed && current ? ` · 전체 ${formatSize(total)}` : ""}`
                 : readOnly
@@ -3049,6 +3515,19 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                 </>
               )}
               <hr />
+              {/* v0.10: the folder is an installed program's own: its uninstaller, as in 제어판. */}
+              {one && menuProgram && (
+                <button
+                  disabled={!menuProgram.can_uninstall || uninstalling}
+                  onClick={() => openDialog({ kind: "uninstall", prog: menuProgram, path: one.path })}
+                  {...tip("uninstallHere", uninstallNote(menuProgram))}
+                >
+                  제거 (제어판처럼)…
+                  <span className="menu-note">
+                    {uninstalling ? "제거 프로그램을 실행하는 중…" : uninstallNote(menuProgram)}
+                  </span>
+                </button>
+              )}
               <button
                 className="danger"
                 disabled={trashLock.busy}
@@ -3125,9 +3604,19 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       )}
       {dialog?.kind === "aiSettings" && (
         <AiSettings
+          // Saved with the window still open: App reads them now, not once it closes (위험도 that is
+          // on follows at once: another judge asked, or the column off when it would go elsewhere).
+          onSaved={p.onAiChanged}
           onClose={() => {
+            const thenAi = dialog.thenAi;
             setDialog(null);
             p.onAiChanged();
+            // Opened from AI 검색's "AI 설정 열기": with a judge ready now, the box turns to AI.
+            if (thenAi) {
+              void freshAi().then((now) => {
+                if (judgeReady(now)) void selectMode("ai");
+              });
+            }
           }}
         />
       )}
@@ -3176,17 +3665,39 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           </div>
         </Dialog>
       )}
-      {dialog?.kind === "jevAsk" && (
-        <Dialog className="ai-preview" title="jev 위험도를 볼까요?" onClose={() => setDialog(null)} onBackdrop={() => setDialog(null)}>
-          <h3>jev 위험도를 볼까요?</h3>
-          <p>
-            켜 두는 동안 이 탭의 목록에 보이는 항목(한 번에 {RISK_BATCH}개까지)의 경로, 이름, 종류, 크기, 날짜, 분류를 TypeSafe jev로
-            보내 위험도를 받아요. 다른 폴더로 가면 그 폴더에서 보이는 항목도 보내요.
-          </p>
-          <p className="muted">
-            파일 내용은 보내지 않아요. 내 jev API 키로 보내고, 받은 위험도는 참고용이에요. 한 번 받은 항목은 앱을 끌 때까지 다시
-            묻지 않아요. 끄려면 툴바의 "위험도"를 한 번 더 누르세요.
-          </p>
+      {dialog?.kind === "riskAsk" && (
+        <Dialog
+          className="ai-preview"
+          title={dialog.engine === "jev" ? "jev 위험도를 볼까요?" : "위험도를 볼까요?"}
+          onClose={() => setDialog(null)}
+          onBackdrop={() => setDialog(null)}
+        >
+          {dialog.engine === "jev" ? (
+            <>
+              <h3>jev 위험도를 볼까요?</h3>
+              <p>
+                켜 두는 동안 이 탭의 목록에 보이는 항목(한 번에 {RISK_BATCH.jev}개까지)의 경로, 이름, 종류, 크기, 날짜, 분류를
+                TypeSafe jev로 보내 위험도를 받아요. 다른 폴더로 가면 그 폴더에서 보이는 항목도 보내요.
+              </p>
+              <p className="muted">
+                파일 내용은 보내지 않아요. 내 jev API 키로 보내고, 받은 위험도는 참고용이에요. 한 번 받은 항목은 앱을 끌 때까지
+                다시 묻지 않아요. 끄려면 툴바의 "위험도"를 한 번 더 누르세요.
+              </p>
+            </>
+          ) : (
+            <>
+              <h3>위험도를 볼까요?</h3>
+              <p>
+                켜 두는 동안 이 탭의 목록에 보이는 항목(한 번에 {RISK_BATCH.ollama}개까지)의 경로, 이름, 종류, 크기, 날짜, 분류를
+                Ollama 주소 <b>{dialog.url}</b>로 보내 로컬 모델의 위험도를 받아요. 다른 폴더로 가면 그 폴더에서 보이는 항목도 보내요.
+              </p>
+              <div className="v06-warn">이 주소는 이 컴퓨터가 아니에요. 보낸 정보는 그 컴퓨터로 가요.</div>
+              <p className="muted">
+                파일 내용은 보내지 않아요. 요금은 없고, 받은 위험도는 참고용이에요. 한 번 받은 항목은 앱을 끌 때까지 다시 묻지
+                않아요. 끄려면 툴바의 "위험도"를 한 번 더 누르세요.
+              </p>
+            </>
+          )}
           <div className="actions">
             <button onClick={() => setDialog(null)}>보내지 않기</button>
             <button
@@ -3194,7 +3705,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               autoFocus
               onClick={() => {
                 setDialog(null);
-                if (jevOk) setRiskOn(true);
+                if (!judgeOk) return;
+                riskAgreed.current = dialog.target;
+                setRiskOn(true);
               }}
             >
               켜기
@@ -3202,37 +3715,79 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           </div>
         </Dialog>
       )}
-      {dialog?.kind === "jevFindAsk" && (
-        <Dialog className="ai-preview" title="뜻으로 찾기를 켤까요?" onClose={() => setDialog(null)} onBackdrop={() => setDialog(null)}>
-          <h3>뜻으로 찾기를 켤까요?</h3>
-          <p>
-            켜 두는 동안 검색창에서 Enter를 누를 때마다 찾는 말과 오늘 날짜, 그리고 후보 항목을 TypeSafe jev로 보내 찾는 말에
-            맞는지 물어요. 파일은 최대 {JEV_FILE_MAX}개의 경로, 이름, 분류, 크기, 수정한 날짜를, 게임·프로그램은 최대{" "}
-            {JEV_APP_MAX}개의 이름, 설치 폴더, 게시자를 보내요. 글자를 치는 동안에는 보내지 않아요.
-          </p>
-          <p className="muted">
-            파일 내용은 보내지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어 보내요). 내 jev API 키로 보내서 요금은
-            jev의 조건대로 키 주인에게 청구되고, 한 번 찾을 때 보통 2~6번 요청해요. 묻는 중에 Esc를 눌러도 이미 보낸 요청은 끝까지
-            가고 요금이 나가요. 같은 검색을 다시 하면 저장해 둔 답을 써요(앱을 끌 때까지). 받은 결과는 참고용이에요. 끄려면
-            검색창의 "뜻으로"를 한 번 더 누르세요.
-          </p>
+      {dialog?.kind === "aiFindAsk" && (
+        <Dialog
+          className="ai-preview"
+          title={dialog.run ? "AI 검색으로 보낼까요?" : "AI 검색을 켤까요?"}
+          onClose={() => setDialog(null)}
+          onBackdrop={() => setDialog(null)}
+        >
+          <h3>{dialog.run ? "AI 검색으로 보낼까요?" : "AI 검색을 켤까요?"}</h3>
+          {dialog.changed && (
+            <div className="v06-warn">판정 엔진이나 보낼 곳이 바뀌었어요. 바뀐 곳으로 보내기 전에 한 번 더 물어요.</div>
+          )}
+          {dialog.engine === "jev" ? (
+            <>
+              <p>
+                AI 검색에서 Enter를 누를 때마다 찾는 말과 오늘 날짜, 그리고 후보 항목을 TypeSafe jev로 보내 찾는 말에 맞는지 물어요.
+                파일은 최대 {JEV_FILE_MAX}개의 경로, 이름, 분류, 크기, 수정한 날짜를, 게임·프로그램은 최대 {JEV_APP_MAX}개의 이름,
+                설치 폴더, 게시자를 보내요. 글자를 치는 동안에는 보내지 않아요.
+              </p>
+              <p className="muted">
+                파일 내용은 보내지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어 보내요). 내 jev API 키로 보내서 요금은
+                jev의 조건대로 키 주인에게 청구되고, 한 번 찾을 때 보통 2~6번 요청해요. 묻는 중에 멈추면(Esc) 남은 후보는 보내지
+                않지만, 이미 보낸 요청은 끝까지 가고 요금이 나가요. 같은 검색을 다시 하면 저장해 둔 답을 써요(앱을 끌 때까지). 받은
+                결과는 참고용이에요. 이름 검색으로 돌아가려면 검색창 앞의 "이름"을 누르세요.
+              </p>
+            </>
+          ) : (
+            <>
+              <p>
+                AI 검색에서 Enter를 누를 때마다 찾는 말과 후보 항목을 Ollama 주소 <b>{dialog.url}</b>로 보내 로컬 모델에게 한
+                항목씩 물어요. 파일은 최대 {LOCAL_FILE_MAX}개의 경로와 수정한 날짜를(오늘 날짜와 함께), 게임·프로그램은 최대{" "}
+                {LOCAL_APP_MAX}개의 이름과 설치 폴더를 보내요. 글자를 치는 동안에는 보내지 않아요.
+              </p>
+              <div className="v06-warn">이 주소는 이 컴퓨터가 아니에요. 보낸 정보는 그 컴퓨터로 가요.</div>
+              <p className="muted">
+                파일 내용은 보내지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어 보내요). 요금은 없어요. 같은 검색을 다시
+                하면 저장해 둔 답을 써요(앱을 끌 때까지). 받은 결과는 참고용이에요. 이름 검색으로 돌아가려면 검색창 앞의 "이름"을
+                누르세요.
+              </p>
+            </>
+          )}
           <div className="actions">
-            <button onClick={() => setDialog(null)}>켜지 않기</button>
+            <button onClick={() => setDialog(null)}>{dialog.run ? "보내지 않기" : "켜지 않기"}</button>
             <button
               className="primary"
               autoFocus
               onClick={() => {
                 setDialog(null);
-                // jev went off meanwhile (another window's AI settings): "뜻으로" is not there.
-                if (!jevOk) return;
-                jevAgreed.current = true;
-                startMeaning();
+                // The judge went off meanwhile (another window's AI settings): nothing to turn on.
+                if (!judgeOk) return;
+                aiAgreed.current = dialog.target;
+                if (!aiMode) switchMode("ai");
+                if (dialog.run) void runAi();
               }}
             >
-              켜기
+              {dialog.run ? "보내기" : "켜기"}
             </button>
           </div>
         </Dialog>
+      )}
+      {dialog?.kind === "aiHow" && (
+        <AiHow
+          why={dialog.why}
+          onClose={() => setDialog(null)}
+          onSettings={() => setDialog({ kind: "aiSettings", thenAi: true })}
+        />
+      )}
+      {dialog?.kind === "uninstall" && (
+        <UninstallAsk
+          prog={dialog.prog}
+          path={dialog.path}
+          onClose={() => setDialog(null)}
+          onRun={() => void runUninstall(dialog)}
+        />
       )}
 
       {/* v0.7. Uninstalling runs the program's own uninstaller; leftovers become a plan, which runs
@@ -3330,9 +3885,10 @@ function PlanFlyout({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * The bar over a 뜻으로 찾기's results: the query they answer, how the candidates were gathered,
- * what was left out and why, and the switch for the hits under JEV_SHOW. `typed`: the box holds
- * another query now, which Enter would ask; `moved`: "이 폴더만" (or the folder it means) changed.
+ * The bar over an AI 검색's results: the query they answer, who judged, how the candidates were
+ * gathered, what was left out and why, and the switch for the hits under JEV_SHOW. `typed`: the
+ * box holds another query now, which Enter would ask; `moved`: "이 폴더만" (or the folder it
+ * means) changed.
  */
 function JevSummary(p: {
   res: JevResults;
@@ -3344,21 +3900,40 @@ function JevSummary(p: {
 }) {
   const f = p.res.found;
   const app = f.target === "app";
+  const engine = engineOf(f);
   const out = jevLeftOut(f);
   const where = p.res.scope === null ? "모든 드라이브에서" : `"${folderTitle(p.res.scope)}" 폴더에서`;
   return (
     <>
-      <b>뜻으로 찾기</b>
+      <b>AI 검색</b>
+      {/* Not "이 PC의": the answer does not say which Ollama gave it. */}
+      <span
+        className={`jev-engine ${engine}`}
+        title={engine === "ollama" ? "로컬 모델(Ollama)이 판정했어요" : "TypeSafe jev가 판정했어요"}
+      >
+        {JUDGE_NAME[engine]}
+      </span>
       <span className="jev-query" title={p.res.query}>
         “{p.res.query}”
       </span>
-      <span>
-        {app
-          ? "설치된 게임·프로그램 중에서 골랐어요"
-          : f.terms.length
-            ? `이름과 폴더 이름에 든 낱말로 후보를 모았어요: ${f.terms.join(", ")}`
-            : "종류와 기간으로 후보를 모았어요"}
-      </span>
+      {/* Stopped early: what was judged before is all there is (Enter asks the rest; the answers
+          so far come from the cache). */}
+      {f.cancelled && (
+        <span className="diff-method">
+          {stoppedEarly(f) ? "멈췄어요 — 아직 확인한 항목이 없어요" : `멈췄어요 — 확인한 ${f.asked.toLocaleString()}개만 보여요`}
+          {!p.typed && !p.moved ? `. Enter를 누르면 ${stoppedEarly(f) ? "다시 찾아요" : "나머지도 확인해요"}` : ""}
+        </span>
+      )}
+      {/* Stopped before the query was read: how candidates would be gathered is not known. */}
+      {!stoppedUnread(f) && (
+        <span>
+          {app
+            ? "설치된 게임·프로그램 중에서 골랐어요"
+            : f.terms.length
+              ? `이름과 폴더 이름에 든 낱말로 후보를 모았어요: ${f.terms.join(", ")}`
+              : "종류와 기간으로 후보를 모았어요"}
+        </span>
+      )}
       {/* Games·programs are all of them whatever the words: only a folder narrows them. */}
       {out.capped &&
         (app ? (
@@ -3370,7 +3945,9 @@ function JevSummary(p: {
           <span className="diff-method">후보가 많아 {out.cap.toLocaleString()}개만 확인했어요 — 낱말을 더 넣어 보세요</span>
         ))}
       {out.unanswered > 0 && (
-        <span className="diff-method">jev가 답하지 않은 후보 {out.unanswered.toLocaleString()}개는 빠졌어요</span>
+        <span className="diff-method">
+          {judgeSubject(engine)} 답하지 않은 후보 {out.unanswered.toLocaleString()}개는 빠졌어요
+        </span>
       )}
       {f.unplaced > 0 && (
         <span className="muted" title="설치 폴더가 스캔 결과에 없는 프로그램이에요 (Microsoft Store 앱, 스캔하지 않은 드라이브의 프로그램)">
@@ -3387,15 +3964,135 @@ function JevSummary(p: {
         )
       )}
       {p.hidden > 0 && (
-        <label className={`scope jev-low${p.showLow ? " on" : ""}`} title="jev가 50% 미만으로 본 항목도 목록에 보여요">
+        <label className={`scope jev-low${p.showLow ? " on" : ""}`} title={`${judgeSubject(engine)} ${SHOW_PCT} 미만으로 본 항목도 목록에 보여요`}>
           <input type="checkbox" checked={p.showLow} onChange={(e) => p.onShowLow(e.target.checked)} />
-          50% 미만도 보기 ({p.hidden.toLocaleString()}개)
+          {SHOW_PCT} 미만도 보기 ({p.hidden.toLocaleString()}개)
         </label>
       )}
       <span className="muted">
-        {app ? "이름·설치 폴더·게시자만 보고 고른 참고용이에요" : "이름·경로·날짜 같은 정보만 보고 고른 참고용이에요"}
+        {app
+          ? engine === "ollama"
+            ? "이름·설치 폴더만 보고 고른 참고용이에요"
+            : "이름·설치 폴더·게시자만 보고 고른 참고용이에요"
+          : "이름·경로·날짜 같은 정보만 보고 고른 참고용이에요"}
       </span>
     </>
+  );
+}
+
+/**
+ * v0.10: "AI" with no judge ready: the two ways to get one (my jev key, or a free model on this
+ * PC), and the AI settings, where either is set. `why`: what is missing now.
+ */
+function AiHow(p: { why: string; onClose: () => void; onSettings: () => void }) {
+  return (
+    <Dialog className="ai-preview ai-how" title="AI 검색을 쓰려면" onClose={p.onClose} onBackdrop={p.onClose}>
+      <h3>AI 검색을 쓰려면</h3>
+      <p>
+        이름에 없는 말("RPG 게임", "작년에 받은 전세 계약서")로 찾으려면, 후보마다 맞는지 판정할 AI가 있어야 해요. 둘 중 하나를
+        골라 주세요.
+      </p>
+      {p.why && <div className="v06-warn">{p.why}</div>}
+      <div className="ai-how-ways">
+        <section className="ai-how-way">
+          <h4>
+            내 jev 키 <span className="ai-how-tag">유료 · 빠름</span>
+          </h4>
+          <p className="muted">
+            TypeSafe jev의 API 키를 AI 설정에 넣어요. 한 번 찾는 데 몇 초면 되고, 보낸 만큼 jev의 조건대로 키 주인에게 청구돼요.
+            찾는 말과 후보의 이름·경로 같은 정보를 jev로 보내요(파일 내용은 보내지 않아요).
+          </p>
+        </section>
+        <section className="ai-how-way">
+          <h4>
+            무료 로컬 모델 <span className="ai-how-tag free">무료 · 이 PC에서</span>
+          </h4>
+          <p className="muted">
+            Ollama를 설치하고 모델을 받아요. 이 PC에서 돌아서 요금이 없고 아무것도 밖으로 나가지 않아요. 대신 후보를 한 항목씩
+            물어서 느리고(한 번 찾는 데 수십 초) jev보다 덜 정확할 수 있어요.
+          </p>
+          <ol className="ai-how-steps">
+            <li>
+              <b>ollama.com</b>에서 Ollama를 설치해요
+            </li>
+            <li>
+              터미널에서 <code>ollama pull qwen3:4b</code>로 모델을 받아요 (GPU 4GB 이상 추천, 더 정확하게는 <code>qwen3:8b</code>)
+            </li>
+            <li>AI 설정 → "AI 판정"에서 "로컬 모델"을 고르고 모델 이름을 넣어요</li>
+          </ol>
+        </section>
+      </div>
+      <p className="muted">어느 쪽이든 AI 설정에서 "AI 판정 쓰기"를 켜 주세요. 이름 검색은 AI 없이 그대로 써요.</p>
+      <div className="actions">
+        <button onClick={p.onClose}>닫기</button>
+        <button className="primary" autoFocus onClick={p.onSettings}>
+          AI 설정 열기
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * v0.10: "제거 (제어판처럼)…": what the program is and what its uninstaller does, before it runs
+ * (as 프로그램 정리's question). Nothing is deleted here: the program's own uninstaller is started,
+ * or a Store app removed for this user.
+ */
+function UninstallAsk(p: { prog: ProgramRef; path: string; onClose: () => void; onRun: () => void }) {
+  const g = p.prog;
+  const name = shown(g.name);
+  const store = g.kind === "store";
+  const facts = [
+    g.publisher && shown(g.publisher),
+    g.size !== null && formatSize(g.size),
+    store ? "Microsoft Store 앱" : g.machine_wide ? "모든 사용자용" : "내 계정용",
+  ].filter(Boolean);
+  return (
+    <Dialog className="v07-confirm uninstall-ask" title={`${name} 제거`} onClose={p.onClose} onBackdrop={p.onClose}>
+      <h3>{name}을(를) 제거할까요?</h3>
+      <p className="muted">
+        {facts.join(" · ")}
+        <br />
+        <span className="uninstall-path" title={p.path}>
+          {shown(p.path)}
+        </span>
+      </p>
+      {store ? (
+        // Remove-AppxPackage (programs.rs): no window of its own and nothing more is asked.
+        <div className="v06-warn">
+          이 사용자에서 바로 제거해요. 제거 창이 뜨지 않고 더 묻지도 않아요. 앱이 저장해 둔 데이터(설정, 앱 안에 둔 파일)도 함께
+          지워지고 휴지통으로 가지 않아요. 다른 계정의 앱은 그대로예요.
+        </div>
+      ) : (
+        <>
+          <p>
+            이 프로그램의 제거 프로그램을 실행해요. 뜨는 창의 안내를 따라 주세요. <b>일부 프로그램은 창 없이 바로 지워져요.</b>
+          </p>
+          {g.machine_wide && (
+            <div className="v06-warn">모든 사용자용으로 설치된 프로그램이라 관리자 권한을 물어요(UAC 창). 다른 계정에서도 없어져요.</div>
+          )}
+        </>
+      )}
+      <p className="muted">
+        제어판(설정 → 앱)의 "제거"와 같아요. Steam 게임이면 Steam이 제거를 맡아요. fine-file은 폴더를 직접 지우지 않고, 제거가 끝나
+        폴더가 없어지면 목록과 검색 결과에서도 빠져요. 남은 폴더는 도구 → 프로그램 정리의 "남은 찌꺼기"에서 찾아볼 수 있어요.
+      </p>
+      {/* 취소 has the focus: a stray Enter must not remove anything. */}
+      <div className="actions">
+        <button autoFocus onClick={p.onClose}>
+          취소
+        </button>
+        {store ? (
+          <button className="primary danger" onClick={p.onRun}>
+            제거
+          </button>
+        ) : (
+          <button className="primary" onClick={p.onRun}>
+            제거 프로그램 실행
+          </button>
+        )}
+      </div>
+    </Dialog>
   );
 }
 

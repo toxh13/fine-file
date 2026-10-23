@@ -1,6 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { ai, planEvents, plans, type Plan, type PlanProgress, type PlanStep, type Risk } from "./api";
+import {
+  ai,
+  JUDGE_NAME,
+  judgeModel,
+  judgeOf,
+  judgeTarget,
+  planEvents,
+  plans,
+  riskConfidence,
+  type AiSettings,
+  type JudgeEngine,
+  type KeyStatus,
+  type Plan,
+  type PlanProgress,
+  type PlanStep,
+  type Risk,
+} from "./api";
 import { Dialog } from "./Duplicates";
 import { driveKey, folderTitle, formatDate, formatSize, parentOf } from "./format";
 import { Markdown, MarkdownInline } from "./markdown";
@@ -79,10 +95,35 @@ const FREES = new Set<Action>(["trash", "relocate"]);
 /** Debounce of saving the selection. */
 const SAVE_MS = 600;
 
-/** Items of a plan jev is asked about (a plan holds no more steps than this). */
+/** Items of a plan the judge is asked about (a plan holds no more steps than this). */
 const JEV_MAX = 500;
 /** Items per jev_risk call: it answers for no more than this many (the rest would get no badge). */
 const JEV_CALL = 400;
+
+/**
+ * The judge of the second check (v0.10: jev, or a local model), as the settings say: whether it
+ * can be asked (on, and jev's key saved or a model named), whether to ask first (the settings ask
+ * for it and what goes would leave this PC), and where it goes.
+ */
+interface Judge {
+  ready: boolean;
+  confirm: boolean;
+  engine: JudgeEngine;
+  /** judgeTarget: "jev", "ollama:<address>" of another computer, or null for this PC. */
+  target: string | null;
+  url: string;
+}
+
+function judgeFrom(s: AiSettings, k: KeyStatus): Judge {
+  const engine = judgeOf(s);
+  return {
+    ready: s.jev_enabled && (engine === "jev" ? k.jev : !!judgeModel(s)),
+    confirm: s.confirm_before_send,
+    engine,
+    target: judgeTarget(s),
+    url: (s.ollama_url ?? "").trim(),
+  };
+}
 
 function errText(err: unknown): string {
   if (typeof err === "string") return err;
@@ -165,12 +206,31 @@ const CARD_LABEL: Record<Action, string> = {
 /** Steps that change where things are or what they are called: the plan has a before and an after to show. */
 const SHAPES = new Set<Action>(["mkdir", "move", "rename"]);
 
-const JEV_TIP =
-  "TypeSafe jev가 이 계획의 항목마다 지워도 되는지(안전·주의·위험)와 프로그램이 다시 만드는 항목인지를 한 번 더 판정해요. " +
-  "계획을 만든 규칙·AI와 따로 보는 빠르고 저렴한 2차 의견이에요.\n" +
-  "· 보내는 것: 항목의 경로·이름·종류·크기·날짜·분류 (파일 내용은 보내지 않아요)\n" +
-  "· 요금: 내 jev API 키 주인에게 jev의 조건대로 청구돼요\n" +
-  '· 결과: 단계의 위험 배지 옆에 "jev …" 배지로 붙어요. 참고용이고, 단계를 대신 고르지 않아요';
+/** The "위험도 다시 확인" button's tooltip, for the judge the settings name (and where a local one is). */
+function judgeTip(j: Judge): string {
+  if (j.engine === "jev") {
+    return (
+      "TypeSafe jev가 이 계획의 항목마다 지워도 되는지(안전·주의·위험)와 프로그램이 다시 만드는 항목인지를 한 번 더 판정해요. " +
+      "계획을 만든 규칙·AI와 따로 보는 빠르고 저렴한 2차 의견이에요.\n" +
+      "· 보내는 것: 항목의 경로·이름·종류·크기·날짜·분류 (파일 내용은 보내지 않아요)\n" +
+      "· 요금: 내 jev API 키 주인에게 jev의 조건대로 청구돼요\n" +
+      '· 결과: 단계의 위험 배지 옆에 "jev …" 배지로 붙어요. 참고용이고, 단계를 대신 고르지 않아요'
+    );
+  }
+  // judgeTarget is null only for an Ollama on this PC.
+  const remote = j.target !== null;
+  return (
+    `${remote ? "다른 컴퓨터의" : "이 PC의"} 로컬 모델(Ollama)이 이 계획의 항목마다 지워도 되는지(안전·주의·위험)를 한 번 더 판정해요. ` +
+    "계획을 만든 규칙·AI와 따로 보는 2차 의견이에요.\n" +
+    (remote
+      ? `· 보내는 것: 항목의 경로·이름·종류·크기·날짜·분류를 Ollama 주소 ${shown(j.url)}(그 컴퓨터)로 보내요 (파일 내용은 보내지 않아요)\n` +
+        "· 요금은 없어요\n"
+      : "· 모델에 주는 것: 항목의 경로·이름·종류·크기·날짜·분류 (파일 내용은 주지 않아요)\n" +
+        "· 요금은 없고, 아무것도 밖으로 나가지 않아요\n") +
+    "· jev보다 느려요. 항목이 많으면 몇 분 걸릴 수 있고, 신뢰도는 매기지 않아요\n" +
+    '· 결과: 단계의 위험 배지 옆에 "로컬 …" 배지로 붙어요. 참고용이고, 단계를 대신 고르지 않아요'
+  );
+}
 
 /** The path's folders under the plan's root ([] for the root itself); null when it is not under it. */
 function underRoot(root: string, p: string): string[] | null {
@@ -715,9 +775,11 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
   const [confirm, setConfirm] = useState<"run" | "undo" | "delete" | "jev" | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
-  /** jev is on with a key, and whether to ask before sending. */
-  const [jev, setJev] = useState<{ ready: boolean; confirm: boolean }>({ ready: false, confirm: true });
+  /** The judge of the second check (jev or a local model): ready, whether to ask before sending, where to. */
+  const [jev, setJev] = useState<Judge>({ ready: false, confirm: true, engine: "jev", target: "jev", url: "" });
+  /** Its answers, and who gave them. */
   const [risks, setRisks] = useState<Map<string, Risk> | null>(null);
+  const [risksBy, setRisksBy] = useState<JudgeEngine>("jev");
   const [jevBusy, setJevBusy] = useState(false);
   /** The steps by folder, or the before/after trees (a plan that makes folders, moves or renames). */
   const [view, setView] = useState<"steps" | "tree">("steps");
@@ -854,7 +916,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
 
   useEffect(() => {
     Promise.all([ai.getSettings(), ai.keyStatus()]).then(
-      ([s, k]) => alive.current && setJev({ ready: s.jev_enabled && k.jev, confirm: s.confirm_before_send }),
+      ([s, k]) => alive.current && setJev(judgeFrom(s, k)),
       () => {},
     );
   }, []);
@@ -1021,44 +1083,75 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
     }
   };
 
-  const fetchJev = async () => {
+  /** The judge as the settings say now; null when they cannot be read. */
+  const judgeNow = async (): Promise<Judge | null> => {
+    try {
+      const [s, k] = await Promise.all([ai.getSettings(), ai.keyStatus()]);
+      return judgeFrom(s, k);
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Asks `want` (the judge read just before, or the one the question showed). The backend asks
+   * the judge the settings name when each request goes, and they may change meanwhile (AI 설정,
+   * another window): read again before each, nothing goes once they name another engine or address.
+   */
+  const fetchJev = async (want: Judge) => {
     setConfirm(null);
     if (jevBusy || !jevPaths.length) return;
     setJevBusy(true);
     try {
       const list: Risk[] = [];
       for (let i = 0; i < jevPaths.length; i += JEV_CALL) {
+        const now = await judgeNow();
+        if (!alive.current) return;
+        if (!now) {
+          setNotice({ text: "AI 설정을 읽지 못해서 보내지 않았어요. 잠시 뒤에 다시 눌러 주세요", error: true });
+          return;
+        }
+        if (!now.ready || now.engine !== want.engine || now.target !== want.target) {
+          setJev(now);
+          setNotice({
+            text: "그사이 판정 엔진이나 보낼 곳이 바뀌어서 보내지 않았어요. 바뀐 설정을 확인하고 다시 눌러 주세요",
+            error: true,
+          });
+          return;
+        }
         list.push(...(await ai.jevRisk(jevPaths.slice(i, i + JEV_CALL))));
         if (!alive.current) return;
       }
       setRisks(new Map(list.map((r) => [r.path.toLowerCase(), r])));
+      // Shown as the answer of the judge that gave it.
+      setRisksBy(want.engine);
     } catch (err) {
-      if (alive.current) setNotice({ text: `jev 위험도를 받지 못했어요: ${errText(err)}`, error: true });
+      if (alive.current) setNotice({ text: `위험도를 받지 못했어요: ${errText(err)}`, error: true });
     } finally {
       if (alive.current) setJevBusy(false);
     }
   };
 
-  /** Whether to say what goes first is read from the settings as saved now (another window may have changed them). */
+  /**
+   * Whether to say what goes first is read from the settings as saved now (another window may have
+   * changed them): asked when they ask for it and it would leave this PC (jev, an Ollama elsewhere).
+   */
   const askJev = async () => {
     if (jevBusy || !jevPaths.length) return;
-    let ask = jev.confirm;
-    try {
-      const s = await ai.getSettings();
-      if (!alive.current) return;
-      setJev((j) => ({ ...j, confirm: s.confirm_before_send }));
-      if (!s.jev_enabled) {
-        setJev((j) => ({ ...j, ready: false }));
-        setNotice({ text: "jev 위험도가 AI 설정에서 꺼졌어요. 다시 켜면 쓸 수 있어요", error: true });
-        return;
-      }
-      ask = s.confirm_before_send;
-    } catch {
-      // Not known now: asked first.
-      ask = true;
+    const now = await judgeNow();
+    if (!alive.current) return;
+    // Not known now: asked first, about the judge as last read (fetchJev reads again before sending).
+    if (!now) {
+      setConfirm("jev");
+      return;
     }
-    if (ask) setConfirm("jev");
-    else void fetchJev();
+    setJev(now);
+    if (!now.ready) {
+      setNotice({ text: "AI 판정이 꺼졌거나 쓸 수 없게 됐어요(jev 키, 로컬 모델 이름). AI 설정에서 확인해 주세요", error: true });
+      return;
+    }
+    if (now.confirm && now.target !== null) setConfirm("jev");
+    else void fetchJev(now);
   };
 
   /** How the last run (or undo) seen here ended. */
@@ -1148,10 +1241,14 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
           <span className="spacer" />
           {jev.ready && (
             <>
-              <button className="btn small" disabled={jevBusy || !jevPaths.length} title={JEV_TIP} onClick={askJev}>
-                {jevBusy ? "jev에 묻는 중…" : "jev로 위험도 다시 확인 (빠르고 저렴한 2차 판정)"}
+              <button className="btn small" disabled={jevBusy || !jevPaths.length} title={judgeTip(jev)} onClick={askJev}>
+                {jevBusy
+                  ? jev.engine === "ollama"
+                    ? "로컬 모델이 판정하는 중…"
+                    : "jev에 묻는 중…"
+                  : `위험도 다시 확인 (${JUDGE_NAME[jev.engine]} 2차 판정)`}
               </button>
-              <span className="plan-info" tabIndex={0} role="note" aria-label={JEV_TIP} title={JEV_TIP}>
+              <span className="plan-info" tabIndex={0} role="note" aria-label={judgeTip(jev)} title={judgeTip(jev)}>
                 ?
               </span>
             </>
@@ -1395,14 +1492,17 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
                                         {RISK_LABEL[s.risk] ?? s.risk}
                                       </span>
                                       {r && (
+                                        // Named by the engine that answered; a local model gives no
+                                        // confidence (jev may leave one out too): "신뢰도 없음".
                                         <span
                                           className={`v06-jev risk-${r.level}`}
                                           title={
-                                            `jev 2차 판정 (참고용) · 신뢰도 ${Math.round(r.confidence * 100)}%` +
+                                            `${risksBy === "ollama" ? "로컬 모델" : "jev"} 2차 판정 (참고용) · ` +
+                                            (riskConfidence(r) === null ? "신뢰도 없음" : `신뢰도 ${Math.round((riskConfidence(r) ?? 0) * 100)}%`) +
                                             (r.regenerable !== null ? ` · 프로그램이 다시 만드는 항목일 확률 ${Math.round(r.regenerable * 100)}%` : "")
                                           }
                                         >
-                                          jev {RISK_LABEL[r.level] ?? r.level}
+                                          {risksBy === "ollama" ? "로컬" : "jev"} {RISK_LABEL[r.level] ?? r.level}
                                         </span>
                                       )}
                                     </div>
@@ -1566,16 +1666,34 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
       )}
 
       {confirm === "jev" && (
-        <Dialog className="ai-preview" title="jev에 보낼까요?" onClose={() => setConfirm(null)} onBackdrop={() => setConfirm(null)}>
-          <h3>jev에 보낼까요?</h3>
-          <p className="muted">
-            아래 항목 {jevPaths.length.toLocaleString()}개의 경로와 크기 같은 정보를 TypeSafe jev로 보내 위험도를 받아요. 파일 내용은
-            보내지 않아요.
-          </p>
+        <Dialog
+          className="ai-preview"
+          title={jev.engine === "ollama" ? "Ollama로 보낼까요?" : "jev에 보낼까요?"}
+          onClose={() => setConfirm(null)}
+          onBackdrop={() => setConfirm(null)}
+        >
+          {jev.engine === "ollama" ? (
+            <>
+              <h3>Ollama로 보낼까요?</h3>
+              <p className="muted">
+                아래 항목 {jevPaths.length.toLocaleString()}개의 경로와 크기 같은 정보를 Ollama 주소 <b>{shown(jev.url)}</b>로 보내 로컬
+                모델의 위험도를 받아요. 파일 내용은 보내지 않아요. 요금은 없어요.
+              </p>
+              <div className="v06-warn">이 주소는 이 컴퓨터가 아니에요. 보낸 정보는 그 컴퓨터로 가요.</div>
+            </>
+          ) : (
+            <>
+              <h3>jev에 보낼까요?</h3>
+              <p className="muted">
+                아래 항목 {jevPaths.length.toLocaleString()}개의 경로와 크기 같은 정보를 TypeSafe jev로 보내 위험도를 받아요. 파일
+                내용은 보내지 않아요.
+              </p>
+            </>
+          )}
           <pre className="v06-code plan-paths-sent">{jevPaths.map(shown).join("\n")}</pre>
           <div className="actions">
             <button onClick={() => setConfirm(null)}>보내지 않기</button>
-            <button className="primary" autoFocus onClick={() => void fetchJev()}>
+            <button className="primary" autoFocus onClick={() => void fetchJev(jev)}>
               보내기
             </button>
           </div>

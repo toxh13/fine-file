@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { ai, type AiProvider, type AiSettings as Settings, type KeyStatus } from "./api";
+import { ai, isLocalUrl, judgeModel, judgeOf, type AiProvider, type AiSettings as Settings, type JudgeEngine, type KeyStatus } from "./api";
 import { Dialog } from "./Duplicates";
 import "./components.css";
 import "./v04.css";
@@ -19,6 +19,12 @@ const PROVIDERS: { id: AiProvider; label: string; note: string }[] = [
   { id: "ollama", label: "Ollama (내 PC)", note: "이 컴퓨터에서 실행" },
   { id: "claude_cli", label: "Claude Code CLI", note: "내가 설치·로그인한 claude" },
   { id: "codex_cli", label: "Codex CLI", note: "내가 설치·로그인한 codex" },
+];
+
+/** v0.10: who judges for the 위험도 badges, AI 검색 and the plan's second check. */
+const JUDGES: { id: JudgeEngine; label: string; note: string }[] = [
+  { id: "jev", label: "jev", note: "유료, 빠름, 키 필요" },
+  { id: "ollama", label: "로컬 모델 · Ollama", note: "무료, 이 PC에서, 처음엔 설치 필요" },
 ];
 
 const CLAUDE_MODELS = [
@@ -44,16 +50,6 @@ function errText(err: unknown): string {
     return JSON.stringify(err) ?? String(err);
   } catch {
     return String(err);
-  }
-}
-
-/** An Ollama address on this computer: what goes there stays here. */
-function isLocalUrl(url: string): boolean {
-  try {
-    const h = new URL(url.trim()).hostname.toLowerCase();
-    return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1" || h.endsWith(".localhost");
-  } catch {
-    return false;
   }
 }
 
@@ -199,7 +195,11 @@ function KeyField({
   );
 }
 
-export function AiSettings({ onClose }: { onClose(): void }) {
+/**
+ * `onSaved`: settings or a key were saved (the window stays open): whoever keeps a copy of them
+ * reads them again now, so what is sent next goes where they now say (위험도 that is on, a search).
+ */
+export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: () => void }) {
   /** As last loaded or saved; `draft` is what the page shows. */
   const [saved, setSaved] = useState<Settings | null>(null);
   const [draft, setDraft] = useState<Settings | null>(null);
@@ -210,8 +210,14 @@ export function AiSettings({ onClose }: { onClose(): void }) {
   const [testing, setTesting] = useState<string | null>(null);
   const [tested, setTested] = useState<{ provider: string; text: string; error?: boolean } | null>(null);
   const [askClose, setAskClose] = useState(false);
+  // v0.10: the models the Ollama at the address shown has (null: not read, or it did not answer).
+  const [models, setModels] = useState<string[] | null>(null);
+  const [modelsBusy, setModelsBusy] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const modelsReq = useRef(0);
   const alive = useRef(true);
   const group = useId();
+  const judgeGroup = useId();
 
   const dirty = !!draft && !!saved && JSON.stringify(draft) !== JSON.stringify(saved);
 
@@ -221,6 +227,16 @@ export function AiSettings({ onClose }: { onClose(): void }) {
       (err) => alive.current && setNotice({ text: `저장한 키를 확인하지 못했어요: ${errText(err)}`, error: true }),
     );
   }, []);
+  // As of the last render: the callbacks below are made once.
+  const savedHook = useRef(onSaved);
+  useEffect(() => {
+    savedHook.current = onSaved;
+  });
+  /** A key was saved or removed: read again here, and by whoever keeps a copy (onSaved). */
+  const keyChanged = useCallback(() => {
+    loadKeys();
+    savedHook.current?.();
+  }, [loadKeys]);
 
   useEffect(() => {
     alive.current = true;
@@ -250,6 +266,41 @@ export function AiSettings({ onClose }: { onClose(): void }) {
       return n;
     });
 
+  /** The judge engine (v0.10). A local model needs an address: this PC's, unless one is there. */
+  const pickJudge = (j: JudgeEngine) =>
+    setDraft((d) => {
+      if (!d) return d;
+      const n = { ...d, judge: j };
+      if (j === "ollama" && !n.ollama_url.trim()) n.ollama_url = DEFAULT_OLLAMA;
+      return n;
+    });
+
+  /** The models the Ollama at `url` has (ollama list), for the 판정 모델 choice. The newest read wins. */
+  const loadModels = useCallback((url: string) => {
+    const req = ++modelsReq.current;
+    setModelsBusy(true);
+    ai.ollamaModels(url.trim() || null).then(
+      (list) => {
+        if (!alive.current || req !== modelsReq.current) return;
+        setModels([...list].sort());
+        setModelsError(null);
+      },
+      (err) => {
+        if (!alive.current || req !== modelsReq.current) return;
+        setModels(null);
+        setModelsError(errText(err));
+      },
+    ).finally(() => alive.current && req === modelsReq.current && setModelsBusy(false));
+  }, []);
+
+  // Read as the local model is chosen, and again a moment after its address is changed.
+  const judgeUrl = draft && judgeOf(draft) === "ollama" ? draft.ollama_url.trim() : null;
+  useEffect(() => {
+    if (judgeUrl === null) return;
+    const t = setTimeout(() => loadModels(judgeUrl), 400);
+    return () => clearTimeout(t);
+  }, [judgeUrl, loadModels]);
+
   /** True when what the page shows is what is saved. */
   const save = async (): Promise<boolean> => {
     if (!draft || !saved) return false;
@@ -261,11 +312,14 @@ export function AiSettings({ onClose }: { onClose(): void }) {
       ollama_url: draft.ollama_url.trim(),
       ollama_model: draft.ollama_model.trim(),
       codex_model: draft.codex_model.trim(),
+      judge: judgeOf(draft),
+      judge_model: (draft.judge_model ?? "").trim(),
     };
     setSaving(true);
     setNotice(null);
     try {
       await ai.setSettings(s);
+      savedHook.current?.();
       if (alive.current) {
         setSaved(s);
         setDraft((d) => (d === draft ? s : d));
@@ -280,14 +334,17 @@ export function AiSettings({ onClose }: { onClose(): void }) {
     }
   };
 
-  /** Saves what changed first: the test tries the settings as saved. */
+  /**
+   * Saves what changed first: the test tries the settings as saved. "judge": the judge engine as a
+   * whole (v0.10; for a local model, Ollama answers and has the model).
+   */
   const test = async (provider: string) => {
     if (testing || saving) return;
     setTested(null);
     if (!(await save())) return;
     setTesting(provider);
     try {
-      const text = await ai.test(provider);
+      const text = provider === "judge" ? await ai.judgeTest() : await ai.test(provider);
       if (alive.current) setTested({ provider, text: text || "연결했어요" });
     } catch (err) {
       if (alive.current) setTested({ provider, text: errText(err), error: true });
@@ -299,6 +356,7 @@ export function AiSettings({ onClose }: { onClose(): void }) {
   const close = () => (dirty ? setAskClose(true) : onClose());
 
   const p = draft?.provider ?? "off";
+  const judge: JudgeEngine = draft ? judgeOf(draft) : "jev";
   const testLine = (provider: string) =>
     tested?.provider === provider && <span className={tested.error ? "ai-test-bad" : "ai-test-ok"}>{tested.text}</span>;
   const claudeModels =
@@ -368,7 +426,7 @@ export function AiSettings({ onClose }: { onClose(): void }) {
               )}
               {p === "claude" && (
                 <>
-                  <KeyField name="claude" label="Claude API 키" placeholder="sk-ant-…" has={keys?.claude} onChanged={loadKeys} />
+                  <KeyField name="claude" label="Claude API 키" placeholder="sk-ant-…" has={keys?.claude} onChanged={keyChanged} />
                   <p className="v06-note">
                     Anthropic Console에서 만든 API 키를 넣어 주세요. 쓴 만큼 Anthropic이 키 주인에게 청구해요.
                   </p>
@@ -394,7 +452,7 @@ export function AiSettings({ onClose }: { onClose(): void }) {
                       />
                     </label>
                   </div>
-                  <KeyField name="openai" label="OpenAI API 키" placeholder="sk-…" has={keys?.openai} onChanged={loadKeys} />
+                  <KeyField name="openai" label="OpenAI API 키" placeholder="sk-…" has={keys?.openai} onChanged={keyChanged} />
                   <p className="v06-note">
                     OpenAI Platform에서 만든 API 키를 넣어 주세요. ChatGPT 구독과는 따로, 쓴 만큼 OpenAI가 키 주인에게 청구해요.
                   </p>
@@ -495,63 +553,173 @@ export function AiSettings({ onClose }: { onClose(): void }) {
             </section>
 
             <section className="v06-section">
-              <h4>위험도 배지와 뜻으로 찾기 (TypeSafe jev)</h4>
+              <h4>AI 판정 (위험도 배지, AI 검색)</h4>
               <p className="v06-note">
-                <b>jev는 무엇인가요?</b> 항목마다 지워도 되는지(안전·주의·위험)와 프로그램이 다시 만드는 항목인지를 빠르게 판정하고,
-                찾는 말에 맞는 항목인지도 판정해 주는 TypeSafe의 서비스예요. 위에서 고른 AI와는 따로라서, AI를 꺼 둔 채로 jev만 쓸 수도
-                있어요. 이 앱에서는 세 곳에 써요.
+                <b>AI 판정은 무엇인가요?</b> 항목마다 지워도 되는지(안전·주의·위험)를 판정하고, 찾는 말에 맞는 항목인지도 판정해요.
+                위에서 고른 AI와는 따로라서, AI를 꺼 둔 채로 판정만 쓸 수도 있어요. 판정하는 쪽(엔진)은 둘 중에서 골라요:{" "}
+                <b>jev</b>(TypeSafe의 유료 서비스, 빠름, 내 키)와 <b>로컬 모델</b>(Ollama, 무료, 이 PC에서). 이 앱에서는 세 곳에 써요.
               </p>
               <ul className="v06-list">
                 <li>
-                  <b>목록의 "위험도" 열</b>: 목록 보기 툴바의 "위험도"를 켜면, 그 탭에 보이는 항목마다 jev의 판정이 배지로 붙어요.
+                  <b>목록의 "위험도" 열</b>: 목록 보기 툴바의 "위험도"를 켜면, 그 탭에 보이는 항목마다 판정이 배지로 붙어요.
                 </li>
                 <li>
-                  <b>정리 계획의 2차 확인</b>: 계획 창의 "jev로 위험도 다시 확인"을 누르면, 계획(규칙이나 AI)이 매긴 위험 옆에 jev의
-                  판정이 "jev 안전"처럼 한 번 더 붙어요. 계획을 만든 쪽과 따로 보는 빠르고 저렴한 2차 의견이에요.
+                  <b>정리 계획의 2차 확인</b>: 계획 창의 "위험도 다시 확인"을 누르면, 계획(규칙이나 AI)이 매긴 위험 옆에 판정이 "jev
+                  안전"이나 "로컬 안전"처럼 한 번 더 붙어요. 계획을 만든 쪽과 따로 보는 2차 의견이에요.
                 </li>
                 <li>
-                  <b>뜻으로 찾기</b>: 검색창의 "뜻으로"를 켜고 Enter를 누르면 이름에 없는 말로 찾아요. "RPG 게임"이면 설치된 게임
-                  중에서, "작년에 받은 전세 계약서"면 파일 중에서 jev가 맞는 것을 골라 일치도와 함께 보여 줘요.
+                  <b>AI 검색</b>: 검색창 앞의 [이름 | AI]에서 "AI"를 고르고(<code>Ctrl+Shift+F</code>) Enter를 누르면 이름에 없는 말로
+                  찾아요. "RPG 게임"이면 설치된 게임 중에서, "작년에 받은 전세 계약서"면 파일 중에서 맞는 것을 골라 일치도와 함께 보여 줘요.
                 </li>
                 <li>
-                  <b>필요한 것</b>: 내 jev API 키(아래). 키가 없으면 버튼과 열, "뜻으로"가 생기지 않아요.
-                </li>
-                <li>
-                  <b>요금</b>: 보낸 만큼 jev 키 주인에게 jev의 조건대로 청구돼요. 이 앱은 요금을 받지 않아요.
-                </li>
-                <li>
-                  <b>보내는 것</b>: 메타데이터만 보내요. 위험도는 항목의 경로·이름·종류·크기·날짜·분류를, 뜻으로 찾기는 찾는 말과 오늘
-                  날짜, 파일이면 경로·이름·분류·크기·수정한 날짜, 게임·프로그램이면 이름·설치 폴더·게시자를 보내요. 파일 내용은
-                  보내지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어 보내요).
+                  <b>보내는 것</b>: 메타데이터만 써요. 위험도는 항목의 경로·이름·종류·크기·날짜·분류를 줘요. AI 검색은 찾는 말과
+                  후보를 주는데, jev에는 오늘 날짜와 함께 파일이면 경로·이름·분류·크기·수정한 날짜, 게임·프로그램이면 이름·설치
+                  폴더·게시자를 주고, 로컬 모델에는 파일이면 경로와 수정한 날짜(오늘 날짜와 함께), 게임·프로그램이면 이름과 설치
+                  폴더만 줘요. 파일 내용은 주지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어요).
                 </li>
               </ul>
               <label className="v06-check">
                 <input type="checkbox" checked={draft.jev_enabled} onChange={(e) => set("jev_enabled", e.target.checked)} />
                 <span className="v06-check-main">
-                  <span>jev 쓰기 (위험도 배지, 뜻으로 찾기)</span>
+                  <span>AI 판정 쓰기 (위험도 배지, AI 검색)</span>
                   <span className="muted">
-                    켜면 계획 창의 "jev로 위험도 다시 확인", 목록 보기 툴바의 "위험도" 버튼, 검색창의 "뜻으로"가 생겨요. 위험도는 그
-                    버튼을 눌러야, 뜻으로 찾기는 켠 뒤 Enter를 눌러야 jev에 물어요(언제 무엇을 보내는지는 아래).
+                    켜면 계획 창의 "위험도 다시 확인"과 목록 보기 툴바의 "위험도" 버튼이 생기고, 검색창의 "AI"로 찾을 수 있어요.
+                    위험도는 그 버튼을 눌러야, AI 검색은 Enter를 눌러야 판정해요(언제 무엇을 보내는지는 아래).
                   </span>
                 </span>
               </label>
-              <KeyField name="jev" label="jev API 키" placeholder="jev 콘솔에서 받은 키" has={keys?.jev} onChanged={loadKeys} />
-              {draft.jev_enabled && keys && !keys.jev && <div className="v06-warn">jev API 키가 없으면 위험도 배지도, 뜻으로 찾기도 쓸 수 없어요.</div>}
-              <div className="ai-test">
-                <button className="btn" disabled={!!testing || saving || !keys?.jev} onClick={() => test("jev")}>
-                  {testing === "jev" ? "시험하는 중…" : "jev 연결 시험"}
-                </button>
-                {testLine("jev")}
+
+              <div className="ai-providers judge-engines" role="radiogroup" aria-label="판정 엔진">
+                {JUDGES.map((o) => (
+                  <label key={o.id} className={`ai-provider${judge === o.id ? " on" : ""}`}>
+                    <input type="radio" name={judgeGroup} checked={judge === o.id} onChange={() => pickJudge(o.id)} />
+                    <span className="ai-provider-main">
+                      <span>{o.label}</span>
+                      <span className="muted">{o.note}</span>
+                    </span>
+                  </label>
+                ))}
               </div>
+
+              {judge === "jev" ? (
+                <>
+                  <KeyField name="jev" label="jev API 키" placeholder="jev 콘솔에서 받은 키" has={keys?.jev} onChanged={keyChanged} />
+                  {draft.jev_enabled && keys && !keys.jev && (
+                    <div className="v06-warn">
+                      jev API 키가 없으면 위험도 배지도, AI 검색도 쓸 수 없어요. 키가 없으면 위의 무료 로컬 모델을 골라도 돼요.
+                    </div>
+                  )}
+                  <div className="ai-test">
+                    <button className="btn" disabled={!!testing || saving || !keys?.jev} onClick={() => test("jev")}>
+                      {testing === "jev" ? "시험하는 중…" : "jev 연결 시험"}
+                    </button>
+                    {testLine("jev")}
+                  </div>
+                  <p className="v06-note">
+                    jev는 얼리 액세스 서비스예요. 내 jev API 키로만 동작하고, 보낸 만큼 jev 키 주인에게 jev의 조건대로 청구돼요(이
+                    앱은 요금을 받지 않아요). 계획 창에서는 누를 때 그 계획의 항목(500개까지)을 보내요. 목록의 "위험도"는 탭마다 따로
+                    켜는데, 켜 두는 동안 그 탭의 목록에 보이는 항목(한 번에 200개까지)을 보내고, 스크롤하거나 다른 폴더로 갈 때마다 새로
+                    보이는 항목도 보내요. AI 검색은 Enter를 누를 때만 보내요. 파일은 240개까지, 게임·프로그램은 400개까지 80개씩
+                    묶어 보내고(동시에 4개까지), 한 번 찾을 때 보통 2~6번 요청해요. 묻는 중에 "멈추기"(Esc)를 누르면 남은 후보는 보내지 않지만, 이미 보낸 요청은 요금이
+                    나가요. 같은 검색을 다시 하면 앱을 끌 때까지 저장해 둔 답을 써요.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="ai-fields">
+                    <label className="field">
+                      <span>Ollama 주소</span>
+                      <input
+                        value={draft.ollama_url}
+                        spellCheck={false}
+                        placeholder={DEFAULT_OLLAMA}
+                        onChange={(e) => set("ollama_url", e.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>판정 모델</span>
+                      <input
+                        value={draft.judge_model ?? ""}
+                        spellCheck={false}
+                        placeholder={draft.ollama_model.trim() || "qwen3:4b"}
+                        onChange={(e) => set("judge_model", e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  {/* The models this Ollama has (ollama list), when it answers. */}
+                  <div className="judge-models">
+                    {models && models.length > 0 ? (
+                      <label className="field">
+                        <span>설치된 모델</span>
+                        <select
+                          value={models.includes((draft.judge_model ?? "").trim()) ? (draft.judge_model ?? "").trim() : ""}
+                          onChange={(e) => e.target.value && set("judge_model", e.target.value)}
+                        >
+                          <option value="">설치된 모델에서 고르기…</option>
+                          {models.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      <span className="muted">
+                        {modelsBusy
+                          ? "설치된 모델을 읽는 중…"
+                          : models
+                            ? "Ollama에 받은 모델이 없어요. 아래 명령으로 받아 주세요"
+                            : modelsError
+                              ? `설치된 모델을 읽지 못했어요: ${modelsError}`
+                              : ""}
+                      </span>
+                    )}
+                    <button type="button" className="btn small" disabled={modelsBusy} onClick={() => loadModels(draft.ollama_url)}>
+                      목록 새로 읽기
+                    </button>
+                  </div>
+                  {draft.ollama_url.trim() && !isLocalUrl(draft.ollama_url) && (
+                    <div className="v06-warn">
+                      이 주소는 이 컴퓨터가 아니에요. 판정할 항목의 정보가 그 컴퓨터로 가요. 내 PC에서만 쓰려면{" "}
+                      <code>{DEFAULT_OLLAMA}</code>로 두세요.
+                    </div>
+                  )}
+                  {draft.jev_enabled && !judgeModel(draft) && (
+                    <div className="v06-warn">판정할 모델 이름을 넣어 주세요 (예: qwen3:4b). 모델이 없으면 위험도 배지도, AI 검색도 쓸 수 없어요.</div>
+                  )}
+                  <p className="v06-note">
+                    <b>추천</b>: <code>qwen3:4b</code> (한국어, GPU 4GB 이상) · 더 정확하게: <code>qwen3:8b</code>. 비워 두면 위 "쓸
+                    AI"의 Ollama 모델을 써요. 주소는 위 "쓸 AI"의 Ollama와 같은 칸이에요.
+                  </p>
+                  <p className="v06-note">
+                    <b>처음 쓸 때</b>: ① <b>ollama.com</b>에서 Ollama를 설치해요. ② 터미널에서 아래 명령으로 모델을 받아요. ③ 위에 모델
+                    이름을 넣고 "로컬 모델 시험"을 눌러요.
+                  </p>
+                  {/* The model that judges (its own, else 쓸 AI's Ollama model), as the test tries it. */}
+                  <CopyBlock text={`ollama pull ${judgeModel(draft) || "qwen3:4b"}`} label="모델을 받는 명령" />
+                  <div className="ai-test">
+                    <button className="btn" disabled={!!testing || saving || !judgeModel(draft)} onClick={() => test("judge")}>
+                      {testing === "judge" ? "시험하는 중…" : "로컬 모델 시험"}
+                    </button>
+                    {dirty && !testing && <span className="muted">바꾼 설정을 먼저 저장해요</span>}
+                    {testLine("judge")}
+                  </div>
+                  <p className="v06-note">
+                    로컬 모델은 이 PC에서 돌아서 요금이 없고, 주소가 이 컴퓨터면 아무것도 밖으로 나가지 않아요. 대신 jev보다 느리고 덜
+                    정확할 수 있어요. 위험도에는 신뢰도를 매기지 않고("로컬" 배지), AI 검색의 일치도는 맞아요·아마·아니에요 세
+                    단계로만 답해요. 판정 중에는 "멈추기"(Esc)로 멈추고 확인한 것만 볼 수 있어요.
+                  </p>
+                  <p className="v06-note">
+                    <b>AI 검색의 속도</b>: 로컬 모델에는 후보를 한 항목씩 차례로 물어요. 작은 모델은 여러 개를 한 번에 물으면 다 같은
+                    답을 내서예요. 한 항목에 0.3초쯤 걸려서(qwen3:4b, 노트북 GPU 기준) 파일은 100개, 게임·프로그램은 150개까지만
+                    확인하고, 한 번 찾는 데 수십 초 걸려요. 첫 검색은 모델을 올리느라 더 걸릴 수 있어요.
+                  </p>
+                </>
+              )}
               <p className="v06-note">
-                jev는 얼리 액세스 서비스예요. 내 jev API 키로만 동작하고, 파일 내용은 보내지 않아요. 위험도는 항목의
-                경로·이름·종류·크기·날짜·분류를 보내요. 계획 창에서는 누를 때 그 계획의 항목(500개까지)을 보내요. 목록의 "위험도"는
-                탭마다 따로 켜는데, 켜 두는 동안 그 탭의 목록에 보이는 항목(한 번에 200개까지)을 보내고, 스크롤하거나 다른 폴더로 갈
-                때마다 새로 보이는 항목도 보내요. 뜻으로 찾기는 Enter를 누를 때만 찾는 말과 오늘 날짜, 그리고 후보 항목을 보내요. 파일은
-                240개까지 경로·이름·분류·크기·수정한 날짜를, 게임·프로그램은 400개까지 이름·설치 폴더·게시자를 보내요. 한 번 찾을 때
-                보통 2~6번 요청하고(묻는 중에 Esc를 눌러도 이미 보낸 요청은 요금이 나가요), 같은 검색을 다시 하면 앱을 끌 때까지 저장해
-                둔 답을 써요. "보내기 전에 미리 보기"가 켜져 있으면 계획 창에서는 보내기 전에, 목록의 "위험도"와 검색창의 "뜻으로"는
-                켤 때 무엇을 보내는지 먼저 물어요. 꺼 두면 묻지 않고 보내요. 배지와 일치도는 참고용이고, 실행할 단계는 직접 골라요.
+                "보내기 전에 미리 보기"가 켜져 있으면 계획 창에서는 보내기 전에, 목록의 "위험도"와 AI 검색은 켤 때 무엇을 어디로
+                보내는지 먼저 물어요(이 PC의 로컬 모델은 밖으로 나가는 것이 없어서 묻지 않아요). 꺼 두면 묻지 않고 보내요. 배지와
+                일치도는 참고용이고, 실행할 단계는 직접 골라요.
               </p>
             </section>
 

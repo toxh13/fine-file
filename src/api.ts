@@ -348,6 +348,12 @@ export const v05 = {
 
 export type AiProvider = "off" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli";
 
+/**
+ * v0.10: what judges for the 위험도 badges, AI 검색 and the plan's second check: "jev" (TypeSafe
+ * jev, my key, paid) or "ollama" (a local model, free, this PC).
+ */
+export type JudgeEngine = "jev" | "ollama";
+
 export interface AiSettings {
   provider: AiProvider;
   claude_model: string;
@@ -356,7 +362,12 @@ export interface AiSettings {
   ollama_model: string;
   codex_model: string;
   effort: "low" | "medium" | "high";
+  /** The judge features' master switch ("AI 판정 쓰기"): 위험도 badges, AI 검색, the plan's second check. */
   jev_enabled: boolean;
+  /** v0.10: the engine of those features. Old settings files have none: "jev". */
+  judge: JudgeEngine;
+  /** v0.10: the Ollama model that judges; empty, `ollama_model` does. The address is `ollama_url`. */
+  judge_model: string;
   confirm_before_send: boolean;
 }
 
@@ -375,8 +386,57 @@ export interface AiPayloadPreview {
 export interface Risk {
   path: string;
   level: "safe" | "caution" | "danger";
-  confidence: number;
+  /**
+   * How sure the judge is, 0..1 (jev: 0 when it does not say). v0.10: null for a local model,
+   * which never says.
+   */
+  confidence: number | null;
   regenerable: number | null;
+}
+
+/** A Risk's confidence, or null when the judge gave none (a local model). */
+export function riskConfidence(r: Risk): number | null {
+  return r.confidence ?? null;
+}
+
+/** The judge's name as the app says it: "jev" or "로컬 모델". */
+export const JUDGE_NAME: Record<JudgeEngine, string> = { jev: "jev", ollama: "로컬 모델" };
+
+/** The engine the settings name (an old backend sends none: jev). */
+export const judgeOf = (s: AiSettings): JudgeEngine => (s.judge === "ollama" ? "ollama" : "jev");
+
+/** The Ollama model that judges: its own, else the AI's Ollama model; "" when neither is set. */
+export const judgeModel = (s: AiSettings): string => (s.judge_model ?? "").trim() || (s.ollama_model ?? "").trim();
+
+/**
+ * An address on this computer (Ollama's): what goes there stays on this PC. Only "localhost",
+ * 127.x.x.x and [::1]: another name (even "x.localhost") is looked up in DNS by the backend, which
+ * may send it elsewhere, so it counts as another computer.
+ */
+export function isLocalUrl(url: string): boolean {
+  try {
+    // The URL parser writes IPv4 in its dotted form ("127.1" → "127.0.0.1") and IPv6 shortest, in brackets.
+    const h = new URL(url.trim()).hostname.toLowerCase();
+    return h === "localhost" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where the judge sends what it is asked about, when that leaves this PC: "jev", or the Ollama
+ * address of another computer. Null for an Ollama on this PC (nothing to ask about first).
+ */
+export function judgeTarget(s: AiSettings): string | null {
+  if (judgeOf(s) === "jev") return "jev";
+  const url = (s.ollama_url ?? "").trim();
+  // Empty: the backend's own (this PC's) address.
+  return !url || isLocalUrl(url) ? null : `ollama:${url}`;
+}
+
+/** The Ollama address the judge sends to when it is another computer's; null for jev and for this PC. */
+export function judgeRemote(s: AiSettings): string | null {
+  return judgeOf(s) === "ollama" && judgeTarget(s) !== null ? (s.ollama_url ?? "").trim() : null;
 }
 
 export type PlanKind = "structure" | "rename" | "dedupe" | "shrink" | "relocate" | "cleanup";
@@ -425,16 +485,44 @@ export const ai = {
     invoke<AiPayloadPreview>("ai_preview", { task, path }),
   explain: (path: string) => invoke<string>("ai_explain", { path }),
   plan: (kind: "structure" | "rename", path: string) => invoke<Plan>("ai_plan", { kind, path }),
+  /** 위험도 from the judge the settings name (jev, or a local model since v0.10). The name stays. */
   jevRisk: (paths: string[]) => invoke<Risk[]>("jev_risk", { paths }),
   /**
-   * v0.9 "뜻으로 찾기": jev reads what the query asks for (installed games·programs by genre or
-   * kind, or files by a description, kind and period), the index gathers candidates, and jev
-   * judges each by its path, name, kind, size and date (never its contents). `under`: only below
-   * this folder. Costs jev requests, so it runs only when asked (Enter), never as one types; the
-   * same search again comes from the backend's cache (`requests` 0). Rejects (Korean) while jev is
-   * off or has no key, for an empty or too long query, or before any drive is scanned.
+   * v0.9 AI 검색 ("뜻으로 찾기" before v0.10): the judge (jev, or a local model since v0.10)
+   * reads what the query asks for (installed games·programs by genre or kind, or files by a
+   * description, kind and period), the index gathers candidates, and the judge rates each by its
+   * path, name, kind, size and date (never its contents). `under`: only below this folder. It runs
+   * only when asked (Enter), never as one types (jev bills each request, a local model takes its
+   * time); the same search again comes from the backend's cache (`requests` 0), each engine's
+   * answers apart. Progress comes as "ai-find-progress" (aiEvents.findProgress); findCancel stops
+   * it early, and it then resolves with what was answered (`cancelled`). Rejects (Korean) while the
+   * judge is off or not ready (no jev key, Ollama not running, no model), for an empty or too long
+   * query, or before any drive is scanned.
    */
   jevFind: (query: string, under: string | null) => invoke<JevFound>("jev_find", { query, under }),
+  /**
+   * v0.10: the AI 검색 that runs stops before its next request (the one out finishes); it then
+   * resolves with what was answered so far, `cancelled` true. Nothing runs: nothing happens.
+   */
+  findCancel: () => invoke<void>("ai_find_cancel"),
+  /**
+   * v0.10: the models the Ollama at `url` (the settings' address when null) has, as `ollama list`
+   * names them. Rejects (Korean) when it does not answer.
+   */
+  ollamaModels: (url: string | null) => invoke<string[]>("ai_ollama_models", { url }),
+  /** v0.10: tries the judge as saved (jev: its key; a local model: Ollama has the model). A Korean status line. */
+  judgeTest: () => invoke<string>("ai_judge_test"),
+};
+
+/** v0.10: "ai-find-progress": the AI 검색 that runs has judged `done` of its `total` batches. */
+export interface FindProgress {
+  done: number;
+  total: number;
+}
+
+export const aiEvents = {
+  findProgress: (f: (p: FindProgress) => void): Promise<UnlistenFn> =>
+    listen<FindProgress>("ai-find-progress", (e) => f(e.payload)),
 };
 
 export const plans = {
@@ -490,10 +578,30 @@ export interface Leftover {
   risk: "caution" | "danger";
 }
 
+/**
+ * v0.10: an installed program whose own folder is a given one (program_at, JevHit.program): what
+ * "제거 (제어판처럼)…" shows and the id it hands to v07.uninstall.
+ */
+export interface ProgramRef {
+  id: string;
+  name: string;
+  publisher: string | null;
+  size: number | null;
+  can_uninstall: boolean;
+  machine_wide: boolean;
+  kind: "win32" | "store";
+}
+
 export const v07 = {
   syncDrive: (drive: string) => invoke<ScanResult>("sync_drive", { drive }),
   programs: (withPrefetch = false) => invoke<Program[]>("programs_list", { withPrefetch }),
+  /** Starts the program's own uninstaller (a Store app: removed for this account). It never deletes folders itself. */
   uninstall: (id: string) => invoke<void>("program_uninstall", { id }),
+  /**
+   * v0.10: the installed program whose own folder (or InstallLocation) is exactly `path` (case
+   * aside, no trailing "\"); null when none is, or for Windows' own components.
+   */
+  programAt: (path: string) => invoke<ProgramRef | null>("program_at", { path }),
   leftovers: () => invoke<Leftover[]>("program_leftovers"),
   leftoversPlan: (paths: string[]) => invoke<Plan>("program_leftovers_plan", { paths }),
 };
@@ -607,7 +715,8 @@ export const v082 = {
   startDupLink: (groups: DupLinkGroup[], dup: number | null) => invoke<number>("start_dup_link", { groups, dup }),
 };
 
-// ---- v0.9: 뜻으로 찾기 (jev) — search by meaning (Explorer.tsx's search box, ai.jevFind) ----------
+// ---- v0.9: AI 검색 — search by meaning (Explorer.tsx's search box, ai.jevFind) ----------
+// (v0.9 "뜻으로 찾기" by jev; v0.10 by jev or a local model, as the AI settings say.)
 
 /** The backend's name for an Entry (index.rs EntryInfo): what search returns. */
 export type EntryInfo = Entry;
@@ -627,17 +736,35 @@ export type JevWhen =
   | "last_year"
   | "older";
 
-/** One candidate jev judged. */
+/**
+ * v0.10: what an AI 검색 shows at first: the hits the judge scored this high or more (the rest wait
+ * behind "40% 미만도 보기"), and the 일치도 badge's "mid" from here. Not 0.5 (v0.9): jev's scores
+ * move a little from request to request and with the order of the items, and true matches came as
+ * low as 0.49 while wrong ones stayed at 0.4 or under. A local model answers 0.9, 0.6 or 0.1 only,
+ * which this does not change.
+ */
+export const JEV_SHOW = 0.4;
+
+/** One candidate the judge rated. */
 export interface JevHit {
   /** The file or folder (for a game or program, its install folder). */
   entry: EntryInfo;
-  /** How well it answers the query, 0..1, as jev sees it. The list hides those under 0.5 at first. */
+  /** How well it answers the query, 0..1, as the judge sees it. The list hides those under JEV_SHOW at first. */
   score: number;
   /** A program's display name, or Steam's name for a game (null: none known, the folder's name stands). */
   label: string | null;
+  /**
+   * v0.10: the installed program this folder is (its uninstaller is what "제거 (제어판처럼)…"
+   * runs); null for files, and for game folders Windows has no program for.
+   */
+  program: ProgramRef | null;
 }
 
 export interface JevFound {
+  /** v0.10: who judged: "jev" or "ollama" (a local model). */
+  engine: JudgeEngine;
+  /** v0.10: stopped early (findCancel): `items` hold what was answered before it. */
+  cancelled: boolean;
   /** "app": installed games and programs (a genre or kind: "RPG 게임"); "file": files and folders (a description). */
   target: "app" | "file";
   /** Files only; null: any kind. */
@@ -650,11 +777,16 @@ export interface JevFound {
   items: JevHit[];
   /** Candidates gathered before the cap. */
   candidates: number;
+  /**
+   * v0.10: the cap, the most candidates judged for this engine and target (meaning.rs): jev 240
+   * files, 400 games·programs; a local model, asked one candidate at a time, 100 and 150.
+   */
+  cap: number;
   /** Candidates judged: at most the cap, fewer when a request went unanswered. */
   asked: number;
   /** Programs whose folder is not in the index (Store apps and the like): left out. */
   unplaced: number;
-  /** jev requests sent for this search; 0 when every answer came from the cache. */
+  /** Requests sent to the judge for this search; 0 when every answer came from the cache. */
   requests: number;
   elapsed_ms: number;
 }

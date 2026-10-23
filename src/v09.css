@@ -1,14 +1,57 @@
-/* v0.9: 뜻으로 찾기 (jev). The search box's switch is App.css's .scope; the bar over the results is
-   App.css's .diff-bar. Colors come from the variables in App.css. */
+/* v0.9: AI 검색 (v0.9 "뜻으로 찾기"). The search box's "이 폴더만" is App.css's .scope; the bar over
+   the results is App.css's .diff-bar. Colors come from the variables in App.css. */
 
-/* ---- the search box: room for a second switch ---- */
-.search.with-jev {
-  flex-basis: 420px;
-  min-width: 250px;
-  max-width: 440px;
+/* ---- the search box: [이름 | AI] in front of it (v0.10), so a little wider ---- */
+.search.modes {
+  flex-basis: 440px;
+  min-width: 270px;
+  max-width: 460px;
+  padding-left: 4px;
 }
 
-/* "뜻으로" on: the box says so by its frame too. */
+.search-mode {
+  flex: none;
+  display: inline-flex;
+  height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  overflow: hidden;
+}
+
+.search-mode button {
+  height: 100%;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.search-mode button + button {
+  border-left: 1px solid var(--line);
+}
+
+.search-mode button:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.search-mode button.on {
+  background: var(--sel);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* No judge ready: still there, and says how to get one when pressed. */
+.search-mode button.not-ready:not(.on) {
+  opacity: 0.7;
+}
+
+.search-mode button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* AI mode: the box says so by its frame too. */
 .search.meaning {
   border-color: var(--sel-line);
 }
@@ -53,6 +96,30 @@
 
 .jev-bar .scope.jev-low {
   margin: -2px 0;
+}
+
+/* v0.10: the stop button while a search runs, its progress, and who judged the results shown. */
+.jev-bar .jev-stop {
+  align-self: center;
+  margin: -3px 0;
+}
+
+.jev-bar .jev-progress {
+  font-variant-numeric: tabular-nums;
+}
+
+.jev-bar .jev-engine {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--muted);
+}
+
+.jev-bar .jev-engine.ollama {
+  border-color: var(--sel-line);
+  color: var(--text);
 }
 
 /* ---- the list: the 일치도 column, and the name jev found in a folder ---- */
@@ -100,4 +167,88 @@
 .tr.sel .td.name .alias {
   color: inherit;
   opacity: 0.75;
+}
+
+/* ---- v0.10: "AI" with no judge ready: the two ways to get one ---- */
+.ai-how-ways {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+@media (max-width: 640px) {
+  .ai-how-ways {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.ai-how-way {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.ai-how-way h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.ai-how-way p {
+  margin: 0 0 6px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ai-how-tag {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--hover);
+  font-size: 11px;
+  font-weight: normal;
+  line-height: 16px;
+}
+
+.ai-how-tag.free {
+  background: var(--safe-bg);
+  color: var(--safe-text);
+}
+
+.ai-how-steps {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ai-how code,
+.ai-how-steps code {
+  user-select: text;
+}
+
+/* ---- v0.10: "제거 (제어판처럼)…": the folder it is about ---- */
+.uninstall-ask .uninstall-path {
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* ---- v0.10: the AI settings' judge engine ---- */
+.ai-providers.judge-engines {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.judge-models {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.judge-models .field {
+  flex: 1 1 240px;
 }

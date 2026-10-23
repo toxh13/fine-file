@@ -26,6 +26,8 @@
 //!   UninstallStrings are silent themselves (Squirrel's `Update.exe
 //!   --uninstall -s`, an NSIS `/S`), and the window says so. Store
 //!   apps: Remove-AppxPackage for this user. The app deletes nothing itself.
+//!   A folder that is exactly a program's own (`program_at`, and AI 검색's
+//!   game and program hits) offers the same uninstaller ("제거 (제어판처럼)").
 //! - Leftovers: folders of 50 MB or more straight in Program Files (both),
 //!   ProgramData, AppData (Local, Roaming) and AppData\Local\Programs, from
 //!   the index, that no installed program accounts for by its name,
@@ -46,6 +48,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::core::{GUID, PWSTR};
@@ -91,7 +94,7 @@ const STAT_MOST: usize = 8;
 const PREFETCH_NAME: usize = 29;
 /// How long the Store app list may take, how long a Store app's removal is
 /// waited for (it goes on after that), and how long a list is reused: by the
-/// program list, and by 뜻으로 찾기 (which only needs the apps' folders, and
+/// program list, and by AI 검색 (which only needs the apps' folders, and
 /// should not wait for PowerShell on every search).
 const STORE_LIMIT: Duration = Duration::from_secs(30);
 const REMOVE_LIMIT: Duration = Duration::from_secs(120);
@@ -183,38 +186,217 @@ fn installed(indexes: &Indexes, evidence: &Evidence, store_kept: Duration) -> Ve
     found
 }
 
-/// An installed program for 뜻으로 찾기 (meaning.rs).
+/// An installed program as a search hit or a folder names it ("제거
+/// (제어판처럼)…"): what the confirm says, and the id `program_uninstall` takes.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ProgramRef {
+    pub id: String,
+    pub name: String,
+    pub publisher: Option<String>,
+    pub size: Option<u64>,
+    /// It has an uninstaller the app can start (else the window says why not).
+    pub can_uninstall: bool,
+    /// Machine-wide (HKLM) install: its uninstaller will ask for administrator rights.
+    pub machine_wide: bool,
+    /// "win32" | "store" (removed for this user)
+    pub kind: String,
+}
+
+impl ProgramRef {
+    fn of(p: &Program) -> ProgramRef {
+        ProgramRef {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            publisher: p.publisher.clone(),
+            size: p.size,
+            can_uninstall: p.can_uninstall,
+            machine_wide: p.machine_wide,
+            kind: p.kind.clone(),
+        }
+    }
+}
+
+/// An installed program with its folders, for AI 검색 (meaning.rs) and `program_at`.
+#[derive(Clone, Debug)]
 pub(crate) struct Placed {
-    pub(crate) name: String,
-    pub(crate) publisher: Option<String>,
+    pub(crate) program: ProgramRef,
     /// Where it says it is installed, if it says so.
     pub(crate) location: Option<String>,
-    /// Its own folder, when a scanned drive has it as a live folder (the one `measure` measured).
+    /// Its own folder as written: none when it names none, or one many programs share.
+    pub(crate) home: Option<String>,
+    /// `home` is its InstallLocation, not the folder of its icon or uninstaller.
+    pub(crate) stated: bool,
+    /// That folder, when a scanned drive has it as a live folder now.
     pub(crate) folder: Option<String>,
 }
 
-/// The installed programs `programs_list` lists, each with its own folder
-/// when the index has it. No launch records, Prefetch or file times are
-/// read: only the folders matter here. The Store list of the last ten
-/// minutes will do (PowerShell takes seconds).
-pub(crate) fn placed(all: Vec<Shared>) -> Vec<Placed> {
-    let evidence = Evidence { launches: Vec::new(), prefetch: HashMap::new(), access_kept: false };
-    installed(&Indexes::of(all), &evidence, STORE_KEPT)
-        .into_iter()
-        .map(|f| Placed {
-            folder: f.home.filter(|_| f.program.size_source == "index"),
-            name: f.program.name,
-            publisher: f.program.publisher,
+/// Which of the programs that share a folder it is first: the one whose
+/// InstallLocation it is (a launcher's folder is the launcher's, not a
+/// game's whose uninstaller the launcher is), then one that can be
+/// uninstalled (a suite, not its language packs), the biggest, by name.
+/// AI 검색's hits (meaning.rs) and `program_at` name the same one.
+pub(crate) fn owner_first(a: &Placed, b: &Placed) -> std::cmp::Ordering {
+    b.stated
+        .cmp(&a.stated)
+        .then(b.program.can_uninstall.cmp(&a.program.can_uninstall))
+        .then(b.program.size.cmp(&a.program.size))
+        .then_with(|| a.program.name.cmp(&b.program.name))
+}
+
+/// An installed program as the Uninstall keys or the Store list have it,
+/// before the indexes are asked where it is.
+#[derive(Clone)]
+struct Listed {
+    /// Its size not measured yet.
+    program: ProgramRef,
+    location: Option<String>,
+    home: Option<String>,
+    stated: bool,
+    /// Its own size estimate (EstimatedSize), bytes.
+    estimated: Option<u64>,
+}
+
+impl Listed {
+    fn of(f: Found) -> Listed {
+        Listed {
+            program: ProgramRef::of(&f.program),
+            estimated: f.estimated.filter(|&kb| kb > 0).map(|kb| kb as u64 * 1024),
             location: f.program.install_location,
+            home: f.home,
+            stated: f.stated,
+        }
+    }
+}
+
+/// How long the Uninstall keys' programs are reused: a search and the
+/// menus after it ask again and again, and they change slowly (an
+/// uninstall forgets them at once). Where each one's folder is, is asked of
+/// the indexes every time: a drive scanned meanwhile counts at once.
+const PLACED_FRESH: Duration = Duration::from_secs(60);
+/// The Uninstall keys' programs, and when they were read. Locked while they
+/// are read: who asks meanwhile waits for that reading, not one of its own.
+static REGISTRY: Mutex<Option<(Instant, Vec<Listed>)>> = Mutex::new(None);
+/// The Store list that `STORE` made at that time, as Listed (its apps' manifests read once).
+static STORE_LISTED: Mutex<Option<(Instant, Vec<Listed>)>> = Mutex::new(None);
+
+/// The programs of the Uninstall keys, read again after PLACED_FRESH.
+fn registry_listed(places: &Places) -> Vec<Listed> {
+    let mut kept = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((at, list)) = &*kept
+        && at.elapsed() < PLACED_FRESH
+    {
+        return list.clone();
+    }
+    let list: Vec<Listed> = registry_programs(places, false).into_iter().map(Listed::of).collect();
+    *kept = Some((Instant::now(), list.clone()));
+    list
+}
+
+/// The apps of the Store list made at `at`.
+fn store_listed(at: Instant, apps: Vec<Appx>, places: &Places) -> Vec<Listed> {
+    let mut kept = STORE_LISTED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((made, list)) = &*kept
+        && *made == at
+    {
+        return list.clone();
+    }
+    let list: Vec<Listed> = apps.into_iter().map(|a| Listed::of(store_found(a, places))).collect();
+    *kept = Some((at, list.clone()));
+    list
+}
+
+/// The installed programs `programs_list` lists, each with its own folder,
+/// whether a scanned drive has it now and its size there (else its own
+/// estimate). Only the folders matter here: no launch records, Prefetch or
+/// file times are read. The Store list of the last ten minutes will do,
+/// made now when there is none (PowerShell takes seconds).
+pub(crate) fn placed(all: Vec<Shared>) -> Vec<Placed> {
+    placed_with(all, store_list(STORE_KEPT).ok())
+}
+
+fn placed_with(all: Vec<Shared>, store: Option<(Instant, Vec<Appx>)>) -> Vec<Placed> {
+    let places = Places::now();
+    let mut list = registry_listed(&places);
+    if let Some((at, apps)) = store {
+        list.extend(store_listed(at, apps, &places));
+    }
+    in_indexes(list, &Indexes::of(all))
+}
+
+/// Each program with its folder, if the indexes have it as they are now.
+fn in_indexes(list: Vec<Listed>, indexes: &Indexes) -> Vec<Placed> {
+    list.into_iter()
+        .map(|l| {
+            let size = l.home.as_deref().and_then(|h| indexed_size(indexes, h));
+            Placed {
+                program: ProgramRef { size: size.or(l.estimated), ..l.program },
+                location: l.location,
+                folder: size.and(l.home.clone()),
+                home: l.home,
+                stated: l.stated,
+            }
         })
         .collect()
+}
+
+/// The size of a program's own folder, when an index has it as a live
+/// folder (not a link), as `measure` measures it.
+fn indexed_size(indexes: &Indexes, home: &str) -> Option<u64> {
+    let ix = indexes.of_path(home)?.read().unwrap_or_else(PoisonError::into_inner);
+    let n = ix.find(home).filter(|&n| is_plain_dir(ix.nodes[n as usize].flags))?;
+    Some(ix.nodes[n as usize].size)
+}
+
+/// The installed program whose own folder `path` is, exactly (not a folder
+/// in it, nor one above), for "제거 (제어판처럼)…" on a folder or a hit.
+/// None for anything else, for a place Windows needs and for the user's
+/// own folders. A menu waits for no PowerShell: the Store apps are those of
+/// the last Store list, whatever its age (an old one is made anew meanwhile).
+#[tauri::command]
+pub async fn program_at(path: String, state: tauri::State<'_, crate::AppState>) -> Result<Option<ProgramRef>, String> {
+    let Some(path) = crate::ai::normalize_abs(&path) else { return Ok(None) };
+    let all = state.all();
+    crate::blocking(move || program_in(&placed_with(all, store_list_now()), &path, &still_installed)).await
+}
+
+/// The program of `list` whose own folder is `path` (any case, a `\` at the
+/// end or not): of several (`owner_first`), the first that is `still`
+/// installed. Never a drive, a place Windows needs, nor one of the user's
+/// own folders or one above it (Downloads, Documents, the profile): whatever
+/// an Uninstall key says, those are no program's.
+fn program_in(list: &[Placed], path: &str, still: &dyn Fn(&str) -> bool) -> Option<ProgramRef> {
+    let key = path_key(path);
+    if key.len() <= 3 || matches!(crate::ai::step_guard(path, true), Some("system" | "special")) {
+        return None;
+    }
+    let mut owners: Vec<&Placed> = list.iter().filter(|p| p.home.as_deref().is_some_and(|h| path_key(h) == key)).collect();
+    owners.sort_by(|a, b| owner_first(a, b));
+    owners.into_iter().find(|p| still(&p.program.id)).map(|p| p.program.clone())
+}
+
+/// Whether a program of the list is still installed: a registry one has
+/// its Uninstall key still (its uninstaller may have run since the list was
+/// read: the list is read again then). A Store app's list is made anew
+/// after each removal.
+fn still_installed(id: &str) -> bool {
+    let Some((tag, key_name)) = id.split_once('\\') else { return true };
+    let Some(hive) = Hive::of_tag(tag) else { return false };
+    let there = Key::open(hive.root(), &format!(r"{UNINSTALL_KEY}\{key_name}"), hive.access()).is_some();
+    if !there {
+        *REGISTRY.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+    there
 }
 
 /// Starts the program's own uninstaller (it shows its own windows and asks
 /// for rights itself). Returns once it has started.
 #[tauri::command]
 pub async fn program_uninstall(id: String) -> Result<(), String> {
-    crate::blocking(move || uninstall(&id)).await?
+    let started = crate::blocking(move || uninstall(&id)).await?;
+    // What is installed is about to change: the next search or menu reads it
+    // again (and a menu checks the program it names is still there, `still_installed`).
+    *REGISTRY.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    started
 }
 
 /// Folders in Program Files, ProgramData and AppData that no installed
@@ -398,6 +580,9 @@ impl Places {
             broad.insert(path_key(p));
             broad.extend(parent_of(p).map(path_key));
         }
+        // The user's own folders (Desktop, Documents, Downloads, ..., OneDrive, every
+        // account's profile): an installer's icon left in Downloads makes it no program's.
+        broad.extend(crate::ai::special_folders().iter().map(|p| path_key(p)));
         for (b, area) in &bases {
             let subs: &[&str] = match area {
                 Area::ProgramFiles => &[r"\WindowsApps"],
@@ -599,6 +784,8 @@ struct Found {
     program: Program,
     /// Its own folder, as written: none when it names none, or one many programs share.
     home: Option<String>,
+    /// `home` is its InstallLocation (not the folder of its icon or uninstaller).
+    stated: bool,
     /// Executables the registry names (its icon, its uninstaller): full paths.
     exes: Vec<String>,
     /// What it is called: its name, its key's name, its publisher.
@@ -667,7 +854,8 @@ fn entry(hive: Hive, key_name: &str, key: &Key, places: &Places, every: bool) ->
     }
     exes.retain(|e| !places.in_windows(&path_key(e)));
     exes.dedup_by(|a, b| path_key(a) == path_key(b));
-    let home = location.clone().filter(|l| !places.is_broad(&path_key(l))).or_else(|| infer_home(&exes, places));
+    let stated = location.clone().filter(|l| !places.is_broad(&path_key(l)));
+    let home = stated.clone().or_else(|| infer_home(&exes, places));
     let mut names = vec![name.clone()];
     let bare = key_name.strip_suffix("_is1").unwrap_or(key_name);
     if !is_guid(bare) && !bare.is_empty() {
@@ -691,7 +879,7 @@ fn entry(hive: Hive, key_name: &str, key: &Key, places: &Places, every: bool) ->
         can_uninstall,
         machine_wide: hive != Hive::User,
     };
-    Some(Found { program, home, exes, names, family: None, estimated: key.dword("EstimatedSize"), uninstall })
+    Some(Found { program, stated: stated.is_some(), home, exes, names, family: None, estimated: key.dword("EstimatedSize"), uninstall })
 }
 
 /// The executable a DisplayIcon names (`"C:\x\app.exe",0` → `C:\x\app.exe`).
@@ -836,18 +1024,47 @@ struct Appx {
 
 /// The last list, and when it was made.
 static STORE: Mutex<Option<(Instant, Vec<Appx>)>> = Mutex::new(None);
+/// Held while a list is made: who asks meanwhile waits for that list (one
+/// PowerShell at a time, not one for each).
+static STORE_LISTING: Mutex<()> = Mutex::new(());
+/// A list is being made for `store_list_now`.
+static STORE_REFRESHING: AtomicBool = AtomicBool::new(false);
 
 /// The Store apps of this user: the last list if it is younger than `kept`
 /// (never with `Duration::ZERO`), else a new one.
 fn store_apps(kept: Duration) -> Result<Vec<Appx>, String> {
-    if let Some((at, apps)) = STORE.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
-        && at.elapsed() < kept
-    {
-        return Ok(apps.clone());
+    store_list(kept).map(|(_, apps)| apps)
+}
+
+/// `store_apps`, with when the list was made.
+fn store_list(kept: Duration) -> Result<(Instant, Vec<Appx>), String> {
+    let young = || STORE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|(at, _)| at.elapsed() < kept).cloned();
+    if let Some(list) = young() {
+        return Ok(list);
+    }
+    let _one = STORE_LISTING.lock().unwrap_or_else(PoisonError::into_inner);
+    // Made while this one waited.
+    if let Some(list) = young() {
+        return Ok(list);
     }
     let apps = list_store()?;
-    *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), apps.clone()));
-    Ok(apps)
+    let at = Instant::now();
+    *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some((at, apps.clone()));
+    Ok((at, apps))
+}
+
+/// The last Store list whatever its age, waiting for no PowerShell (for a
+/// menu): one older than STORE_KEPT, or none yet, is made anew in the
+/// background, for the next time.
+fn store_list_now() -> Option<(Instant, Vec<Appx>)> {
+    let last = STORE.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if last.as_ref().is_none_or(|(at, _)| at.elapsed() >= STORE_KEPT) && !STORE_REFRESHING.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let _ = store_list(STORE_KEPT);
+            STORE_REFRESHING.store(false, Ordering::SeqCst);
+        });
+    }
+    last
 }
 
 fn list_store() -> Result<Vec<Appx>, String> {
@@ -991,6 +1208,7 @@ fn store_found(app: Appx, places: &Places) -> Found {
     };
     Found {
         program,
+        stated: home.is_some(),
         home,
         exes: Vec::new(),
         names: vec![display, app.name.clone()],
@@ -1921,12 +2139,119 @@ mod tests {
                 machine_wide: true,
             },
             home: home.map(String::from),
+            stated: home.is_some(),
             exes: Vec::new(),
             names: [Some(name), publisher].into_iter().flatten().map(String::from).collect(),
             family: None,
             estimated: None,
             uninstall: None,
         }
+    }
+
+    /// A program as `placed` gives it: its own folder (`stated`: its
+    /// InstallLocation, else the folder of its icon or uninstaller), live in an index.
+    fn placed_at(name: &str, home: Option<&str>, stated: bool, can_uninstall: bool, size: u64) -> Placed {
+        let f = program(name, Some("Maker"), home);
+        Placed {
+            program: ProgramRef { can_uninstall, size: Some(size), ..ProgramRef::of(&f.program) },
+            location: f.program.install_location,
+            folder: f.home.clone(),
+            home: f.home,
+            stated: stated && home.is_some(),
+        }
+    }
+
+    fn installed_still(_: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn a_folder_is_a_programs_only_when_it_is_its_own() {
+        let placed = |name: &str, home: Option<&str>, can_uninstall: bool, size: u64| placed_at(name, home, true, can_uninstall, size);
+        let list = vec![
+            placed("ELDEN RING", Some(r"D:\SteamLibrary\steamapps\common\ELDEN RING"), true, 50 << 30),
+            placed("Office", Some(r"C:\Program Files\Microsoft Office"), true, 3 << 30),
+            placed("Office ko-kr", Some(r"C:\Program Files\Microsoft Office\"), true, 1 << 30),
+            placed("Office helper", Some(r"c:\program files\microsoft office"), false, 9 << 30),
+            placed("No folder", None, true, 1),
+        ];
+        let at = |p: &str| program_in(&list, p, &installed_still).map(|r| r.name);
+        // Exactly its folder, in any case, with or without a `\` at the end.
+        assert_eq!(at(r"d:\steamlibrary\STEAMAPPS\common\elden ring\").as_deref(), Some("ELDEN RING"));
+        // Not a folder in it, not one above it, not a drive.
+        assert_eq!(at(r"D:\SteamLibrary\steamapps\common\ELDEN RING\Game"), None);
+        assert_eq!(at(r"D:\SteamLibrary\steamapps\common"), None);
+        assert_eq!(at(r"D:\"), None);
+        // Shared by a suite and its parts: the one that can be removed, then the biggest.
+        assert_eq!(at(r"C:\Program Files\Microsoft Office").as_deref(), Some("Office"));
+        let r = program_in(&list, r"C:\Program Files\Microsoft Office", &installed_still).unwrap();
+        assert_eq!((r.id.as_str(), r.publisher.as_deref(), r.kind.as_str(), r.machine_wide), (r"HKLM64\Office", Some("Maker"), "win32", true));
+        // One that is gone since the list was read (its uninstaller ran): the next one, or none.
+        let gone = |id: &str| id != r"HKLM64\Office";
+        assert_eq!(program_in(&list, r"C:\Program Files\Microsoft Office", &gone).map(|r| r.name).as_deref(), Some("Office ko-kr"));
+        assert!(program_in(&list, r"D:\SteamLibrary\steamapps\common\ELDEN RING", &|_| false).is_none());
+        // A place Windows needs is never offered.
+        let windows = vec![placed("Windows Help", Some(r"C:\Windows\Help"), true, 1)];
+        assert!(program_in(&windows, r"C:\Windows\Help", &installed_still).is_none());
+        // One that cannot be removed is still named (the window says why it cannot).
+        let only = vec![placed("Locked", Some(r"C:\Tools\Locked"), false, 1)];
+        assert_eq!(program_in(&only, r"C:\Tools\Locked", &installed_still).map(|r| r.can_uninstall), Some(false));
+        assert!(program_in(&[], r"C:\Tools\Locked", &installed_still).is_none());
+
+        // A launcher's folder is the launcher's (its InstallLocation), not that of a game
+        // whose uninstaller is the launcher's exe (the folder only guessed from it).
+        let launcher = r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher";
+        let list = vec![placed_at("Assassin's Creed", Some(launcher), false, true, 1 << 30), placed_at("Ubisoft Connect", Some(launcher), true, true, 1 << 30)];
+        assert_eq!(program_in(&list, launcher, &installed_still).map(|r| r.name).as_deref(), Some("Ubisoft Connect"));
+        let mut both = list.clone();
+        both.sort_by(owner_first);
+        assert_eq!(both[0].program.name, "Ubisoft Connect");
+    }
+
+    #[test]
+    fn the_users_own_folders_are_no_programs() {
+        use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, FOLDERID_Downloads};
+        // An installer that left its icon in Downloads, or named it as where it is installed.
+        for id in [FOLDERID_Downloads, FOLDERID_Documents, FOLDERID_Profile] {
+            let Some(dir) = known_folder(&id) else { continue };
+            let list = vec![placed_at("Foo", Some(&dir), true, true, 1)];
+            assert!(program_in(&list, &dir, &installed_still).is_none(), "{dir}");
+            let p = Places::now();
+            assert!(p.is_broad(&path_key(&dir)), "{dir}");
+            assert_eq!(infer_home(&[format!(r"{dir}\FooSetup.exe")], &p), None, "{dir}");
+            // A folder of its own in there still is one.
+            let own = format!(r"{dir}\Tools\Foo");
+            assert_eq!(infer_home(&[format!(r"{own}\foo.exe")], &p).as_deref(), Some(own.as_str()));
+            let list = vec![placed_at("Foo", Some(&own), false, true, 1)];
+            assert_eq!(program_in(&list, &own, &installed_still).map(|r| r.name).as_deref(), Some("Foo"));
+        }
+    }
+
+    #[test]
+    fn where_programs_are_is_asked_of_the_indexes_as_they_are_now() {
+        let raw = vec![
+            RawEntry { id: 1, parent: 1, name: ".".into(), flags: FLAG_DIR, size: 0, alloc: 0, modified: 0 },
+            RawEntry { id: 2, parent: 1, name: "Games".into(), flags: FLAG_DIR, size: 0, alloc: 0, modified: 0 },
+            RawEntry { id: 3, parent: 2, name: "Foo".into(), flags: FLAG_DIR, size: 0, alloc: 0, modified: 0 },
+            RawEntry { id: 4, parent: 3, name: "foo.exe".into(), flags: 0, size: 5 * GB, alloc: 5 * GB, modified: 0 },
+        ];
+        let d: Shared = std::sync::Arc::new(std::sync::RwLock::new(Index::build("D:", "test", 0, raw, 1)));
+        let listed = |home: &str| Listed {
+            program: ProgramRef::of(&program("Foo", None, Some(home)).program),
+            location: Some(home.into()),
+            home: Some(home.into()),
+            stated: true,
+            estimated: Some(MB),
+        };
+        let list = vec![listed(r"D:\Games\Foo"), listed(r"D:\Games\Gone")];
+        // D: not scanned yet: its own estimate, no folder.
+        let before = in_indexes(list.clone(), &Indexes(HashMap::new()));
+        assert_eq!((before[0].folder.as_deref(), before[0].program.size), (None, Some(MB)));
+        // Scanned since: the folder counts at once, measured.
+        let after = in_indexes(list, &Indexes::of(vec![d]));
+        assert_eq!((after[0].folder.as_deref(), after[0].program.size), (Some(r"D:\Games\Foo"), Some(5 * GB)));
+        assert_eq!((after[1].folder.as_deref(), after[1].program.size), (None, Some(MB)));
+        assert!(after[0].stated);
     }
 
     fn userassist_data(count: u32, last: i64) -> Vec<u8> {

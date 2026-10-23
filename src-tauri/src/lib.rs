@@ -4,6 +4,7 @@ mod classify;
 mod diff;
 mod dups;
 mod index;
+mod judge;
 mod mapview;
 mod mcp;
 mod meaning;
@@ -1660,11 +1661,15 @@ pub fn run() {
             ai::ai_key_status,
             ai::ai_set_key,
             ai::ai_test,
+            ai::ai_judge_test,
+            ai::ai_ollama_models,
             ai::ai_preview,
             ai::ai_explain,
             ai::ai_plan,
             ai::jev_risk,
             meaning::jev_find,
+            meaning::ai_find,
+            meaning::ai_find_cancel,
             plans::plans_list,
             plans::plan_get,
             plans::plan_rules,
@@ -1674,6 +1679,7 @@ pub fn run() {
             plans::plan_delete,
             programs::programs_list,
             programs::program_uninstall,
+            programs::program_at,
             programs::program_leftovers,
             programs::program_leftovers_plan,
             sync_drive,
