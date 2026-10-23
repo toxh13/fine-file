@@ -3,10 +3,10 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 // ---- the toolbar's second row (the command bar), as Windows 11 Explorer has it ----------
 
 /**
- * Below this width of the command bar (a window of about 1000 px, with the sidebar) the less used
- * commands fold into "⋯".
+ * Below this width of the command bar (a window of about 900 px, with the sidebar) the less used
+ * commands (정리 ▾) fold into "⋯". All of them take about 600 px.
  */
-const FOLD_AT = 740;
+const FOLD_AT = 640;
 
 /** How far the command bar is folded: 0 nothing, then one more group per step (see Explorer). */
 export const FOLD_MAX = 3;
@@ -60,7 +60,7 @@ export interface MenuButtonProps {
 }
 
 /**
- * A button that opens a menu under it (도구 ▾, 보기 ▾, ⋯). The keyboard works as in a menu button:
+ * A button that opens a menu under it (보기 ▾, 정리 ▾, ⋯). The keyboard works as in a menu button:
  * Enter or Space (or a click) open it with the focus on the checked (or first) item; ↑ ↓ Home End
  * move, Esc and Tab close it and give the focus back to the button. Choosing an item closes it (the
  * focus goes back to the button when it was chosen with the keyboard); a click anywhere else, the
@@ -326,6 +326,22 @@ export const Icon = {
   diff: () => (
     <Svg>
       <path d="M4.2 13.4V5.6M2.2 7.6l2-2 2 2M11.8 2.6v7.8M9.8 8.4l2 2 2-2" />
+    </Svg>
+  ),
+  /** A shield with "!": the judge's 위험도. */
+  risk: () => (
+    <Svg>
+      <path d="M8 1.8l5 1.8v4.2c0 3-2.1 5.1-5 6.4-2.9-1.3-5-3.4-5-6.4V3.6z" />
+      <path d="M8 5.2v3.4M8 10.9v.1" />
+    </Svg>
+  ),
+  /** A broom: 정리 ▾. */
+  tidy: () => (
+    <Svg>
+      <path d="M14 2 8.6 7.4" />
+      <path d="M7.4 6.2l2.4 2.4" />
+      <path d="M7.4 6.2 2 10.4 5.6 14l4.2-5.4" />
+      <path d="M7.4 8.6 4.2 11.8" />
     </Svg>
   ),
   search: () => (

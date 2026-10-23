@@ -236,12 +236,12 @@ function riskHeadTitle(engine: JudgeEngine, remote: string | null): string {
           : "· 경로·이름·크기·날짜 같은 정보만 모델에 줘요 (파일 내용은 주지 않아요)\n" +
             "· 요금은 없고, 아무것도 밖으로 나가지 않아요\n") +
         '· 로컬 모델은 신뢰도를 매기지 않아요("로컬" 배지). jev보다 느리고 덜 정확할 수 있어요\n' +
-        '· 툴바의 "위험도"로 켜고 꺼요. 이 열로는 정렬하지 않아요'
+        '· 보기 ▾ → "위험도 (AI 판정)"로 켜고 꺼요. 이 열로는 정렬하지 않아요'
     : "위험도 (TypeSafe jev): 이 항목을 지워도 되는지 jev가 본 판정이에요 (안전·주의·위험).\n" +
         "· 참고용이에요. 아무것도 지우거나 고르지 않아요\n" +
         "· 경로·이름·크기·날짜 같은 정보만 보내요 (파일 내용은 보내지 않아요)\n" +
         "· 내 jev API 키로 물어서, 요금은 jev 조건대로 키 주인에게 청구돼요\n" +
-        '· 툴바의 "위험도"로 켜고 꺼요. 이 열로는 정렬하지 않아요';
+        '· 보기 ▾ → "위험도 (AI 판정)"로 켜고 꺼요. 이 열로는 정렬하지 않아요';
 }
 
 function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, riskEngine, score, alias }: { col: Column; e: Entry } & Props) {

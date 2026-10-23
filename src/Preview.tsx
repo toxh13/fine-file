@@ -7,7 +7,8 @@ import { folderTitle, formatDate, formatSize, parentOf, pathKey, typeLabel } fro
 import { Glyph } from "./GridView";
 import "./components.css";
 
-// ---- the details pane (상세 정보): what an item is, where it is, and a preview of it ----
+// ---- the details pane (상세 정보): what an item is, where it is, and a preview of it. It is a tab of
+// the side pane, whose head (the tabs, the close button) is Explorer's. ----
 
 /** Wait for the selection to settle, so arrowing through a folder loads nothing in between. */
 const DEBOUNCE = 150;
@@ -51,7 +52,6 @@ export interface PreviewProps {
    * the share of it that it takes is shown.
    */
   parentSize?: number;
-  onClose: () => void;
   /** The location's copy button: the full paths go to the clipboard as text. */
   onCopyPaths: (items: Entry[]) => void;
   /** Folder sizes are known (indexed folder, search results). Left out, a folder shows a size when it has one. */
@@ -107,7 +107,7 @@ function Location({ text, onCopy }: { text: string; onCopy: () => void }) {
   );
 }
 
-export function Preview({ entry, selection, parentSize, onClose, onCopyPaths, sized, adminFolder, drives }: PreviewProps) {
+export function Preview({ entry, selection, parentSize, onCopyPaths, sized, adminFolder, drives }: PreviewProps) {
   const [shown, setShown] = useState<Shown | null>(null);
   // Media the page could not play after all (a codec WebView2 lacks): the shell thumbnail stands in.
   const [broken, setBroken] = useState<string | null>(null);
@@ -202,32 +202,11 @@ export function Preview({ entry, selection, parentSize, onClose, onCopyPaths, si
     setAdminBusy((b) => (b === s.key ? null : b));
   };
 
-  const head = (
-    <div className="preview-head">
-      <span className="preview-title">상세 정보</span>
-      <button className="preview-close" aria-label="상세 정보 닫기" title="상세 정보 닫기 (Alt+P)" onClick={onClose}>
-        ✕
-      </button>
-    </div>
-  );
-
   if (selection && selection.length > 1) {
-    return (
-      <aside className="preview" aria-label="상세 정보">
-        {head}
-        <Summary items={selection} sized={sized} parentSize={parentSize} onCopyPaths={onCopyPaths} />
-      </aside>
-    );
+    return <Summary items={selection} sized={sized} parentSize={parentSize} onCopyPaths={onCopyPaths} />;
   }
 
-  if (!entry) {
-    return (
-      <aside className="preview" aria-label="상세 정보">
-        {head}
-        <div className="preview-empty">항목을 고르면 여기에 상세 정보가 보여요</div>
-      </aside>
-    );
-  }
+  if (!entry) return <div className="preview-empty">항목을 고르면 여기에 상세 정보가 보여요</div>;
 
   let sizeText = "—";
   // preview_info reads the size from disk, which is newer than the index's.
@@ -244,76 +223,73 @@ export function Preview({ entry, selection, parentSize, onClose, onCopyPaths, si
   const fill = !!preview && (!!elevated || (kind !== null && FILLS.has(kind)));
 
   return (
-    <aside className="preview" aria-label="상세 정보">
-      {head}
-      <div className="details-scroll">
-        <div className="details-top">
-          <span className="details-icon">
-            {fresh && thumbUrl ? <img src={thumbUrl} alt="" draggable={false} /> : <Glyph e={entry} />}
-          </span>
-          <span className="details-title" title={entry.path}>
-            {entry.name}
-          </span>
-        </div>
-
-        <dl className="preview-meta">
-          <dt>종류</dt>
-          <dd title={fresh?.info?.mime ?? undefined}>{typeLabel(entry.name, entry.is_dir)}</dd>
-          <dt>크기</dt>
-          <dd>{sizeText}</dd>
-          {folderKnown && (
-            <>
-              <dt>파일 수</dt>
-              <dd>{entry.files.toLocaleString()}개</dd>
-            </>
-          )}
-          <dt>수정한 날짜</dt>
-          <dd>{formatDate(entry.modified) || "—"}</dd>
-          <Location text={folder ?? entry.path} onCopy={() => onCopyPaths([entry])} />
-          {attrs && (
-            <>
-              <dt>속성</dt>
-              <dd>{attrs}</dd>
-            </>
-          )}
-          {folder && sizeKnown && !!parentSize && parentSize > 0 && <Share size={entry.size} parent={parentSize} folder={folder} />}
-        </dl>
-
-        {preview && (
-          <section className={`details-preview${fill ? " fill" : ""}`} aria-label="미리 보기">
-            <h4 className="details-sub">미리 보기</h4>
-            <div className={`preview-body ${loading ? "stale" : ""}`}>
-              {elevated ? (
-                <AdminBody s={preview} info={elevated} />
-              ) : kind ? (
-                <Body
-                  s={preview}
-                  kind={kind}
-                  thumb={thumbUrl}
-                  thumbDone={thumbDone}
-                  broken={broken === preview.key}
-                  onBroken={() => setBroken(preview.key)}
-                />
-              ) : null}
-              {canElevate && fresh && (
-                <div className="preview-admin">
-                  <p>
-                    {isDenied(fresh.error)
-                      ? "이 파일은 지금 권한으로 읽을 수 없어요."
-                      : "관리자 권한으로 읽은 폴더예요. 관리자 권한으로 파일 앞부분을 읽어 볼 수 있어요."}
-                  </p>
-                  <button disabled={adminBusy === fresh.key} onClick={() => readAsAdmin(fresh)}>
-                    {adminBusy === fresh.key ? "읽는 중…" : "관리자 권한으로 읽기"}
-                  </button>
-                  {adminRead?.key === fresh.key && adminRead.error && <p className="preview-note error">{adminRead.error}</p>}
-                  <p className="muted">앞부분 256 KB만 읽고, 파일은 바꾸지 않아요.</p>
-                </div>
-              )}
-            </div>
-          </section>
-        )}
+    <div className="details-scroll">
+      <div className="details-top">
+        <span className="details-icon">
+          {fresh && thumbUrl ? <img src={thumbUrl} alt="" draggable={false} /> : <Glyph e={entry} />}
+        </span>
+        <span className="details-title" title={entry.path}>
+          {entry.name}
+        </span>
       </div>
-    </aside>
+
+      <dl className="preview-meta">
+        <dt>종류</dt>
+        <dd title={fresh?.info?.mime ?? undefined}>{typeLabel(entry.name, entry.is_dir)}</dd>
+        <dt>크기</dt>
+        <dd>{sizeText}</dd>
+        {folderKnown && (
+          <>
+            <dt>파일 수</dt>
+            <dd>{entry.files.toLocaleString()}개</dd>
+          </>
+        )}
+        <dt>수정한 날짜</dt>
+        <dd>{formatDate(entry.modified) || "—"}</dd>
+        <Location text={folder ?? entry.path} onCopy={() => onCopyPaths([entry])} />
+        {attrs && (
+          <>
+            <dt>속성</dt>
+            <dd>{attrs}</dd>
+          </>
+        )}
+        {folder && sizeKnown && !!parentSize && parentSize > 0 && <Share size={entry.size} parent={parentSize} folder={folder} />}
+      </dl>
+
+      {preview && (
+        <section className={`details-preview${fill ? " fill" : ""}`} aria-label="미리 보기">
+          <h4 className="details-sub">미리 보기</h4>
+          <div className={`preview-body ${loading ? "stale" : ""}`}>
+            {elevated ? (
+              <AdminBody s={preview} info={elevated} />
+            ) : kind ? (
+              <Body
+                s={preview}
+                kind={kind}
+                thumb={thumbUrl}
+                thumbDone={thumbDone}
+                broken={broken === preview.key}
+                onBroken={() => setBroken(preview.key)}
+              />
+            ) : null}
+            {canElevate && fresh && (
+              <div className="preview-admin">
+                <p>
+                  {isDenied(fresh.error)
+                    ? "이 파일은 지금 권한으로 읽을 수 없어요."
+                    : "관리자 권한으로 읽은 폴더예요. 관리자 권한으로 파일 앞부분을 읽어 볼 수 있어요."}
+                </p>
+                <button disabled={adminBusy === fresh.key} onClick={() => readAsAdmin(fresh)}>
+                  {adminBusy === fresh.key ? "읽는 중…" : "관리자 권한으로 읽기"}
+                </button>
+                {adminRead?.key === fresh.key && adminRead.error && <p className="preview-note error">{adminRead.error}</p>}
+                <p className="muted">앞부분 256 KB만 읽고, 파일은 바꾸지 않아요.</p>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </div>
   );
 }
 

@@ -252,3 +252,189 @@
 .judge-models .field {
   flex: 1 1 240px;
 }
+
+/* The comparison bar's "크기 변화 끄기", at its end. */
+.diff-bar .diff-off {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ---- the side pane's head: [상세 정보 | 정리 도우미] tabs, and one close button ---- */
+.preview-head.pane-head {
+  gap: 4px;
+  padding-left: 6px;
+}
+
+.pane-tabs {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-self: stretch;
+  gap: 2px;
+}
+
+.pane-tab {
+  position: relative;
+  flex: none;
+  padding: 0 10px;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pane-tab:hover {
+  color: var(--text);
+}
+
+.pane-tab.on {
+  color: var(--text);
+}
+
+/* The tab shown: a line on the head's bottom edge. */
+.pane-tab.on::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+}
+
+.pane-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -4px;
+  border-radius: 6px;
+}
+
+/* The tab shown, under the head: laid out as the pane itself was (a column that fills it). */
+.pane-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- 정리 도우미, in the side pane: what it looks at, then its sections; the pane scrolls as one ---- */
+.details-scroll.helper {
+  padding: 12px 14px 16px;
+}
+
+.helper-target {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  overflow-wrap: anywhere;
+}
+
+.helper-target-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.helper-target-row b {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.helper-mark {
+  flex: none;
+  font-size: 13px;
+}
+
+.helper-target .muted {
+  font-size: 12px;
+  user-select: text;
+}
+
+.helper-target .helper-follow {
+  font-size: 11px;
+}
+
+.btn.helper-pin {
+  flex: none;
+  white-space: nowrap;
+}
+
+.btn.helper-pin.on {
+  border-color: var(--sel-line);
+  background: var(--sel);
+  color: var(--text);
+}
+
+/* Another item's request is out: the buttons wait for it. */
+.helper-busy {
+  flex: none;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--sel);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.details-scroll.helper .v06-section {
+  flex: none;
+  padding: 12px 0;
+}
+
+.details-scroll.helper .v06-section-head {
+  flex-wrap: wrap;
+}
+
+.details-scroll.helper .ai-answer {
+  max-height: none;
+}
+
+.helper-made {
+  margin: 8px 0 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* "이 내용을 보낼까요?", in the pane. */
+.helper-send {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.helper-send h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.helper-send p.muted {
+  margin: 4px 0 8px;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.helper-send .ai-preview-text {
+  max-height: 40vh;
+}
+
+.helper-send .actions {
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.helper-foot {
+  flex: none;
+  display: flex;
+  margin-top: 12px;
+}

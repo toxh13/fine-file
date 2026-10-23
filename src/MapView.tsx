@@ -959,13 +959,13 @@ export function MapView({
         <button
           className={`tool${diffOn ? " on" : ""}`}
           aria-pressed={diffOn}
-          title="지난 스캔과 비교해서 커지거나 작아진 곳을 색으로 보여요"
+          title="크기 변화: 지난 스캔과 비교해서 커지거나 작아진 곳을 색으로 보여요"
           onClick={() => {
             setDiffOn(!diffOn);
             storeDiff(!diffOn);
           }}
         >
-          변화
+          크기 변화
         </button>
         {mode === "mindmap" && (
           <button className="tool" disabled={!pinned} title="가지 나무가 한눈에 들어오게 맞춰요" onClick={() => setMoved(null)}>
@@ -1102,7 +1102,7 @@ export function MapView({
       </div>
 
       {diffs ? (
-        <div className="map-legend" aria-label="변화">
+        <div className="map-legend" aria-label="크기 변화">
           <span className="map-key">
             <i className="map-swatch diff-grow" />
             커짐

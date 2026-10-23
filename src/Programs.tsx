@@ -729,7 +729,7 @@ export function Programs({
                     `${madeRunnable > 0 ? `${madeSkipped.toLocaleString()}단계는` : "모든 단계가"} 정리 계획이 건드리지 않는 곳(대부분 Program Files·ProgramData·AppData 안)이라 "건너뜀"으로 저장했고, 실행되지 않아요(단계마다 이유가 있어요). 그런 폴더는 "위치 보기"로 열어 확인한 뒤 직접 Delete(휴지통)로 지워 주세요. `}
                   {madeRunnable > 0 &&
                     `${madeSkipped > 0 ? `나머지 ${madeRunnable.toLocaleString()}단계는` : "단계는"} 처음에 골라 두지 않았어요. ${
-                      onOpenPlan ? "계획 창에서" : '툴바의 "계획"에서 이 계획을 열어'
+                      onOpenPlan ? "계획 창에서" : '툴바의 "정리 ▾ → 정리 계획 목록…"(창이 좁으면 "⋯" 안)에서 이 계획을 열어'
                     } 확인하고 골라 "실행"을 눌러야 휴지통으로 가요.`}
                 </span>
                 {onOpenPlan && (

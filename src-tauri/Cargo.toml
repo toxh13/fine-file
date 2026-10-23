@@ -1,6 +1,6 @@
 [package]
 name = "fine-file"
-version = "0.10.0"
+version = "0.10.1"
 description = "Fast Windows file explorer with folder sizes and instant search"
 authors = ["toxh13"]
 license = "MIT OR Apache-2.0"

@@ -27,6 +27,8 @@ import {
   type AiState,
   type Changes,
   type ExplorerHandle,
+  type PaneState,
+  type PaneTab,
   type View,
 } from "./Explorer";
 import { FirstRunGuide, HELP_TIPS, Help, firstRunDone } from "./Help";
@@ -40,7 +42,10 @@ import "./App.css";
 /** v0.2 had one view for the window: the first tab gets it when no tabs were saved. */
 const VIEW_KEY = "fine-file.view";
 const TABS_KEY = "fine-file.tabs";
-/** The details pane (상세 정보; "미리 보기" up to v0.8): open, and its width. */
+/**
+ * The side pane: open, its width, and its tab (상세 정보, "미리 보기" up to v0.8; or 정리 도우미).
+ * Saved before it had tabs, it opens on 상세 정보.
+ */
 const PREVIEW_KEY = "fine-file.preview";
 
 interface Tab {
@@ -78,15 +83,16 @@ function savedTabs(): { tabs: Omit<Tab, "id">[]; active: number } | null {
   }
 }
 
-function savedPreview(): { open: boolean; width: number } {
+function savedPane(): PaneState {
   try {
     const v = JSON.parse(localStorage.getItem(PREVIEW_KEY) ?? "null");
     return {
       open: v?.open === true,
+      tab: v?.tab === "helper" ? "helper" : "details",
       width: typeof v?.width === "number" && v.width >= 200 && v.width <= 2000 ? v.width : 320,
     };
   } catch {
-    return { open: false, width: 320 };
+    return { open: false, tab: "details", width: 320 };
   }
 }
 
@@ -258,7 +264,7 @@ export default function App() {
   // Each tab's handle, for what every tab hears about (live changes, scans) and the sidebar.
   const handles = useRef(new Map<number, ExplorerHandle>());
   const tabBar = useRef<HTMLDivElement>(null);
-  const [preview, setPreview] = useState(savedPreview);
+  const [pane, setPane] = useState(savedPane);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
     const id = Date.now() + Math.random();
@@ -340,8 +346,9 @@ export default function App() {
     );
   }, []);
 
-  // Drafts proposed over MCP: the "계획" button's badge. They come from another process without an
-  // event, so the list is read again when the window comes back to the front, and now and then.
+  // Drafts proposed over MCP: the badge on "정리 ▾" (and its "정리 계획 목록…"). They come from another
+  // process without an event, so the list is read again when the window comes back to the front, and
+  // now and then.
   const [planDrafts, setPlanDrafts] = useState(0);
   const plansReq = useRef(0);
   const refreshPlans = useCallback(() => {
@@ -416,11 +423,11 @@ export default function App() {
     store(TABS_KEY, JSON.stringify({ tabs: tabs.map(({ path, view }) => ({ path, view })), active }));
   }, [tabs, activeId]);
 
-  // Dragging the details pane's edge changes its width many times a second: saved once it rests.
+  // Dragging the side pane's edge changes its width many times a second: saved once it rests.
   useEffect(() => {
-    const t = setTimeout(() => store(PREVIEW_KEY, JSON.stringify(preview)), 300);
+    const t = setTimeout(() => store(PREVIEW_KEY, JSON.stringify(pane)), 300);
     return () => clearTimeout(t);
-  }, [preview]);
+  }, [pane]);
 
   // Watchers start and stop on their own (a drive is plugged in, a watch fails quietly), so the
   // sidebar asks again now and then; it is a small in-memory answer.
@@ -559,8 +566,21 @@ export default function App() {
     tabBar.current?.querySelector(".tab.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeId, tabs.length]);
 
-  const togglePreview = useCallback(() => setPreview((v) => ({ ...v, open: !v.open })), []);
-  const setPreviewWidth = useCallback((width: number) => setPreview((v) => (v.width === width ? v : { ...v, width })), []);
+  // "상세 정보" (Alt+P) and "정리 도우미" (Alt+H): the pane on that tab, or closed when that tab shows.
+  const togglePane = useCallback(
+    (tab: PaneTab) => setPane((v) => (v.open && v.tab === tab ? { ...v, open: false } : { ...v, open: true, tab })),
+    [],
+  );
+  // The pane's tabs and its close button (null), a menu's "정리 도우미로 보기": switching tabs keeps it open.
+  const showPane = useCallback(
+    (tab: PaneTab | null) =>
+      setPane((v) => {
+        if (tab === null) return v.open ? { ...v, open: false } : v;
+        return v.open && v.tab === tab ? v : { ...v, open: true, tab };
+      }),
+    [],
+  );
+  const setPaneWidth = useCallback((width: number) => setPane((v) => (v.width === width ? v : { ...v, width })), []);
 
   // ---- copy, move, paste ----
 
@@ -1062,9 +1082,13 @@ export default function App() {
         ev.preventDefault();
         closeTab(activeId);
       } else if (ev.altKey && !ev.ctrlKey && !ev.metaKey && isLetter(ev, "p")) {
-        // The details pane (상세 정보): Alt+P, and Alt+Shift+P as in Explorer (Shift is not looked at).
+        // The side pane on 상세 정보: Alt+P, and Alt+Shift+P as in Explorer (Shift is not looked at).
         ev.preventDefault();
-        togglePreview();
+        togglePane("details");
+      } else if (ev.altKey && !ev.ctrlKey && !ev.metaKey && isLetter(ev, "h")) {
+        // The side pane on 정리 도우미 (Alt+Shift+H too).
+        ev.preventDefault();
+        togglePane("helper");
       } else if (ev.key === "F1" && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.shiftKey) {
         // The help. While a dialog is open (the help itself too) its keys stop there.
         ev.preventDefault();
@@ -1403,10 +1427,10 @@ export default function App() {
               onScan={scan}
               refreshDrives={refreshDrives}
               banners={t.id === activeId ? banners : null}
-              previewOpen={preview.open}
-              previewWidth={preview.width}
-              onTogglePreview={togglePreview}
-              onPreviewWidth={setPreviewWidth}
+              pane={pane}
+              onTogglePane={togglePane}
+              onShowPane={showPane}
+              onPaneWidth={setPaneWidth}
               toast={toast}
               onState={onTabState}
               onOpenTab={openTab}

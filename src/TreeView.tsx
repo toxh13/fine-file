@@ -327,6 +327,11 @@ export function TreeView(p: Props) {
           if (cur.open) toggle(cur.key, false);
           else if (cur.depth > 0) setFocus(cur.parent);
           break;
+        case "Escape":
+          // No row then, as Esc clears the list's selection: what follows the row (상세 정보, the
+          // 정리 도우미) goes back to the folder shown. ↓ or Home picks the first row again.
+          setFocus(null);
+          break;
       }
     };
     window.addEventListener("keydown", onKey);

@@ -561,7 +561,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
               </p>
               <ul className="v06-list">
                 <li>
-                  <b>목록의 "위험도" 열</b>: 목록 보기 툴바의 "위험도"를 켜면, 그 탭에 보이는 항목마다 판정이 배지로 붙어요.
+                  <b>목록의 "위험도" 열</b>: 목록 보기에서 보기 ▾ → "위험도 (AI 판정)"를 켜면, 그 탭에 보이는 항목마다 판정이 배지로 붙어요.
                 </li>
                 <li>
                   <b>정리 계획의 2차 확인</b>: 계획 창의 "위험도 다시 확인"을 누르면, 계획(규칙이나 AI)이 매긴 위험 옆에 판정이 "jev
@@ -583,8 +583,8 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
                 <span className="v06-check-main">
                   <span>AI 판정 쓰기 (위험도 배지, AI 검색)</span>
                   <span className="muted">
-                    켜면 계획 창의 "위험도 다시 확인"과 목록 보기 툴바의 "위험도" 버튼이 생기고, 검색창의 "AI"로 찾을 수 있어요.
-                    위험도는 그 버튼을 눌러야, AI 검색은 Enter를 눌러야 판정해요(언제 무엇을 보내는지는 아래).
+                    켜면 계획 창의 "위험도 다시 확인"과 목록 보기의 보기 ▾ → "위험도 (AI 판정)"를 쓸 수 있고, 검색창의 "AI"로 찾을 수
+                    있어요. 위험도는 그것을 켜야, AI 검색은 Enter를 눌러야 판정해요(언제 무엇을 보내는지는 아래).
                   </span>
                 </span>
               </label>

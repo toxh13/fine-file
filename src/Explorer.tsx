@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ai,
   aiEvents,
@@ -34,7 +34,7 @@ import {
   type Risk,
 } from "./api";
 import { AdminBar, adminCanRead, adminError, ensureAdmin } from "./AdminSession";
-import { AiPanel, contentsNote } from "./AiPanel";
+import { contentsNote, HelperPane, useHelper, type HelperTarget } from "./AiPanel";
 import { AiSettings } from "./AiSettings";
 import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
@@ -72,10 +72,10 @@ export const TIPS: Record<string, string> = {
   reveal: "Windows 탐색기를 열어 이 항목을 골라 둬요",
   goParent: "이 항목이 들어 있는 폴더를 이 탭에서 열어요",
   copyPath: "전체 경로를 글자로 클립보드에 복사해요",
-  explain: "이 항목이 무엇인지, 어느 프로그램 것인지, 지워도 되는지 AI에게 설명을 받아요 (AI는 켜야 쓰는 선택 기능)",
+  helperOpen: "옆 창의 정리 도우미가 이 폴더를 봐요. AI 설명과 정리 계획(규칙으로는 AI 없이)을 거기서 받아요",
+  helperOpenFile: "옆 창의 정리 도우미가 이 파일을 봐요. 무엇인지, 지워도 되는지 AI 설명을 거기서 받아요 (AI는 켜야 쓰는 선택 기능)",
   planMenu: "규칙(AI 없이)이나 AI로 이 폴더의 정리 계획을 만들어요. 만들기만 하고, 계획 창에서 확인하고 실행해야 바뀌어요",
-  tools: "중복 파일 찾기, 프로그램 정리, 옮긴 폴더 목록, 크기 지도",
-  more: "더 보기: 창이 좁아서 접어 둔 명령 (변화, 도구, AI, 계획…)",
+  more: "더 보기: 창이 좁아서 접어 둔 명령이에요 (정리 메뉴, 열 더 보기…)",
   help: "도움말 (F1): 기능 설명, 검색 문법, 문제 해결",
   drive: "이 드라이브를 열어요. 가운데 클릭하면 새 탭에서 열려요",
   scanMore: "다른 스캔 방식: 관리자 권한으로 전체 다시 스캔, 일반 탐색으로 다시 스캔",
@@ -112,6 +112,16 @@ const isDenied = (e: unknown) => /\(os error 5\)/.test(String(e));
 /** What a folder read through the admin session refuses (it is read-only). */
 const READ_ONLY = "관리자 권한으로 읽는 중이라 읽기만 할 수 있어요. 바꾸거나 옮기거나 지울 수 없어요";
 
+/** Where the list of plans is, for the toasts: under 정리 ▾, which a narrow window folds into "⋯". */
+const PLANS_AT = '툴바의 "정리 ▾ → 정리 계획 목록…"(창이 좁으면 "⋯" 안)';
+
+/** The focus is in a box being typed in (a rename, the search box, the address): a dialog opened now would take it away. */
+function typingNow(): boolean {
+  const a = document.activeElement;
+  if (a instanceof HTMLInputElement) return a.type !== "checkbox";
+  return a instanceof HTMLTextAreaElement || (a instanceof HTMLElement && a.isContentEditable);
+}
+
 /** create_folder's answer when the name is taken (by a folder or a file). */
 const NAME_TAKEN = "같은 이름이 이미 있어요";
 
@@ -136,7 +146,7 @@ const DIFF_LIMIT = 64;
 const RERUN_ALL_MS = 5000;
 const RERUN_HERE_MS = 2000;
 
-/** The preview keeps at least this width, and the list beside it at least LIST_MIN. */
+/** The side pane keeps at least this width, and the list beside it at least LIST_MIN. */
 const PREVIEW_MIN = 220;
 const LIST_MIN = 320;
 
@@ -148,14 +158,20 @@ const FOLDER_COLUMNS: Column[] = [
   { key: "type", label: "종류", width: "minmax(90px, 0.8fr)" },
 ];
 
-/** With the list's "변화" switch on: the change since the scan before, right after the size. */
+/** With "크기 변화" on (보기 ▾): the change since the scan before, right after the size. */
 const FOLDER_DIFF_COLUMNS: Column[] = [
   ...FOLDER_COLUMNS.slice(0, 2),
-  { key: "change", label: "변화", width: "minmax(104px, 0.9fr)", align: "right" },
+  {
+    key: "change",
+    label: "크기 변화",
+    width: "minmax(104px, 0.9fr)",
+    align: "right",
+    title: '지난 스캔 뒤로 늘고 준 크기예요. 누르면 이 열로 정렬하고, 보기 ▾ → "크기 변화 (지난 스캔과 비교)"로 켜고 꺼요',
+  },
   ...FOLDER_COLUMNS.slice(2),
 ];
 
-/** With the toolbar's "위험도" on (jev or a local model): its badge for each row, last. */
+/** With "위험도 (AI 판정)" on (보기 ▾; jev or a local model): its badge for each row, last. */
 const RISK_COLUMN: Column = { key: "risk", label: "위험도", width: "64px" };
 // A local model's badges say "로컬" too ("로컬 안전").
 const RISK_COLUMN_LOCAL: Column = { ...RISK_COLUMN, width: "84px" };
@@ -471,6 +487,14 @@ function judgeBlocker(s: AiState | null): string {
 /** The judge can be asked (see judgeBlocker). */
 const judgeReady = (s: AiState | null): s is AiState => judgeBlocker(s) === "";
 
+/** judgeBlocker in a few words, under the menu item it keeps off (보기 ▾ → "위험도 (AI 판정)"). */
+function judgeNote(s: AiState | null): string {
+  if (!s) return "AI 설정을 읽지 못했어요. 누르면 다시 읽어요";
+  if (!s.settings.jev_enabled) return "AI 설정에서 AI 판정을 켜면 써요";
+  if (judgeOf(s.settings) === "jev") return "AI 설정에서 jev 키를 넣으면 써요";
+  return "AI 설정에서 Ollama 모델 이름을 넣으면 써요";
+}
+
 /** Which judge answers, and with what (a local model's name, its address): answers of two never mix. */
 const judgeKey = (s: AiConfig) =>
   judgeOf(s) === "jev" ? "jev" : `ollama:${judgeModel(s)}@${(s.ollama_url ?? "").trim()}`;
@@ -507,8 +531,7 @@ type TabDialog =
   | { kind: "dups" }
   | { kind: "relocs" }
   | { kind: "relocate"; source: Entry }
-  // v0.6: the AI panel for a folder or file, the AI settings, the plans, one plan.
-  | { kind: "ai"; path: string; file: boolean }
+  // v0.6: the AI settings, the plans, one plan (the AI panel is the side pane's 정리 도우미 now).
   // `thenAi`: opened from AI 검색's "AI 설정 열기": closed with a judge ready, the box turns to AI.
   | { kind: "aiSettings"; thenAi?: boolean }
   | { kind: "plans" }
@@ -611,6 +634,16 @@ function jevWithout(r: Results, j: JevResults, gone: string[]): Results {
   return hits.length === j.found.items.length ? r : jevResults(r.key, j.query, j.scope, j.found, hits);
 }
 
+/** The side pane's tabs: 상세 정보, and the 정리 도우미. */
+export type PaneTab = "details" | "helper";
+
+/** The side pane, one for every tab (App's): open, the tab it shows, its width. */
+export interface PaneState {
+  open: boolean;
+  tab: PaneTab;
+  width: number;
+}
+
 export interface ExplorerHandle {
   /** Opens a folder in this tab (the sidebar). */
   navigate: (path: string) => void;
@@ -640,10 +673,13 @@ export interface ExplorerProps {
   refreshDrives: () => Promise<unknown>;
   /** Banners shared by every tab (live updates lost), shown under the toolbar. */
   banners: React.ReactNode;
-  previewOpen: boolean;
-  previewWidth: number;
-  onTogglePreview: () => void;
-  onPreviewWidth: (width: number) => void;
+  /** The side pane: only the tab shown draws it. */
+  pane: PaneState;
+  /** "상세 정보" (Alt+P), "정리 도우미 (옆 창)" (Alt+H): the pane on that tab, or closed when that tab shows. */
+  onTogglePane: (tab: PaneTab) => void;
+  /** The pane on `tab` (its tabs, a menu's "정리 도우미로 보기"), or closed (null). */
+  onShowPane: (tab: PaneTab | null) => void;
+  onPaneWidth: (width: number) => void;
   toast: (text: string, kind?: "info" | "error") => void;
   /** The folder and view shown, for the tab's title and the tabs saved for next time. */
   onState: (id: number, path: string, view: View) => void;
@@ -659,7 +695,7 @@ export interface ExplorerProps {
   ai: AiState | null;
   /** The AI settings may have changed (a settings dialog closed): App reads them again. */
   onAiChanged: () => void;
-  /** Plans proposed over MCP that wait as drafts: the "계획" button's badge. */
+  /** Plans proposed over MCP that wait as drafts: the badge on "정리 ▾". */
   planDrafts: number;
   /** A plan was made, changed or removed here: App counts the drafts again. */
   onPlansChanged: () => void;
@@ -744,6 +780,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const [riskOn, setRiskOn] = useState(false);
   const [range, setRange] = useState<[number, number]>([0, 0]);
   const [riskTick, setRiskTick] = useState(0);
+  // The 정리 도우미's target while "고정" is on; null: it follows (one item picked, else the folder shown).
+  const [helperPin, setHelperPin] = useState<HelperTarget | null>(null);
   // A plan being made from the menu (rules, or asking an AI), for the status bar; one at a time.
   const [working, setWorking] = useState<string | null>(null);
   const planning = useRef(false);
@@ -1550,7 +1588,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     riskError.current = null;
     const now = await freshAi();
     if (!judgeReady(now)) {
+      // Not ready (the menu item shows it off): what is missing, and the settings where it is set.
       toast(judgeBlocker(now));
+      if (activeRef.current && !busyRef.current) openDialog({ kind: "aiSettings" });
       return;
     }
     if (!activeRef.current || busyRef.current) return;
@@ -2311,15 +2351,15 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     el.style.top = `${fit(menu.y, height, window.innerHeight)}px`;
   }, [menu, menuItems, searching, menuProg]);
 
-  // The divider between the list and the preview: dragged, it sets the preview's width.
+  // The divider between the list and the side pane: dragged, it sets the pane's width.
   const startResize = (ev: React.PointerEvent<HTMLDivElement>) => {
     if (ev.button !== 0) return;
     ev.preventDefault();
     const bar = ev.currentTarget;
     const room = bar.parentElement?.clientWidth ?? 0;
     const x0 = ev.clientX;
-    const w0 = p.previewWidth;
-    const onWidth = p.onPreviewWidth;
+    const w0 = p.pane.width;
+    const onWidth = p.onPaneWidth;
     const width = (x: number) => Math.round(Math.max(PREVIEW_MIN, Math.min(room - LIST_MIN, w0 + x0 - x)));
     bar.setPointerCapture(ev.pointerId);
     bar.classList.add("dragging");
@@ -2409,6 +2449,25 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         : previewEntry && treeFocus?.sized && pathKey(parentOf(previewEntry.path) ?? "") === pathKey(path)
           ? total
           : undefined;
+  // The 정리 도우미 (the side pane's other tab) follows the one item picked (the tree's focused row;
+  // the map has none), else the folder shown; "고정" keeps one while you go elsewhere. Search
+  // results are no folder to look at, and a folder read with administrator rights is read-only.
+  const helperPick = treeShown ? (treeFocus?.e ?? null) : mapShown ? null : one;
+  const helperWhy = readOnly
+    ? "관리자 권한으로 읽는 폴더에서는 정리 도우미를 쓸 수 없어요. 읽기만 할 수 있어서 정리 계획도 실행할 수 없어요"
+    : searching && !helperPick
+      ? "검색 결과에서는 항목을 하나 고르면 정리 도우미가 그 항목을 봐요"
+      : !path
+        ? "볼 폴더가 없어요"
+        : null;
+  const helperAuto: HelperTarget | null = helperWhy
+    ? null
+    : helperPick
+      ? { path: helperPick.path, name: helperPick.name, is_dir: helperPick.is_dir }
+      : { path, name: folderTitle(path), is_dir: true };
+  const helperTarget = helperPin ?? helperAuto;
+  const helperOn = p.pane.open && p.pane.tab === "helper";
+  const detailsOn = p.pane.open && p.pane.tab === "details";
   // What the command bar's clipboard buttons act on: as Ctrl+C / Ctrl+X do (the tree's row; the
   // map has no selection). Rename and trash stay with the list and icons, as their keys do.
   const clipItems = treeShown ? (treeFocus ? [treeFocus.e] : []) : mapShown ? [] : selectedEntries;
@@ -2444,7 +2503,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         ? undefined
         : "먼저 항목을 골라 주세요";
   // The command bar folds into "⋯" in a narrow window; measured again when its buttons change.
-  const fold = useFold(cmdBar, `${view}|${judgeOk}|${p.planDrafts > 0 ? (p.planDrafts > 99 ? 3 : String(p.planDrafts).length) : 0}`);
+  const fold = useFold(cmdBar, `${p.planDrafts > 0 ? (p.planDrafts > 99 ? 3 : String(p.planDrafts).length) : 0}`);
 
   // The breadcrumbs show their end (the folder shown) when the path is longer than the box.
   useLayoutEffect(() => {
@@ -2492,12 +2551,40 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   // ---- v0.6: AI and plans ----
 
   // A plan made in the background opens once it is there, unless the user moved on meanwhile
-  // (another tab, another dialog): it then waits under "계획".
-  const showPlan = (planId: string) => {
+  // (another tab, another dialog; `open` false: see the helper's below): it then waits in the list
+  // of plans, and the toast says where that is (in "⋯" when the bar is folded). `waits`: the toast's
+  // text then.
+  const showPlan = (planId: string, open = true, waits = `정리 계획을 만들었어요. ${PLANS_AT}에서 열 수 있어요`) => {
     p.onPlansChanged();
-    if (activeRef.current && !busyRef.current) setDialog({ kind: "plan", id: planId });
-    else toast('정리 계획을 만들었어요. 툴바의 "계획"에서 열 수 있어요');
+    if (open && activeRef.current && !busyRef.current) setDialog({ kind: "plan", id: planId });
+    else toast(waits);
   };
+
+  // The 정리 도우미: what it got for each item and its request out live with the tab, so they
+  // outlast the pane (closed, or showing 상세 정보). Its settings are read while it shows. Its
+  // answers may come long after they were asked for: a plan opens (as a dialog that takes the focus)
+  // only while the pane still shows the helper on that item and nothing is being typed (a rename
+  // box, the search box, the address); else it waits under the item's "계획 열기" and in the list.
+  const helper = useHelper(active && helperOn, p.ai, (planId, t) => {
+    p.onAiChanged();
+    const there = helperOn && helperTarget !== null && pathKey(helperTarget.path) === pathKey(t.path);
+    showPlan(
+      planId,
+      there && renaming === null && !typingNow(),
+      `"${t.name}"의 정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`,
+    );
+  });
+
+  /**
+   * A menu's "정리 도우미로 보기": the pane shows the helper on `e`. It is pinned there when the
+   * helper would not follow it (another item picked, or a pin on something else).
+   */
+  const openHelper = (e: HelperTarget) => {
+    setMenu(null);
+    if (helperPin || pathKey(e.path) !== pathKey(helperAuto?.path ?? "")) setHelperPin(e);
+    p.onShowPane("helper");
+  };
+  const helperOf = (e: Entry): HelperTarget => ({ path: e.path, name: e.name, is_dir: e.is_dir });
 
   /** "정리 계획 만들기 ▸" → a rule: made here from the scan, no AI. Opens the plan, which runs only once approved there. */
   const rulePlan = async (kind: RuleKind, at: string) => {
@@ -2610,11 +2697,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     }
   };
 
-  /** "AI로 설명…" and the toolbar's AI button: the AI panel for a folder or file (it says what to do while AI is off). */
-  const openAi = (e: { path: string; is_dir: boolean }) => openDialog({ kind: "ai", path: e.path, file: !e.is_dir });
-
   // The plan's folder, or the folder an item of a step is in: shown in this tab, the plan closed
-  // (it stays under "계획", and a run goes on).
+  // (it stays in the list of plans, and a run goes on).
   const planNavigate = (to: string) => {
     setDialog(null);
     p.onPlansChanged();
@@ -2655,52 +2739,105 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
 
   // ---- the toolbar: the address and the search, and under them the command bar ----
 
-  // The 도구 menu's items; in a narrow window they are in "⋯" too, as rows lined up with its others.
-  const toolItems = (inMore: boolean) => {
-    const row = (label: string) => (inMore ? <MenuRow check={false} icon={null} label={label} /> : label);
-    return (
-      <>
-        <button role="menuitem" disabled={!path} onClick={() => openDialog({ kind: "dups" })} {...tip("dups")}>
-          {row("중복 파일 찾기…")}
-        </button>
-        <button role="menuitem" onClick={() => openDialog({ kind: "programs" })} {...tip("programs")}>
-          {row("프로그램 정리…")}
-        </button>
-        <button role="menuitem" onClick={() => openDialog({ kind: "relocs" })} {...tip("relocations")}>
-          {row("옮긴 폴더 목록…")}
-        </button>
-      </>
-    );
-  };
   const diffTitle = searching
-    ? "검색 결과에는 변화 열이 없어요"
+    ? "검색 결과에는 크기 변화 열이 없어요"
     : readOnly
       ? "관리자 권한으로 읽는 폴더는 스캔 결과와 비교할 수 없어요"
-      : "지난 스캔 뒤로 크기가 얼마나 늘고 줄었는지 보여 주는 열을 더해요";
+      : undefined;
   // The stop button of an AI 검색 (stopAi): it stops the run only when this tab alone waits for it.
   // `aiShared`: another tab waits for the same run.
   const aiQuitOnly = jevBusy && (jevQueued || aiStopping || !aiAlone());
   const aiShared =
     jevBusy && !jevQueued && !aiStopping && aiRun.current?.key === aiWait.current && (aiRun.current?.waiters.size ?? 0) > 1;
+  // Off with no judge ready, saying what is missing (judgeBlocker).
   const riskTitle = searching
     ? "검색 결과에는 위험도 열이 없어요"
     : readOnly
       ? "관리자 권한으로 읽는 폴더는 위험도를 묻지 않아요"
-      : judge === "ollama"
-        ? judgeAway
-          ? `보이는 항목을 지워도 되는지 Ollama 주소 ${judgeAway}(다른 컴퓨터)의 로컬 모델에 물어 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보를 그 컴퓨터로 보내요)`
-          : "보이는 항목을 지워도 되는지 이 PC의 로컬 모델(Ollama)이 판정해 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보만 줘요)"
-        : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)";
-  const aiTitle = readOnly
-    ? "관리자 권한으로 읽는 폴더에서는 쓸 수 없어요"
-    : aiBlocker(p.ai) === null
-      ? undefined
-      : "정리 도우미: 규칙으로 정리 계획을 만들어요 (AI는 꺼져 있어요. 톱니바퀴(AI 설정)에서 켤 수 있어요)";
+      : !judgeOk
+        ? `${TIPS.risk} · ${judgeBlocker(p.ai)}`
+        : judge === "ollama"
+          ? judgeAway
+            ? `보이는 항목을 지워도 되는지 Ollama 주소 ${judgeAway}(다른 컴퓨터)의 로컬 모델에 물어 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보를 그 컴퓨터로 보내요)`
+            : "보이는 항목을 지워도 되는지 이 PC의 로컬 모델(Ollama)이 판정해 보여 주는 열이에요 (참고용, 요금 없음, 경로·크기 같은 정보만 줘요)"
+          : "보이는 항목을 지워도 되는지 TypeSafe jev에 물어 보여 주는 열이에요 (참고용, 경로·크기 같은 정보만 보내요)";
   const plansTitle =
     p.planDrafts > 0
-      ? `정리 계획 목록 · Claude 앱이 MCP로 제안한 계획 ${p.planDrafts.toLocaleString()}개가 확인을 기다려요`
+      ? `${TIPS.plans}. Claude 앱이 MCP로 제안한 계획 ${p.planDrafts.toLocaleString()}개가 확인을 기다려요`
       : undefined;
   const badge = p.planDrafts > 0 && <span className="tool-badge">{p.planDrafts > 99 ? "99+" : p.planDrafts}</span>;
+
+  // 보기 ▾'s "열 더 보기": the list's extra columns, this tab's own switches (in "⋯" too, when folded).
+  const riskOff = !judgeOk && !searching && !readOnly;
+  const columnItems = view === "list" && (
+    <>
+      <hr />
+      <div className="menu-label">열 더 보기</div>
+      <button
+        role="menuitemcheckbox"
+        aria-checked={diffOn}
+        disabled={searching || readOnly}
+        onClick={toggleDiff}
+        {...tip("diff", diffTitle)}
+      >
+        <MenuRow check={diffOn} icon={<Icon.diff />} label="크기 변화 (지난 스캔과 비교)" />
+      </button>
+      {/* Ready only with the judge on in the AI settings (jev's key, or a local model named). Not
+          ready, it is shown off (as the plan menu's AI items) with what is missing under it, and
+          stays in reach: a click says it again and opens the AI settings (toggleRisk). */}
+      <button
+        role="menuitemcheckbox"
+        aria-checked={riskOn && judgeOk}
+        className={riskOff ? "off" : undefined}
+        disabled={searching || readOnly}
+        onClick={toggleRisk}
+        {...tip("risk", riskTitle)}
+      >
+        <MenuRow
+          check={riskOn && judgeOk}
+          icon={<Icon.risk />}
+          label={
+            <>
+              위험도 (AI 판정)
+              {riskOff && <span className="menu-note">{judgeNote(p.ai)}</span>}
+            </>
+          }
+        />
+      </button>
+    </>
+  );
+
+  // 정리 ▾'s items ("⋯" has them instead, when folded): the helper, the plans, and the tools that tidy.
+  const tidyItems = (
+    <>
+      <button role="menuitemcheckbox" aria-checked={helperOn} onClick={() => p.onTogglePane("helper")} {...tip("helper")}>
+        <MenuRow check={helperOn} icon={<Icon.details />} label="정리 도우미 (옆 창)" keys="Alt+H" />
+      </button>
+      <button role="menuitem" onClick={() => openDialog({ kind: "plans" })} {...tip("plans", plansTitle)}>
+        <MenuRow
+          check={false}
+          icon={null}
+          label={
+            <>
+              정리 계획 목록…
+              {badge}
+              {p.planDrafts > 0 && <span className="menu-note">확인을 기다리는 계획 {p.planDrafts.toLocaleString()}개</span>}
+            </>
+          }
+        />
+      </button>
+      <hr />
+      <button role="menuitem" disabled={!path} onClick={() => openDialog({ kind: "dups" })} {...tip("dups")}>
+        <MenuRow check={false} icon={null} label="중복 파일 찾기…" />
+      </button>
+      <button role="menuitem" onClick={() => openDialog({ kind: "programs" })} {...tip("programs")}>
+        <MenuRow check={false} icon={null} label="프로그램 정리…" />
+      </button>
+      <button role="menuitem" onClick={() => openDialog({ kind: "relocs" })} {...tip("relocations")}>
+        <MenuRow check={false} icon={null} label="옮긴 폴더 목록…" />
+      </button>
+    </>
+  );
   const newFolderOff = readOnly
     ? READ_ONLY
     : searching
@@ -2901,36 +3038,13 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                 <MenuRow check={view === v} icon={VIEW_ICON[v]()} label={VIEW_LABEL[v]} keys={`Ctrl+Shift+${i + 1}`} />
               </button>
             ))}
+            {columnItems}
           </MenuButton>
-          {fold < 1 && view === "list" && (
-            <button
-              className={`cmd ${diffOn ? "on" : ""}`}
-              aria-pressed={diffOn}
-              disabled={searching || readOnly}
-              {...tip("diff", diffTitle)}
-              onClick={toggleDiff}
-            >
-              <Icon.diff />
-              <span className="cmd-label">변화</span>
-            </button>
-          )}
-          {/* The judge on in the AI settings and ready (jev's key, or a local model): this tab's 위험도 column. */}
-          {fold < 1 && view === "list" && judgeOk && (
-            <button
-              className={`cmd ${riskOn ? "on" : ""}`}
-              aria-pressed={riskOn}
-              disabled={searching || readOnly}
-              title={riskTitle}
-              onClick={toggleRisk}
-            >
-              <span className="cmd-label">위험도</span>
-            </button>
-          )}
           <button
-            className={`cmd ${p.previewOpen ? "on" : ""}`}
+            className={`cmd ${detailsOn ? "on" : ""}`}
             aria-label="상세 정보"
-            aria-pressed={p.previewOpen}
-            onClick={p.onTogglePreview}
+            aria-pressed={detailsOn}
+            onClick={() => p.onTogglePane("details")}
             {...tip("details")}
           >
             <Icon.details />
@@ -2963,88 +3077,32 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                   <hr />
                 </>
               )}
-              {view === "list" && (
-                <>
-                  <button
-                    role="menuitemcheckbox"
-                    aria-checked={diffOn}
-                    disabled={searching || readOnly}
-                    onClick={toggleDiff}
-                    {...tip("diff", diffTitle)}
-                  >
-                    <MenuRow check={diffOn} icon={<Icon.diff />} label="변화" />
-                  </button>
-                  {judgeOk && (
-                    <button
-                      role="menuitemcheckbox"
-                      aria-checked={riskOn}
-                      disabled={searching || readOnly}
-                      onClick={toggleRisk}
-                      title={riskTitle}
-                    >
-                      <MenuRow check={riskOn} icon={null} label="위험도" />
-                    </button>
-                  )}
-                  <hr />
-                </>
-              )}
-              {toolItems(true)}
-              <hr />
-              <button role="menuitem" disabled={!path || readOnly} onClick={() => openAi({ path, is_dir: true })} {...tip("ai", aiTitle)}>
-                <MenuRow check={false} icon={null} label="AI (정리 도우미)…" />
-              </button>
-              <button role="menuitem" onClick={() => openDialog({ kind: "plans" })} {...tip("plans", plansTitle)}>
-                <MenuRow
-                  check={false}
-                  icon={null}
-                  label={
-                    <>
-                      계획
-                      {badge}
-                    </>
-                  }
-                />
-              </button>
+              <div className="menu-label">정리</div>
+              {tidyItems}
+              {columnItems}
             </MenuButton>
           )}
 
           <span className="cmd-end">
             {fold < 1 && (
-              <>
-                <MenuButton
-                  name="도구"
-                  active={active}
-                  label={
-                    <>
-                      <span className="cmd-label">도구</span>
-                      <Caret />
-                    </>
-                  }
-                  attrs={tip("tools")}
-                >
-                  {toolItems(false)}
-                  <hr />
-                  <button
-                    role="menuitem"
-                    disabled={searching}
-                    onClick={() => changeView("map")}
-                    {...tip("viewMap", searching ? SEARCH_VIEW : undefined)}
-                  >
-                    크기 지도로 보기
-                  </button>
-                  <hr />
-                  <button role="menuitem" onClick={() => p.onHelp()} {...tip("help")}>
-                    도움말 (F1)
-                  </button>
-                </MenuButton>
-                <button className="cmd" disabled={!path || readOnly} {...tip("ai", aiTitle)} onClick={() => openAi({ path, is_dir: true })}>
-                  AI
-                </button>
-                <button className="cmd" {...tip("plans", plansTitle)} onClick={() => openDialog({ kind: "plans" })}>
-                  계획
-                  {badge}
-                </button>
-              </>
+              <MenuButton
+                name="정리"
+                active={active}
+                label={
+                  <>
+                    <Icon.tidy />
+                    <span className="cmd-label">정리</span>
+                    {badge}
+                    <Caret />
+                  </>
+                }
+                attrs={{
+                  "aria-label": p.planDrafts > 0 ? `정리 · 확인을 기다리는 계획 ${p.planDrafts.toLocaleString()}개` : "정리",
+                  ...tip("tidy"),
+                }}
+              >
+                {tidyItems}
+              </MenuButton>
             )}
             <button className="cmd icon-btn" aria-label="AI 설정" onClick={() => openDialog({ kind: "aiSettings" })} {...tip("aiSettings")}>
               <GearIcon />
@@ -3121,6 +3179,14 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               partial={changes.smallest > 0}
             />
           )}
+          {/* The toolbar has no button of its own for it any more: it is turned off here too. */}
+          <button
+            className="v06-link diff-off"
+            title='크기 변화 열과 이 줄을 숨겨요. 다시 보려면 보기 ▾ → "크기 변화 (지난 스캔과 비교)"를 켜요'
+            onClick={toggleDiff}
+          >
+            크기 변화 끄기
+          </button>
         </div>
       )}
 
@@ -3185,7 +3251,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         </div>
       )}
 
-      <div className="content" style={{ "--preview-w": `${p.previewWidth}px` } as React.CSSProperties}>
+      <div className="content" style={{ "--preview-w": `${p.pane.width}px` } as React.CSSProperties}>
         <div
           className="pane"
           onMouseDownCapture={(ev) => {
@@ -3305,20 +3371,33 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           )}
         </div>
 
-        {/* The details pane (상세 정보). Only the tab shown asks for previews. */}
-        {active && p.previewOpen && (
+        {/* The side pane: 상세 정보, or the 정리 도우미. Only the tab shown asks for previews. */}
+        {active && p.pane.open && (
           <>
-            <div className="divider" title="끌어서 상세 정보 창 너비 바꾸기" onPointerDown={startResize} />
-            <Preview
-              entry={detailsMany ? null : previewEntry}
-              selection={detailsMany ? selectedEntries : undefined}
-              parentSize={detailsParent}
-              onClose={p.onTogglePreview}
-              onCopyPaths={copyPaths}
-              sized={previewSized}
-              adminFolder={readOnly}
-              drives={p.drives}
-            />
+            <div className="divider" title="끌어서 옆 창 너비 바꾸기" onPointerDown={startResize} />
+            <SidePane tab={p.pane.tab} onTab={p.onShowPane} onClose={() => p.onShowPane(null)}>
+              {p.pane.tab === "details" ? (
+                <Preview
+                  entry={detailsMany ? null : previewEntry}
+                  selection={detailsMany ? selectedEntries : undefined}
+                  parentSize={detailsParent}
+                  onCopyPaths={copyPaths}
+                  sized={previewSized}
+                  adminFolder={readOnly}
+                  drives={p.drives}
+                />
+              ) : (
+                <HelperPane
+                  helper={helper}
+                  target={helperTarget}
+                  why={helperWhy}
+                  pinned={helperPin !== null}
+                  onPin={(on) => setHelperPin(on ? helperTarget : null)}
+                  onSettings={() => openDialog({ kind: "aiSettings" })}
+                  onOpenPlan={(planId) => openDialog({ kind: "plan", id: planId })}
+                />
+              )}
+            </SidePane>
           </>
         )}
       </div>
@@ -3411,8 +3490,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
             </>
           )}
           <hr />
-          <button onClick={() => openAi(target)} {...tip("explain")}>
-            AI로 설명…
+          <button onClick={() => openHelper(helperOf(target))} {...tip(target.is_dir ? "helperOpen" : "helperOpenFile")}>
+            정리 도우미로 보기
           </button>
           {target.is_dir && planMenu(target.path)}
           <hr />
@@ -3436,8 +3515,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           </button>
           {pinItem(path, "이 폴더를 ")}
           <hr />
-          <button onClick={() => openAi({ path, is_dir: true })} {...tip("explain")}>
-            이 폴더를 AI로 설명…
+          <button onClick={() => openHelper({ path, name: folderTitle(path), is_dir: true })} {...tip("helperOpen")}>
+            이 폴더를 정리 도우미로 보기
           </button>
           {planMenu(path)}
         </div>
@@ -3508,8 +3587,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               {one && (
                 <>
                   <hr />
-                  <button onClick={() => openAi(one)} {...tip("explain")}>
-                    AI로 설명…
+                  <button onClick={() => openHelper(helperOf(one))} {...tip(one.is_dir ? "helperOpen" : "helperOpenFile")}>
+                    정리 도우미로 보기
                   </button>
                   {one.is_dir && planMenu(one.path)}
                 </>
@@ -3587,21 +3666,6 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       )}
 
       {/* v0.6. A plan only runs from its own window, once approved there. */}
-      {dialog?.kind === "ai" && (
-        <AiPanel
-          path={dialog.path}
-          file={dialog.file}
-          onClose={() => {
-            setDialog(null);
-            p.onAiChanged();
-          }}
-          onOpenPlan={(planId) => {
-            p.onAiChanged();
-            p.onPlansChanged();
-            setDialog({ kind: "plan", id: planId });
-          }}
-        />
-      )}
       {dialog?.kind === "aiSettings" && (
         <AiSettings
           // Saved with the window still open: App reads them now, not once it closes (위험도 that is
@@ -3681,7 +3745,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               </p>
               <p className="muted">
                 파일 내용은 보내지 않아요. 내 jev API 키로 보내고, 받은 위험도는 참고용이에요. 한 번 받은 항목은 앱을 끌 때까지
-                다시 묻지 않아요. 끄려면 툴바의 "위험도"를 한 번 더 누르세요.
+                다시 묻지 않아요. 끄려면 보기 ▾ → "위험도 (AI 판정)"를 한 번 더 누르세요.
               </p>
             </>
           ) : (
@@ -3694,7 +3758,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               <div className="v06-warn">이 주소는 이 컴퓨터가 아니에요. 보낸 정보는 그 컴퓨터로 가요.</div>
               <p className="muted">
                 파일 내용은 보내지 않아요. 요금은 없고, 받은 위험도는 참고용이에요. 한 번 받은 항목은 앱을 끌 때까지 다시 묻지
-                않아요. 끄려면 툴바의 "위험도"를 한 번 더 누르세요.
+                않아요. 끄려면 보기 ▾ → "위험도 (AI 판정)"를 한 번 더 누르세요.
               </p>
             </>
           )}
@@ -3807,6 +3871,80 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         />
       )}
     </div>
+  );
+}
+
+const PANE_TABS: { id: PaneTab; label: string; keys: string }[] = [
+  { id: "details", label: "상세 정보", keys: "Alt+P" },
+  { id: "helper", label: "정리 도우미", keys: "Alt+H" },
+];
+
+/**
+ * The side pane: its head ([상세 정보 | 정리 도우미], one button that closes the pane) and, under it,
+ * the tab shown as their tab panel. As in a tab list, only the tab shown is in the Tab order, and
+ * ← → (Home End) go to the other tab and show it.
+ */
+function SidePane({
+  tab,
+  onTab,
+  onClose,
+  children,
+}: {
+  tab: PaneTab;
+  onTab: (tab: PaneTab) => void;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const base = useId();
+  const tabId = (t: PaneTab) => `${base}-tab-${t}`;
+  const panelId = (t: PaneTab) => `${base}-panel-${t}`;
+  const onKey = (ev: React.KeyboardEvent) => {
+    const at = PANE_TABS.findIndex((t) => t.id === tab);
+    const n = PANE_TABS.length;
+    const to =
+      ev.key === "ArrowRight" ? (at + 1) % n : ev.key === "ArrowLeft" ? (at + n - 1) % n : ev.key === "Home" ? 0 : ev.key === "End" ? n - 1 : -1;
+    if (to < 0 || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    // Kept from the window's keys behind: the list, the icons and the tree move with these too.
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = PANE_TABS[to].id;
+    onTab(next);
+    document.getElementById(tabId(next))?.focus();
+  };
+  return (
+    <aside className="preview" aria-label={tab === "helper" ? "정리 도우미" : "상세 정보"}>
+      <div className="preview-head pane-head">
+        <div className="pane-tabs" role="tablist" aria-label="옆 창" onKeyDown={onKey}>
+          {PANE_TABS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              id={tabId(t.id)}
+              aria-controls={panelId(t.id)}
+              aria-selected={tab === t.id}
+              tabIndex={tab === t.id ? 0 : -1}
+              className={`pane-tab${tab === t.id ? " on" : ""}`}
+              onClick={() => onTab(t.id)}
+              {...tip(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <button
+          className="preview-close"
+          aria-label="옆 창 닫기"
+          title={`옆 창 닫기 (${PANE_TABS.find((t) => t.id === tab)?.keys})`}
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      </div>
+      <div className="pane-panel" role="tabpanel" id={panelId(tab)} aria-labelledby={tabId(tab)}>
+        {children}
+      </div>
+    </aside>
   );
 }
 
@@ -4075,7 +4213,7 @@ function UninstallAsk(p: { prog: ProgramRef; path: string; onClose: () => void; 
       )}
       <p className="muted">
         제어판(설정 → 앱)의 "제거"와 같아요. Steam 게임이면 Steam이 제거를 맡아요. fine-file은 폴더를 직접 지우지 않고, 제거가 끝나
-        폴더가 없어지면 목록과 검색 결과에서도 빠져요. 남은 폴더는 도구 → 프로그램 정리의 "남은 찌꺼기"에서 찾아볼 수 있어요.
+        폴더가 없어지면 목록과 검색 결과에서도 빠져요. 남은 폴더는 정리 ▾(창이 좁으면 ⋯) → 프로그램 정리의 "남은 찌꺼기"에서 찾아볼 수 있어요.
       </p>
       {/* 취소 has the focus: a stray Enter must not remove anything. */}
       <div className="actions">
