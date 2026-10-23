@@ -4,6 +4,7 @@ import {
   api,
   methodNote,
   ops,
+  places,
   plans,
   v04,
   v05,
@@ -13,6 +14,10 @@ import {
   type DiffNode,
   type DriveInfo,
   type Entry,
+  type JevFound,
+  type JevHit,
+  type JevKind,
+  type JevWhen,
   type KeyStatus,
   type Listing,
   type Risk,
@@ -22,7 +27,7 @@ import { AiPanel, contentsNote } from "./AiPanel";
 import { AiSettings } from "./AiSettings";
 import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
-import { FileTable, type ChangeCell, type Column, type RiskCell, type SortKey } from "./FileTable";
+import { FileTable, type ChangeCell, type Column, type RiskCell, type ScoreCell, type SortKey } from "./FileTable";
 import { GridView, gridStep } from "./GridView";
 import { HELP_TIPS } from "./Help";
 import { MapView } from "./MapView";
@@ -32,7 +37,8 @@ import { Programs } from "./Programs";
 import { RelocateDialog, Relocations } from "./Relocate";
 import { dragOut, dragRefusal, screenPoint } from "./shell";
 import { TreeView, type TreeRefresh } from "./TreeView";
-import { driveKey, formatDate, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, typeLabel } from "./format";
+import { driveKey, folderTitle, formatDate, formatSize, isSameOrInside, normalizePath, parentOf, pathKey, typeLabel } from "./format";
+import "./v09.css";
 
 export type View = "list" | "tree" | "grid" | "map";
 export const VIEWS: View[] = ["list", "tree", "grid", "map"];
@@ -148,6 +154,104 @@ const SEARCH_COLUMNS: Column[] = [
   { key: "modified", label: "수정한 날짜", width: "140px" },
 ];
 
+/** A 뜻으로 찾기's results: jev's score right after the name, as it is what they are ordered by. */
+const JEV_COLUMNS: Column[] = [
+  SEARCH_COLUMNS[0],
+  {
+    key: "score",
+    label: "일치도",
+    width: "72px",
+    title:
+      "일치도 (TypeSafe jev): 찾는 말에 얼마나 맞는지 jev가 이름·경로 같은 정보만 보고 매긴 값이에요 (파일 내용은 안 봐요, 참고용).\n" +
+      "50% 미만은 처음에 숨겨요. 누르면 이 열로 정렬해요",
+  },
+  ...SEARCH_COLUMNS.slice(1),
+];
+
+// ---- v0.9: 뜻으로 찾기 (jev) ----
+
+/** What the list shows of a 뜻으로 찾기 at first: the hits jev scored this high or more. */
+const JEV_SHOW = 0.5;
+/** Candidates a 뜻으로 찾기 asks jev about at most (meaning.rs): files, and games·programs. */
+const JEV_FILE_MAX = 240;
+const JEV_APP_MAX = 400;
+
+const JEV_KIND: Record<JevKind, string> = {
+  document: "문서",
+  image: "사진·그림",
+  video: "동영상",
+  audio: "음악·소리",
+  archive: "압축 파일",
+  program: "프로그램·설치 파일",
+};
+
+const JEV_WHEN: Record<JevWhen, string> = {
+  today: "오늘",
+  yesterday: "어제",
+  this_week: "이번 주",
+  last_week: "지난주",
+  this_month: "이번 달",
+  last_month: "지난달",
+  this_year: "올해",
+  last_year: "작년",
+  older: "작년보다 전",
+};
+
+/** What the list says with no row to show of a 뜻으로 찾기. `hidden`: hits kept back under JEV_SHOW. */
+function jevEmpty(f: JevFound, hidden: number): string {
+  if (hidden > 0) return `jev가 맞다고 본 항목이 없어요. 위의 "50% 미만도 보기"로 나머지 ${hidden.toLocaleString()}개를 볼 수 있어요`;
+  if (f.candidates === 0) {
+    return f.target === "app"
+      ? "후보가 될 게임·프로그램을 찾지 못했어요. 설치한 드라이브를 스캔했는지 확인해 주세요"
+      : "후보가 될 파일을 찾지 못했어요. 이름에 들어 있을 만한 낱말로 바꿔 보세요";
+  }
+  return "jev가 맞다고 본 항목이 없어요. 다른 말로 찾아 보세요";
+}
+
+/**
+ * What a 뜻으로 찾기 left out. `capped`: more candidates than the cap, which only the first `cap`
+ * of were asked about (files: those with the most words; games·programs: the biggest, as they are
+ * all of them whatever the words). `unanswered`: under the cap, a request jev did not answer.
+ */
+function jevLeftOut(f: JevFound) {
+  const max = f.target === "app" ? JEV_APP_MAX : JEV_FILE_MAX;
+  const cap = Math.min(f.candidates, max);
+  return { cap, capped: f.candidates > max, unanswered: Math.max(0, cap - f.asked) };
+}
+
+/** The status bar's line for a 뜻으로 찾기: how many fit, what was asked, how long it took, what jev took it for, what was left out. */
+function jevLine(f: JevFound, matched: number): string {
+  const app = f.target === "app";
+  const what = app
+    ? "게임·프로그램"
+    : [f.kind && `종류: ${JEV_KIND[f.kind] ?? f.kind}`, f.when && `기간: ${JEV_WHEN[f.when] ?? f.when}`]
+        .filter(Boolean)
+        .join(" · ") || "파일·폴더";
+  const asked = f.requests === 0 ? "jev 요청 0번 (저장해 둔 답)" : `jev 요청 ${f.requests.toLocaleString()}번`;
+  const out = jevLeftOut(f);
+  const notes = [
+    out.capped && (app ? `큰 것부터 ${out.cap.toLocaleString()}개만 확인` : `후보가 많아 ${out.cap.toLocaleString()}개만 확인`),
+    out.unanswered > 0 && `jev가 답하지 않은 ${out.unanswered.toLocaleString()}개 빠짐`,
+    f.unplaced > 0 && `폴더를 찾지 못한 프로그램 ${f.unplaced.toLocaleString()}개 빠짐`,
+  ].filter(Boolean);
+  return (
+    `뜻으로 찾기: 맞는 항목 ${matched.toLocaleString()}개 · 후보 ${f.candidates.toLocaleString()}개 중 ` +
+    `${f.asked.toLocaleString()}개 확인 · ${asked} · ${jevTime(f.elapsed_ms)} · ${what}` +
+    notes.map((n) => ` · ${n}`).join("")
+  );
+}
+
+/** "0.8초"; a search the cache answered is quicker than that. */
+const jevTime = (ms: number) => (ms < 100 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}초`);
+
+/** A path after `from` was renamed to `to`: itself, or an item inside it; null when neither. */
+function renamedPath(p: string, from: string, to: string): string | null {
+  const k = pathKey(p);
+  const f = pathKey(from);
+  if (k === f) return to;
+  return isSameOrInside(k, f) ? to + p.slice(from.length) : null;
+}
+
 /** Whether a listing answers the folder now shown (case and trailing separator aside). */
 function sameListing(a: string, b: string) {
   return a.replace(/\\$/, "").toLowerCase() === b.replace(/\\$/, "").toLowerCase();
@@ -156,8 +260,8 @@ function sameListing(a: string, b: string) {
 // One collator for every sort: localeCompare with an options object builds a new one per call.
 const cmp = new Intl.Collator("ko", { numeric: true }).compare;
 
-// "변화" sorts by the comparison, which only the tab has.
-const SORTERS: Record<Exclude<SortKey, "change">, (a: Entry, b: Entry) => number> = {
+// "변화" sorts by the comparison and "일치도" by jev's scores, which only the tab has.
+const SORTERS: Record<Exclude<SortKey, "change" | "score">, (a: Entry, b: Entry) => number> = {
   name: (a, b) => cmp(a.name, b.name),
   size: (a, b) => a.size - b.size,
   files: (a, b) => a.files - b.files,
@@ -335,6 +439,8 @@ type TabDialog =
   | { kind: "aiSend"; task: AiPlanTask; path: string; payload: AiPayloadPreview; changed?: boolean }
   // Turning the list's 위험도 on, when the settings say to ask before sending.
   | { kind: "jevAsk" }
+  // v0.9: turning the search box's "뜻으로" on, the first time in this tab, likewise.
+  | { kind: "jevFindAsk" }
   // v0.7: installed programs and the folders removed ones left behind.
   | { kind: "programs" };
 
@@ -350,6 +456,47 @@ interface Results {
   items: Entry[];
   total: number;
   ms: number;
+  /** v0.9: the answer of a 뜻으로 찾기 (jev): `items` are its hits' entries, `hits` them by path. */
+  jev?: JevResults;
+}
+
+interface JevResults {
+  /** The query asked (trimmed) and where ("이 폴더만": that folder; null: every drive), which the box may no longer hold. */
+  query: string;
+  scope: string | null;
+  found: JevFound;
+  hits: Map<string, JevHit>;
+}
+
+/** Results of a 뜻으로 찾기 whose hits are `hits` (the answer, or it patched after a rename or trash). */
+function jevResults(key: string, query: string, scope: string | null, found: JevFound, hits: JevHit[]): Results {
+  return {
+    key,
+    items: hits.map((h) => h.entry),
+    total: hits.length,
+    ms: found.elapsed_ms,
+    jev: { query, scope, found: { ...found, items: hits }, hits: new Map(hits.map((h) => [h.entry.path, h])) },
+  };
+}
+
+// A 뜻으로 찾기 is not asked again after a change (that costs jev requests): its results follow
+// the change instead, an item renamed here under its new name, one gone (trash, another program)
+// left out.
+function jevRenamed(r: Results, j: JevResults, from: string, to: string): Results {
+  const name = to.slice(to.lastIndexOf("\\") + 1);
+  const hits = j.found.items.map((h) => {
+    const at = renamedPath(h.entry.path, from, to);
+    return at === null ? h : { ...h, entry: { ...h.entry, path: at, name: at === to ? name : h.entry.name } };
+  });
+  return jevResults(r.key, j.query, j.scope, j.found, hits);
+}
+function jevWithout(r: Results, j: JevResults, gone: string[]): Results {
+  const keys = gone.map(pathKey);
+  const hits = j.found.items.filter((h) => {
+    const k = pathKey(h.entry.path);
+    return !keys.some((g) => isSameOrInside(k, g));
+  });
+  return hits.length === j.found.items.length ? r : jevResults(r.key, j.query, j.scope, j.found, hits);
 }
 
 export interface ExplorerHandle {
@@ -482,6 +629,20 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const planning = useRef(false);
   // "보내기" in an AI preview: what goes is being made again to compare with what was shown.
   const [sendCheck, setSendCheck] = useState(false);
+  // v0.9: the search box's "뜻으로" (jev), this tab's own switch. While it is on, typing searches
+  // nothing (every run costs jev requests): Enter asks (runJev). `jevAgreed`: what goes was said
+  // once in this tab ("보내기 전에 미리 보기"). `jevRun`: the run out, kept until it ends even once
+  // the tab stopped waiting for it (Esc): what it sent is billed either way, and the next Enter
+  // waits for it rather than sending alongside it. `jevBusy`: the tab waits for the run that
+  // `jevReq` names (bumped, its answer is dropped); `jevQueued`: for the one before it to end.
+  // `jevLow`: the hits under JEV_SHOW show too.
+  const [meaningOn, setMeaningOn] = useState(false);
+  const jevAgreed = useRef(false);
+  const jevRun = useRef<{ key: string; done: Promise<JevFound> } | null>(null);
+  const jevReq = useRef(0);
+  const [jevBusy, setJevBusy] = useState(false);
+  const [jevQueued, setJevQueued] = useState(false);
+  const [jevLow, setJevLow] = useState(false);
 
   const navigate = useCallback((to: string) => {
     const target = normalizePath(to);
@@ -593,6 +754,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   const activeRef = useRef(active);
   const busyRef = useRef(false);
   const dialogRef = useRef(dialog);
+  // "뜻으로" on: name searches neither run nor land.
+  const meaningRef = useRef(meaningOn);
+  // A 뜻으로 찾기's answer on screen, for live changes (apply).
+  const jevShown = useRef<JevResults | null>(null);
   useLayoutEffect(() => {
     pathRef.current = path;
     queryRef.current = query;
@@ -601,6 +766,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     activeRef.current = active;
     busyRef.current = confirmTrash !== null || dialog !== null;
     dialogRef.current = dialog;
+    meaningRef.current = meaningOn;
+    jevShown.current = results?.jev ?? null;
   });
 
   // Search runs. Typing (or a scan, rename, trash) starts one at once. A live re-run waits for
@@ -618,8 +785,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       s.busy++;
       try {
         const r = await api.search(q, scope);
-        // An older run's answer, or one for a query or scope no longer shown.
-        if (seq < s.shown || key !== searchKey.current) return;
+        // An older run's answer, or one for a query or scope no longer shown, or "뜻으로" came on.
+        if (seq < s.shown || key !== searchKey.current || meaningRef.current) return;
         s.shown = seq;
         setResults({ key, items: r.items, total: r.total, ms: r.elapsed_ms });
         if (key !== shownSearch.current) {
@@ -630,7 +797,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         }
       } catch (e) {
         // A live re-run fails quietly; the next change tries again.
-        if (!live && key === searchKey.current) toast(String(e), "error");
+        if (!live && key === searchKey.current && !meaningRef.current) toast(String(e), "error");
       } finally {
         s.busy--;
         s.ended = Date.now();
@@ -646,7 +813,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     const s = searchRuns.current;
     if (!s.wanted || s.busy || s.timer !== null || document.hidden || !activeRef.current) return;
     const q = queryRef.current.trim();
-    if (!q) {
+    // A 뜻으로 찾기 is not run again by itself: each run costs jev requests.
+    if (!q || meaningRef.current) {
       s.wanted = false;
       return;
     }
@@ -665,17 +833,23 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     pumpRef.current = pumpSearch;
   }, [pumpSearch]);
 
-  // Search as you type.
+  // Search as you type; with "뜻으로" on, only on Enter (runJev).
   useEffect(() => {
     const q = query.trim();
     if (!q) {
       setResults(null);
       shownSearch.current = "";
+      // The box was emptied (Esc, another folder): a 뜻으로 찾기 still out is not waited for. It
+      // runs to its end all the same (jevRun): what it sent is billed.
+      jevReq.current++;
+      setJevBusy(false);
+      setJevQueued(false);
       return;
     }
+    if (meaningOn) return;
     const t = setTimeout(() => runSearch(q, under, false), 120);
     return () => clearTimeout(t);
-  }, [query, under, searchNonce, runSearch]);
+  }, [query, under, searchNonce, runSearch, meaningOn]);
 
   // The folder shown is gone (removed, or renamed by another program): the nearest folder above
   // it that is still there takes its place in the history, so Back does not lead to it again.
@@ -774,12 +948,52 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     search: false,
   });
 
+  // A 뜻으로 찾기's hits in folders that changed (another program, Windows' own menu, a move):
+  // looked for on disk, a batch at a time, and left out once gone. jev is not asked again.
+  const jevGone = useRef({ busy: false, paths: new Set<string>() });
+  const checkJevGone = useCallback(async () => {
+    const s = jevGone.current;
+    if (s.busy) return;
+    s.busy = true;
+    try {
+      while (s.paths.size) {
+        const paths = [...s.paths];
+        s.paths.clear();
+        // Not readable is not gone.
+        const kinds = await Promise.all(paths.map((p) => places.pathKind(p).catch(() => "file" as const)));
+        const gone = paths.filter((_, i) => kinds[i] === "gone");
+        if (gone.length) setResults((r) => (r?.jev ? jevWithout(r, r.jev, gone) : r));
+      }
+    } finally {
+      s.busy = false;
+    }
+  }, []);
+
   const apply = useCallback(
     (c: Changes) => {
       const shown = activeRef.current;
       const later = owed.current;
       const dirs = [...c.dirs];
       const removed = [...c.removed];
+      const jev = jevShown.current;
+      if (jev) {
+        // Live changes name the folders removed, not the files: a hit in a folder that changed,
+        // or in one removed (a folder renamed only in case is still there), is looked for.
+        // Without a removed list, any changed folder above it may be where it went.
+        const wanted = jevGone.current.paths;
+        for (const h of jev.found.items) {
+          const k = pathKey(h.entry.path);
+          const up = parentOf(h.entry.path);
+          if (
+            c.full.has(driveKey(k)) ||
+            (up !== null && c.dirs.has(pathKey(up))) ||
+            removed.some((r) => isSameOrInside(k, r)) ||
+            (c.unsure && dirs.some((d) => isSameOrInside(k, d)))
+          )
+            wanted.add(h.entry.path);
+        }
+        if (wanted.size) void checkJevGone();
+      }
       const here = pathRef.current;
       if (here) {
         const key = pathKey(here);
@@ -807,7 +1021,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           }
         }
       }
-      if (queryRef.current.trim()) {
+      // A 뜻으로 찾기 is not run again for changes (each run costs jev requests).
+      if (queryRef.current.trim() && !meaningRef.current) {
         // A search of one folder only cares about changes in it, or to it.
         const scope = underRef.current === null ? null : pathKey(underRef.current);
         const touched =
@@ -821,7 +1036,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         }
       }
     },
-    [reloadLive, refreshTree],
+    [reloadLive, refreshTree, checkJevGone],
   );
 
   const resync = useCallback(() => {
@@ -916,8 +1131,11 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       removed: root.children.filter((c) => c.status === "removed"),
     };
   }, [compared]);
-  // Sorting by the change needs the column; without it the list goes by size.
-  const sortKey = sort.key === "change" && !diffWanted ? "size" : sort.key;
+  // A 뜻으로 찾기's answer on screen (v0.9).
+  const jevRes = results?.jev ?? null;
+  // Sorting by the change needs the column, and by 일치도 a 뜻으로 찾기's results; without them the
+  // list goes by size.
+  const sortKey = (sort.key === "change" && !diffWanted) || (sort.key === "score" && !jevRes) ? "size" : sort.key;
   const changeSort = useMemo(
     () =>
       sortKey !== "change"
@@ -932,16 +1150,28 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
             SORTERS.size,
     [sortKey, changes],
   );
+  const scoreSort = useMemo(
+    () =>
+      jevRes
+        ? (a: Entry, b: Entry) => (jevRes.hits.get(a.path)?.score ?? 0) - (jevRes.hits.get(b.path)?.score ?? 0)
+        : SORTERS.size,
+    [jevRes],
+  );
   const rows = useMemo(() => {
-    const list = searching ? results!.items : (fresh?.entries ?? adminEntries ?? []);
+    let list = searching ? results!.items : (fresh?.entries ?? adminEntries ?? []);
+    // A 뜻으로 찾기 shows the hits jev scored under JEV_SHOW only when asked to ("50% 미만도 보기").
+    if (jevRes && !jevLow) list = list.filter((e) => (jevRes.hits.get(e.path)?.score ?? 0) >= JEV_SHOW);
     const dir = sort.desc ? -1 : 1;
-    const by = sortKey === "change" ? changeSort! : SORTERS[sortKey];
+    const by = sortKey === "change" ? changeSort! : sortKey === "score" ? scoreSort : SORTERS[sortKey];
     return [...list].sort((a, b) => {
       // Folders first in name/type order, like Explorer.
       if ((sortKey === "name" || sortKey === "type") && a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       return by(a, b) * dir || cmp(a.name, b.name);
     });
-  }, [searching, results, fresh, adminEntries, sort.desc, sortKey, changeSort]);
+  }, [searching, results, fresh, adminEntries, sort.desc, sortKey, changeSort, jevRes, jevLow, scoreSort]);
+  // Hits a 뜻으로 찾기 shows at first, and those it keeps back.
+  const jevMatched = jevRes ? jevRes.found.items.filter((h) => h.score >= JEV_SHOW).length : 0;
+  const jevHidden = jevRes ? jevRes.found.items.length - jevMatched : 0;
 
   // A folder compared for the first time is asked at once; again after live changes to its
   // listing, once they settle. The newest answer for the folder shown wins.
@@ -1063,16 +1293,34 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     if (riskAsking.current.has(k)) return "asking";
     return riskCache.get(k)?.risk ?? null;
   };
-  // jev turned off in the settings, or its key removed: the column goes, and comes back off.
+  // jev turned off in the settings, or its key removed: the column goes, and comes back off; so
+  // does "뜻으로", with its results (the box's name search runs again), and the question about
+  // turning either on, if open ("켜기" there would turn on a switch no longer shown).
   useEffect(() => {
-    if (!jevOk) setRiskOn(false);
+    if (jevOk) return;
+    setRiskOn(false);
+    setMeaningOn(false);
+    jevReq.current++;
+    setJevBusy(false);
+    setJevQueued(false);
+    setResults((r) => (r?.jev ? null : r));
+    setDialog((d) => (d?.kind === "jevAsk" || d?.kind === "jevFindAsk" ? null : d));
   }, [jevOk]);
 
   const columnsShown = useMemo(() => {
-    if (searching) return SEARCH_COLUMNS;
+    if (searching) return jevRes ? JEV_COLUMNS : SEARCH_COLUMNS;
     const base = diffWanted ? FOLDER_DIFF_COLUMNS : FOLDER_COLUMNS;
     return riskShown ? [...base, RISK_COLUMN] : base;
-  }, [searching, diffWanted, riskShown]);
+  }, [searching, jevRes, diffWanted, riskShown]);
+
+  // A row's 일치도, and the program or game jev found in that folder.
+  const scoreCell = (e: Entry): ScoreCell | undefined => {
+    const h = jevRes?.hits.get(e.path);
+    return h && { score: h.score, label: h.label };
+  };
+  const aliasOf = (e: Entry) => jevRes?.hits.get(e.path)?.label;
+  // The size bar of a 뜻으로 찾기's rows (by score, not size): the biggest of them.
+  const jevBar = useMemo(() => (jevRes ? rows.reduce((m, e) => Math.max(m, e.size), 0) : 0), [jevRes, rows]);
 
   /**
    * The AI settings and keys as saved now, not as this window last read them (another window may
@@ -1103,6 +1351,98 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     // What is sent, and to whom, is said first when the settings ask for it.
     if (now.settings.confirm_before_send) openDialog({ kind: "jevAsk" });
     else setRiskOn(true);
+  };
+
+  // ---- v0.9: 뜻으로 찾기 (jev) ----
+
+  // On: name search results give way (the list shows the folder until Enter), and the box takes
+  // the keyboard.
+  const startMeaning = () => {
+    setMeaningOn(true);
+    setResults(null);
+    shownSearch.current = "";
+  };
+  // Off: back to the name search of what the box holds (the search effect runs it). A run still
+  // out is not waited for; it ends by itself (jevRun).
+  const stopMeaning = () => {
+    setMeaningOn(false);
+    jevReq.current++;
+    setJevBusy(false);
+    setJevQueued(false);
+    setResults((r) => (r?.jev ? null : r));
+  };
+  useEffect(() => {
+    if (meaningOn) searchBox.current?.focus();
+  }, [meaningOn]);
+
+  /** The search box's "뜻으로". Turned on the first time in this tab, it says what goes when the settings ask for it. */
+  const toggleMeaning = async () => {
+    if (meaningOn) {
+      stopMeaning();
+      return;
+    }
+    const now = await freshAi();
+    if (!jevReady(now)) {
+      toast(now ? "jev가 꺼져 있거나 jev 키가 없어요. AI 설정에서 확인해 주세요" : "AI 설정을 읽지 못했어요. 잠시 뒤에 다시 해 주세요");
+      return;
+    }
+    if (!activeRef.current || busyRef.current) return;
+    if (now.settings.confirm_before_send && !jevAgreed.current) openDialog({ kind: "jevFindAsk" });
+    else startMeaning();
+  };
+
+  /**
+   * Enter with "뜻으로" on: asks jev what the box holds, within "이 폴더만" when it is on. The best
+   * hits come first. One run at a time, per tab: emptying the box (Esc) stops waiting for it, not
+   * the run, so asking the same again waits for that run (sent once, billed once), and asking
+   * something else starts once it ended.
+   */
+  const runJev = async () => {
+    const q = query.trim();
+    if (!q) return;
+    const scope = under;
+    const key = `jev:${q}\n${scope ?? ""}`;
+    const req = ++jevReq.current;
+    setJevBusy(true);
+    try {
+      // Another search still out (the tab stopped waiting for it): this one goes once it ended,
+      // never alongside it.
+      while (jevRun.current && jevRun.current.key !== key) {
+        setJevQueued(true);
+        await jevRun.current.done.catch(() => {});
+        if (req !== jevReq.current) return;
+      }
+      setJevQueued(false);
+      // The same search still out: its answer, not a second run billed again.
+      let run = jevRun.current;
+      if (!run) {
+        const mine = { key, done: ai.jevFind(q, scope) };
+        jevRun.current = run = mine;
+        void mine.done
+          .finally(() => {
+            if (jevRun.current === mine) jevRun.current = null;
+          })
+          .catch(() => {});
+      }
+      const found = await run.done;
+      if (req !== jevReq.current) return;
+      setResults(jevResults(key, q, scope, found, found.items));
+      if (key !== shownSearch.current) {
+        shownSearch.current = key;
+        setSelected(new Set());
+        setFocusPath(null);
+        anchor.current = null;
+        setJevLow(false);
+        setSort({ key: "score", desc: true });
+      }
+    } catch (err) {
+      if (req === jevReq.current) toast(String(err), "error");
+    } finally {
+      if (req === jevReq.current) {
+        setJevBusy(false);
+        setJevQueued(false);
+      }
+    }
   };
 
   const focus = useMemo(
@@ -1242,6 +1582,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       });
       setFocusPath((f) => (f === e.path ? to : f));
       if (anchor.current === e.path) anchor.current = to;
+      setResults((r) => (r?.jev ? jevRenamed(r, r.jev, e.path, to) : r));
       onChanged(id, changesOf([parentOf(e.path)], [e.path]));
       setSearchNonce((n) => n + 1);
       refreshTree();
@@ -1270,6 +1611,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         toast(`휴지통으로 ${r.moved.length.toLocaleString()}개 옮겼어요`);
         const moved = new Set(r.moved);
         setSelected((s) => new Set([...s].filter((p) => !moved.has(p))));
+        setResults((res) => (res?.jev ? jevWithout(res, res.jev, r.moved) : res));
         // Read focus as it is now: the user may have moved on while the trash ran.
         if (next) {
           setFocusPath((f) => (f !== null && moved.has(f) ? next.path : f));
@@ -1710,7 +2052,13 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     return () => ro.disconnect();
   }, [path, editingAddress]);
   const pasteTitle = canPaste === false ? "클립보드에 붙여넣을 파일이 없어요" : undefined;
-  const emptyText = searching ? "검색 결과가 없어요" : fresh || loadError ? "빈 폴더예요" : "불러오는 중…";
+  const emptyText = jevRes
+    ? jevEmpty(jevRes.found, jevLow ? 0 : jevHidden)
+    : searching
+      ? "검색 결과가 없어요"
+      : fresh || loadError
+        ? "빈 폴더예요"
+        : "불러오는 중…";
   const denied = !searching && !readOnly && loadError !== null && isDenied(loadError);
   // Refused, and somewhere the admin session can read (not a network place).
   const elevatable = denied && adminCanRead(path, p.drives);
@@ -2026,24 +2374,54 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               </div>
             )}
           </form>
-          <div className={`search${scopeHere ? " here" : ""}`}>
+          <div className={`search${jevOk ? " with-jev" : ""}${meaningOn ? " meaning" : ""}${jevBusy ? " busy" : ""}`}>
             <span className="search-icon">
               <Icon.search />
             </span>
             <input
               ref={searchBox}
-              aria-label={scopeHere ? "이 폴더에서 검색" : "모든 드라이브에서 검색"}
-              placeholder={scopeHere ? "이 폴더에서 검색 (Ctrl+F)" : "모든 드라이브에서 검색 (Ctrl+F)"}
+              aria-label={
+                meaningOn
+                  ? scopeHere
+                    ? "이 폴더에서 뜻으로 찾기 (Enter)"
+                    : "모든 드라이브에서 뜻으로 찾기 (Enter)"
+                  : scopeHere
+                    ? "이 폴더에서 검색"
+                    : "모든 드라이브에서 검색"
+              }
+              aria-busy={jevBusy || undefined}
+              placeholder={
+                meaningOn
+                  ? "뜻으로 찾기: RPG 게임, 작년에 받은 전세 계약서 (Enter)"
+                  : scopeHere
+                    ? "이 폴더에서 검색 (Ctrl+F)"
+                    : "모든 드라이브에서 검색 (Ctrl+F)"
+              }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setQuery("");
+                // "뜻으로" on: Enter asks jev; typing alone never does, nor a held Enter, nor the
+                // Enter that ends a Hangul syllable being composed.
+                else if (e.key === "Enter" && meaningOn) {
+                  e.preventDefault();
+                  if (!e.repeat && !e.nativeEvent.isComposing) void runJev();
+                }
+              }}
               spellCheck={false}
-              {...tip("search")}
+              {...tip(meaningOn ? "meaning" : "search")}
             />
-            <label className="scope" {...tip("searchHere")}>
+            <label className={`scope${scopeHere ? " on" : ""}`} {...tip("searchHere")}>
               <input type="checkbox" checked={scopeHere} onChange={(e) => setScopeHere(e.target.checked)} />
               이 폴더만
             </label>
+            {/* v0.9: jev on in the AI settings, with its key: this tab's 뜻으로 찾기. */}
+            {jevOk && (
+              <label className={`scope meaning${meaningOn ? " on" : ""}`} {...tip("meaning")}>
+                <input type="checkbox" checked={meaningOn} onChange={() => void toggleMeaning()} />
+                뜻으로
+              </label>
+            )}
           </div>
         </div>
 
@@ -2317,6 +2695,32 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         </div>
       )}
 
+      {/* v0.9: "뜻으로" on: what the box does now, the run out, or what the answer shown took the query for. */}
+      {meaningOn && (jevBusy || jevRes || query.trim()) && (
+        <div className="diff-bar jev-bar" role="status">
+          {jevBusy ? (
+            <>
+              <b className="jev-asking">jev에 묻는 중…</b>
+              <span className="muted">
+                {jevQueued && "앞에서 보낸 검색이 끝나면 이어서 물어요. "}
+                검색창에서 Esc를 누르면 그만 기다려요. 이미 보낸 요청은 끝까지 가고 요금이 나가요
+              </span>
+            </>
+          ) : jevRes ? (
+            <JevSummary
+              res={jevRes}
+              typed={query.trim() !== jevRes.query}
+              moved={under !== jevRes.scope}
+              hidden={jevHidden}
+              showLow={jevLow}
+              onShowLow={setJevLow}
+            />
+          ) : (
+            <span className="muted">Enter를 누르면 jev에 뜻으로 물어봐요. 글자를 치는 동안에는 보내지 않아요</span>
+          )}
+        </div>
+      )}
+
       <div className="content" style={{ "--preview-w": `${p.previewWidth}px` } as React.CSSProperties}>
         <div
           className="pane"
@@ -2407,7 +2811,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               onSort={(key) =>
                 setSort((s) => ({
                   key,
-                  desc: s.key === key ? !s.desc : key === "size" || key === "files" || key === "modified" || key === "change",
+                  desc:
+                    s.key === key
+                      ? !s.desc
+                      : key === "size" || key === "files" || key === "modified" || key === "change" || key === "score",
                 }))
               }
               selected={selected}
@@ -2417,7 +2824,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               onContextMenu={rowMenu}
               renaming={renaming}
               onRenameDone={finishRename}
-              barTotal={searching ? (results!.items[0]?.size ?? 0) : total}
+              barTotal={jevRes ? jevBar : searching ? (results!.items[0]?.size ?? 0) : total}
               sized={searching || !!fresh?.indexed}
               emptyText={emptyText}
               onMiddleClick={(e) => p.onOpenTab(e.path, false)}
@@ -2426,6 +2833,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               change={diffWanted ? changeCell : undefined}
               risk={riskShown ? riskCell : undefined}
               onRange={riskShown ? onRange : undefined}
+              score={jevRes ? scoreCell : undefined}
+              alias={jevRes ? aliasOf : undefined}
             />
           )}
         </div>
@@ -2450,15 +2859,17 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
 
       <footer className="status">
         <span>
-          {searching
-            ? `검색 결과 ${results!.total.toLocaleString()}개${results!.total > results!.items.length ? ` (큰 순서로 ${results!.items.length.toLocaleString()}개 표시)` : ""} · ${results!.ms}ms`
-            : fresh
-              ? `항목 ${rows.length.toLocaleString()}개${fresh.indexed && current ? ` · 전체 ${formatSize(total)}` : ""}`
-              : readOnly
-                ? `항목 ${rows.length.toLocaleString()}개 · 관리자 권한으로 읽는 중 (읽기 전용)`
-                : loadError
-                  ? "열 수 없는 폴더예요"
-                  : "불러오는 중…"}
+          {jevRes
+            ? jevLine(jevRes.found, jevMatched)
+            : searching
+              ? `검색 결과 ${results!.total.toLocaleString()}개${results!.total > results!.items.length ? ` (큰 순서로 ${results!.items.length.toLocaleString()}개 표시)` : ""} · ${results!.ms}ms`
+              : fresh
+                ? `항목 ${rows.length.toLocaleString()}개${fresh.indexed && current ? ` · 전체 ${formatSize(total)}` : ""}`
+                : readOnly
+                  ? `항목 ${rows.length.toLocaleString()}개 · 관리자 권한으로 읽는 중 (읽기 전용)`
+                  : loadError
+                    ? "열 수 없는 폴더예요"
+                    : "불러오는 중…"}
         </span>
         {!treeShown && !mapShown && selectedEntries.length > 0 && (
           <span>
@@ -2783,7 +3194,39 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
               autoFocus
               onClick={() => {
                 setDialog(null);
-                setRiskOn(true);
+                if (jevOk) setRiskOn(true);
+              }}
+            >
+              켜기
+            </button>
+          </div>
+        </Dialog>
+      )}
+      {dialog?.kind === "jevFindAsk" && (
+        <Dialog className="ai-preview" title="뜻으로 찾기를 켤까요?" onClose={() => setDialog(null)} onBackdrop={() => setDialog(null)}>
+          <h3>뜻으로 찾기를 켤까요?</h3>
+          <p>
+            켜 두는 동안 검색창에서 Enter를 누를 때마다 찾는 말과 오늘 날짜, 그리고 후보 항목을 TypeSafe jev로 보내 찾는 말에
+            맞는지 물어요. 파일은 최대 {JEV_FILE_MAX}개의 경로, 이름, 분류, 크기, 수정한 날짜를, 게임·프로그램은 최대{" "}
+            {JEV_APP_MAX}개의 이름, 설치 폴더, 게시자를 보내요. 글자를 치는 동안에는 보내지 않아요.
+          </p>
+          <p className="muted">
+            파일 내용은 보내지 않아요(Steam 게임 이름만 Steam의 설치 정보 파일에서 읽어 보내요). 내 jev API 키로 보내서 요금은
+            jev의 조건대로 키 주인에게 청구되고, 한 번 찾을 때 보통 2~6번 요청해요. 묻는 중에 Esc를 눌러도 이미 보낸 요청은 끝까지
+            가고 요금이 나가요. 같은 검색을 다시 하면 저장해 둔 답을 써요(앱을 끌 때까지). 받은 결과는 참고용이에요. 끄려면
+            검색창의 "뜻으로"를 한 번 더 누르세요.
+          </p>
+          <div className="actions">
+            <button onClick={() => setDialog(null)}>켜지 않기</button>
+            <button
+              className="primary"
+              autoFocus
+              onClick={() => {
+                setDialog(null);
+                // jev went off meanwhile (another window's AI settings): "뜻으로" is not there.
+                if (!jevOk) return;
+                jevAgreed.current = true;
+                startMeaning();
               }}
             >
               켜기
@@ -2883,6 +3326,76 @@ function PlanFlyout({ children }: { children: React.ReactNode }) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The bar over a 뜻으로 찾기's results: the query they answer, how the candidates were gathered,
+ * what was left out and why, and the switch for the hits under JEV_SHOW. `typed`: the box holds
+ * another query now, which Enter would ask; `moved`: "이 폴더만" (or the folder it means) changed.
+ */
+function JevSummary(p: {
+  res: JevResults;
+  typed: boolean;
+  moved: boolean;
+  hidden: number;
+  showLow: boolean;
+  onShowLow: (on: boolean) => void;
+}) {
+  const f = p.res.found;
+  const app = f.target === "app";
+  const out = jevLeftOut(f);
+  const where = p.res.scope === null ? "모든 드라이브에서" : `"${folderTitle(p.res.scope)}" 폴더에서`;
+  return (
+    <>
+      <b>뜻으로 찾기</b>
+      <span className="jev-query" title={p.res.query}>
+        “{p.res.query}”
+      </span>
+      <span>
+        {app
+          ? "설치된 게임·프로그램 중에서 골랐어요"
+          : f.terms.length
+            ? `이름과 폴더 이름에 든 낱말로 후보를 모았어요: ${f.terms.join(", ")}`
+            : "종류와 기간으로 후보를 모았어요"}
+      </span>
+      {/* Games·programs are all of them whatever the words: only a folder narrows them. */}
+      {out.capped &&
+        (app ? (
+          <span className="diff-method">
+            게임·프로그램이 많아 큰 것부터 {out.cap.toLocaleString()}개만 확인했어요 —{" "}
+            {p.res.scope === null ? '"이 폴더만"으로 좁혀 보세요' : "더 안쪽 폴더에서 찾아 보세요"}
+          </span>
+        ) : (
+          <span className="diff-method">후보가 많아 {out.cap.toLocaleString()}개만 확인했어요 — 낱말을 더 넣어 보세요</span>
+        ))}
+      {out.unanswered > 0 && (
+        <span className="diff-method">jev가 답하지 않은 후보 {out.unanswered.toLocaleString()}개는 빠졌어요</span>
+      )}
+      {f.unplaced > 0 && (
+        <span className="muted" title="설치 폴더가 스캔 결과에 없는 프로그램이에요 (Microsoft Store 앱, 스캔하지 않은 드라이브의 프로그램)">
+          폴더를 찾지 못한 프로그램 {f.unplaced.toLocaleString()}개는 빠졌어요
+        </span>
+      )}
+      {p.typed ? (
+        <span className="muted">Enter를 누르면 지금 쓴 말로 새로 찾아요</span>
+      ) : (
+        p.moved && (
+          <span className="diff-method" title={p.res.scope ?? undefined}>
+            범위가 바뀌었어요. 이 결과는 {where} 찾았어요. Enter를 누르면 새로 찾아요
+          </span>
+        )
+      )}
+      {p.hidden > 0 && (
+        <label className={`scope jev-low${p.showLow ? " on" : ""}`} title="jev가 50% 미만으로 본 항목도 목록에 보여요">
+          <input type="checkbox" checked={p.showLow} onChange={(e) => p.onShowLow(e.target.checked)} />
+          50% 미만도 보기 ({p.hidden.toLocaleString()}개)
+        </label>
+      )}
+      <span className="muted">
+        {app ? "이름·설치 폴더·게시자만 보고 고른 참고용이에요" : "이름·경로·날짜 같은 정보만 보고 고른 참고용이에요"}
+      </span>
+    </>
   );
 }
 

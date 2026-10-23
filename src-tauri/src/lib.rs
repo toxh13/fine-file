@@ -6,6 +6,7 @@ mod dups;
 mod index;
 mod mapview;
 mod mcp;
+mod meaning;
 mod ops;
 mod places;
 mod plans;
@@ -1663,6 +1664,7 @@ pub fn run() {
             ai::ai_explain,
             ai::ai_plan,
             ai::jev_risk,
+            meaning::jev_find,
             plans::plans_list,
             plans::plan_get,
             plans::plan_rules,

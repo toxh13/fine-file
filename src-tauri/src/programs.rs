@@ -90,10 +90,13 @@ const STAT_MOST: usize = 8;
 /// Prefetch keeps this much of an executable's name.
 const PREFETCH_NAME: usize = 29;
 /// How long the Store app list may take, how long a Store app's removal is
-/// waited for (it goes on after that), and how long a list is reused.
+/// waited for (it goes on after that), and how long a list is reused: by the
+/// program list, and by 뜻으로 찾기 (which only needs the apps' folders, and
+/// should not wait for PowerShell on every search).
 const STORE_LIMIT: Duration = Duration::from_secs(30);
 const REMOVE_LIMIT: Duration = Duration::from_secs(120);
 const STORE_FRESH: Duration = Duration::from_secs(60);
+const STORE_KEPT: Duration = Duration::from_secs(600);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Store apps, without frameworks and Windows' own packages, as JSON (UTF-8:
@@ -160,19 +163,51 @@ pub async fn programs_list(with_prefetch: bool, state: tauri::State<'_, crate::A
     let all = state.all();
     let prefetch = if with_prefetch { prefetch_runs().await } else { Vec::new() };
     crate::blocking(move || {
-        let indexes = Indexes::of(all);
-        let places = Places::now();
-        let mut found = registry_programs(&places, false);
-        found.extend(store_apps(false).unwrap_or_default().into_iter().map(|a| store_found(a, &places)));
         let evidence = Evidence { launches: launches(), prefetch: prefetch_map(&prefetch), access_kept: last_access_kept() };
-        for f in &mut found {
-            measure(f, &indexes, &evidence);
-        }
-        let mut programs: Vec<Program> = found.into_iter().map(|f| f.program).collect();
+        let mut programs: Vec<Program> = installed(&Indexes::of(all), &evidence, STORE_FRESH).into_iter().map(|f| f.program).collect();
         programs.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
         programs
     })
     .await
+}
+
+/// What `programs_list` lists (Uninstall keys and Store apps, a Store list
+/// up to `store_kept` old), measured against the indexes.
+fn installed(indexes: &Indexes, evidence: &Evidence, store_kept: Duration) -> Vec<Found> {
+    let places = Places::now();
+    let mut found = registry_programs(&places, false);
+    found.extend(store_apps(store_kept).unwrap_or_default().into_iter().map(|a| store_found(a, &places)));
+    for f in &mut found {
+        measure(f, indexes, evidence);
+    }
+    found
+}
+
+/// An installed program for 뜻으로 찾기 (meaning.rs).
+pub(crate) struct Placed {
+    pub(crate) name: String,
+    pub(crate) publisher: Option<String>,
+    /// Where it says it is installed, if it says so.
+    pub(crate) location: Option<String>,
+    /// Its own folder, when a scanned drive has it as a live folder (the one `measure` measured).
+    pub(crate) folder: Option<String>,
+}
+
+/// The installed programs `programs_list` lists, each with its own folder
+/// when the index has it. No launch records, Prefetch or file times are
+/// read: only the folders matter here. The Store list of the last ten
+/// minutes will do (PowerShell takes seconds).
+pub(crate) fn placed(all: Vec<Shared>) -> Vec<Placed> {
+    let evidence = Evidence { launches: Vec::new(), prefetch: HashMap::new(), access_kept: false };
+    installed(&Indexes::of(all), &evidence, STORE_KEPT)
+        .into_iter()
+        .map(|f| Placed {
+            folder: f.home.filter(|_| f.program.size_source == "index"),
+            name: f.program.name,
+            publisher: f.program.publisher,
+            location: f.program.install_location,
+        })
+        .collect()
 }
 
 /// Starts the program's own uninstaller (it shows its own windows and asks
@@ -802,11 +837,11 @@ struct Appx {
 /// The last list, and when it was made.
 static STORE: Mutex<Option<(Instant, Vec<Appx>)>> = Mutex::new(None);
 
-/// The Store apps of this user: the list of the last minute, unless `fresh`.
-fn store_apps(fresh: bool) -> Result<Vec<Appx>, String> {
-    if !fresh
-        && let Some((at, apps)) = STORE.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
-        && at.elapsed() < STORE_FRESH
+/// The Store apps of this user: the last list if it is younger than `kept`
+/// (never with `Duration::ZERO`), else a new one.
+fn store_apps(kept: Duration) -> Result<Vec<Appx>, String> {
+    if let Some((at, apps)) = STORE.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
+        && at.elapsed() < kept
     {
         return Ok(apps.clone());
     }
@@ -1319,7 +1354,7 @@ fn uninstall(id: &str) -> Result<(), String> {
             if !is_package_name(id) {
                 return Err(BAD_ID.into());
             }
-            let app = store_apps(true)?.into_iter().find(|a| a.full_name == id).ok_or(NOT_FOUND)?;
+            let app = store_apps(Duration::ZERO)?.into_iter().find(|a| a.full_name == id).ok_or(NOT_FOUND)?;
             if app.non_removable {
                 return Err(NOT_REMOVABLE.into());
             }
@@ -1772,7 +1807,7 @@ fn find_leftovers(indexes: &Indexes) -> Result<Vec<Leftover>, String> {
     // System components and updates say whose a folder is too (WSL, parts of drivers).
     let mut found = registry_programs(&places, true);
     // A Store app's name accounts for a folder too; without the list, a few more look left behind.
-    found.extend(store_apps(false).unwrap_or_default().into_iter().map(|a| store_found(a, &places)));
+    found.extend(store_apps(STORE_FRESH).unwrap_or_default().into_iter().map(|a| store_found(a, &places)));
     let owners = Owners::of(&found, &places);
     let own = own_folders();
     let now = crate::index::now_filetime();

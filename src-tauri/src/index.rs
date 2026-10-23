@@ -8,7 +8,7 @@
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -141,6 +141,35 @@ pub struct Index {
     /// Removed nodes, and name bytes no node uses any more. `compact` drops both.
     dead_nodes: usize,
     dead_names: usize,
+}
+
+/// How many folders above an item `Index::gather` looks at for terms.
+const GATHER_LEVELS: usize = 4;
+
+/// Whether a file (its name in lower case, its size) is of a kind.
+pub type IsKind = dyn Fn(&str, u64) -> bool + Sync;
+
+/// What `Index::gather` and `Index::newest` look for (뜻으로 찾기, meaning.rs).
+pub struct Wanted<'a> {
+    /// Words to find in names; case does not matter. The first 32 count.
+    pub terms: &'a [String],
+    /// Whether a file of this name (lower case) and size is of the kind
+    /// asked for. None: any kind, folders too.
+    pub kind: Option<&'a IsKind>,
+    /// Last modified in `from..to` (FILETIME), when Some.
+    pub period: Option<(i64, i64)>,
+    /// Only this folder and what is below it, when Some.
+    pub under: Option<u32>,
+    /// Whether an item (its path, its name, whether it is a folder) may be
+    /// shown at all, asked only of items that passed everything else.
+    pub keep: &'a (dyn Fn(&str, &str, bool) -> bool + Sync),
+}
+
+/// One item `Index::gather` found, with its score.
+pub struct Gathered {
+    pub node: u32,
+    pub score: u32,
+    pub info: EntryInfo,
 }
 
 #[derive(Serialize, Clone)]
@@ -600,6 +629,98 @@ impl Index {
             i = self.nodes[i as usize].parent;
         }
         false
+    }
+
+    /// Live folders whose name, in lower case, passes `test`.
+    pub fn dirs_where(&self, test: impl Fn(&str) -> bool + Sync) -> Vec<u32> {
+        (1..self.nodes.len() as u32).into_par_iter().filter(|&i| self.is_live_dir(i) && test(self.lower_name(i))).collect()
+    }
+
+    /// Items whose name holds some of `w.terms`, or whose folders up to
+    /// GATHER_LEVELS above do (뜻으로 찾기, meaning.rs): 2 points for each term
+    /// in the name, 1 for each one only in a folder's name. Of the kind and
+    /// period asked for, below `w.under`, and what `w.keep` takes. How many
+    /// there are, and the best `cap` of them (score, then newest first).
+    pub fn gather(&self, w: &Wanted, cap: usize) -> (usize, Vec<Gathered>) {
+        let terms: Vec<String> = w.terms.iter().map(|t| fold(t)).filter(|t| !t.is_empty()).take(32).collect();
+        if terms.is_empty() {
+            return (0, Vec::new());
+        }
+        let mask_of = |i: u32| {
+            let name = self.lower_name(i);
+            terms.iter().enumerate().fold(0u32, |m, (k, t)| if name.contains(t.as_str()) { m | 1 << k } else { m })
+        };
+        // The folders with a term in their name first, so that each item
+        // looks up only its few folders above instead of their names.
+        let dirs: HashMap<u32, u32> = (1..self.nodes.len() as u32)
+            .into_par_iter()
+            .filter(|&i| self.is_live_dir(i))
+            .filter_map(|i| Some((i, mask_of(i))).filter(|&(_, m)| m != 0))
+            .collect();
+        let mut hits: Vec<(u32, u32)> = (1..self.nodes.len() as u32)
+            .into_par_iter()
+            .filter(|&i| self.wanted(i, w))
+            .filter_map(|i| {
+                let n = &self.nodes[i as usize];
+                let own = if n.flags & FLAG_DIR != 0 { dirs.get(&i).copied().unwrap_or(0) } else { mask_of(i) };
+                let mut above = 0;
+                let mut p = n.parent;
+                for _ in 0..GATHER_LEVELS {
+                    if dirs.is_empty() || p == ROOT || p == NO_PARENT {
+                        break;
+                    }
+                    above |= dirs.get(&p).copied().unwrap_or(0);
+                    p = self.nodes[p as usize].parent;
+                }
+                let score = 2 * own.count_ones() + (above & !own).count_ones();
+                (score > 0).then_some((i, score))
+            })
+            .filter(|&(i, _)| w.under.is_none_or(|u| u == ROOT || self.is_under(i, u)))
+            .filter(|&(i, _)| (w.keep)(&self.path_of(i), self.name(i), self.nodes[i as usize].flags & FLAG_DIR != 0))
+            .collect();
+        let total = hits.len();
+        hits.par_sort_unstable_by_key(|&(i, score)| (std::cmp::Reverse(score), std::cmp::Reverse(self.nodes[i as usize].modified), i));
+        hits.truncate(cap);
+        (total, hits.into_iter().map(|(node, score)| Gathered { node, score, info: self.info(node) }).collect())
+    }
+
+    /// The newest files of the kind and period asked for (`w.terms` are not
+    /// looked at), below `w.under`, that `w.keep` takes, at most `n`, but
+    /// the nodes in `skip`. With neither a kind nor a period that is just
+    /// the newest files anywhere, so meaning.rs asks only with one of them.
+    pub fn newest(&self, w: &Wanted, n: usize, skip: &HashSet<u32>) -> Vec<EntryInfo> {
+        let mut files: Vec<u32> = (1..self.nodes.len() as u32)
+            .into_par_iter()
+            .filter(|&i| self.nodes[i as usize].flags & FLAG_DIR == 0 && self.wanted(i, w) && !skip.contains(&i))
+            .filter(|&i| w.under.is_none_or(|u| u == ROOT || self.is_under(i, u)))
+            .collect();
+        files.par_sort_unstable_by_key(|&i| (std::cmp::Reverse(self.nodes[i as usize].modified), i));
+        // `keep` (a path and its category) only for as many as it takes, newest first.
+        let mut out = Vec::new();
+        for chunk in files.chunks(4096) {
+            if out.len() >= n {
+                break;
+            }
+            let kept: Vec<u32> = chunk.par_iter().copied().filter(|&i| (w.keep)(&self.path_of(i), self.name(i), false)).collect();
+            out.extend(kept.into_iter().take(n - out.len()).map(|i| self.info(i)));
+        }
+        out
+    }
+
+    /// Live, not super-hidden (hidden and system) nor a system file, of the
+    /// kind (folders only with no kind) and the period `w` asks for.
+    fn wanted(&self, i: u32, w: &Wanted) -> bool {
+        let n = &self.nodes[i as usize];
+        let dir = n.flags & FLAG_DIR != 0;
+        let shown = n.flags & FLAG_DELETED == 0
+            && n.flags & (FLAG_HIDDEN | FLAG_SYSTEM) != FLAG_HIDDEN | FLAG_SYSTEM
+            && (dir || n.flags & FLAG_SYSTEM == 0);
+        shown
+            && match w.kind {
+                Some(kind) => !dir && kind(self.lower_name(i), n.size),
+                None => true,
+            }
+            && w.period.is_none_or(|(from, to)| (from..to).contains(&n.modified))
     }
 
     /// Marks a node as removed and takes its size out of every ancestor.
@@ -1888,5 +2009,113 @@ mod tests {
         assert_eq!(ix.nodes[c as usize].flags, FLAG_DIR);
         assert!(ix.update(c, cloud));
         assert_eq!(ix.nodes[c as usize].flags, cloud.flags);
+    }
+
+    /// A small drive for `gather` and `newest`: modified times are plain numbers.
+    fn papers() -> Index {
+        let e = |id, parent, name: &str, flags, modified| RawEntry { id, parent, name: name.into(), flags, size: 10, alloc: 10, modified };
+        let raw = vec![
+            e(5, 5, ".", FLAG_DIR, 0),
+            e(6, 5, "Users", FLAG_DIR, 0),
+            e(7, 6, "me", FLAG_DIR, 0),
+            e(8, 7, "전세 계약", FLAG_DIR, 50),
+            e(9, 8, "scan.pdf", 0, 300),
+            e(10, 8, "2024", FLAG_DIR, 60),
+            e(11, 10, "a", FLAG_DIR, 60),
+            e(12, 11, "b", FLAG_DIR, 60),
+            e(13, 12, "deep.pdf", 0, 400),
+            e(14, 12, "c", FLAG_DIR, 60),
+            e(15, 14, "too deep.pdf", 0, 500),
+            e(16, 7, "전세계약서.hwp", 0, 200),
+            e(17, 7, "계약 메모.txt", 0, 100),
+            e(18, 7, "photo.jpg", 0, 900),
+            e(19, 7, "계약서.pdf", FLAG_HIDDEN | FLAG_SYSTEM, 950),
+            e(20, 7, "계약.ini", FLAG_SYSTEM, 960),
+            e(21, 7, "숨은 계약.pdf", FLAG_HIDDEN, 970),
+            e(22, 5, "계약 보관", FLAG_DIR | FLAG_SYSTEM, 30),
+        ];
+        Index::build("C:", "test", 0, raw, 5)
+    }
+
+    fn names(found: &[Gathered]) -> Vec<(&str, u32)> {
+        found.iter().map(|g| (g.info.name.as_str(), g.score)).collect()
+    }
+
+    #[test]
+    fn gathers_by_name_and_by_folders_above() {
+        let ix = papers();
+        let terms = ["전세".to_string(), "계약".to_string()];
+        let keep = |_: &str, _: &str, _: bool| true;
+        let w = Wanted { terms: &terms, kind: None, period: None, under: None, keep: &keep };
+        let (total, found) = ix.gather(&w, 100);
+        // Both terms in the name: 4. One in the name, the other only in a folder
+        // above: 3. Only in folders up to four levels above: 2 per term.
+        // "too deep.pdf" is five levels below "전세 계약". Super-hidden items and
+        // system files never count; a system folder (customized) does.
+        assert_eq!(
+            names(&found),
+            vec![
+                ("전세계약서.hwp", 4),
+                ("전세 계약", 4),
+                ("숨은 계약.pdf", 2),
+                ("deep.pdf", 2),
+                ("scan.pdf", 2),
+                ("계약 메모.txt", 2),
+                ("2024", 2),
+                ("a", 2),
+                ("b", 2),
+                ("c", 2),
+                ("계약 보관", 2),
+            ]
+        );
+        assert_eq!(total, found.len());
+        // The cap keeps the best; the total still counts them all.
+        let (total, top) = ix.gather(&w, 3);
+        assert_eq!((total, names(&top)), (11, vec![("전세계약서.hwp", 4), ("전세 계약", 4), ("숨은 계약.pdf", 2)]));
+        assert_eq!(top[1].info.path, r"C:\Users\me\전세 계약");
+        // Case does not matter.
+        let upper = ["PHOTO".to_string()];
+        assert_eq!(names(&ix.gather(&Wanted { terms: &upper, ..w }, 10).1), vec![("photo.jpg", 2)]);
+        assert_eq!(ix.gather(&Wanted { terms: &[], ..w }, 10).0, 0);
+    }
+
+    #[test]
+    fn gathers_by_kind_period_place_and_keep() {
+        let ix = papers();
+        let terms = ["계약".to_string()];
+        let keep = |_: &str, _: &str, _: bool| true;
+        let pdf = |name: &str, _: u64| name.ends_with(".pdf");
+        let w = Wanted { terms: &terms, kind: None, period: None, under: None, keep: &keep };
+        // A kind: files of it only, no folders.
+        let docs = ix.gather(&Wanted { kind: Some(&pdf), ..w }, 10).1;
+        assert_eq!(names(&docs), vec![("숨은 계약.pdf", 2), ("deep.pdf", 1), ("scan.pdf", 1)]);
+        // A period: modified in from..to.
+        let late = ix.gather(&Wanted { period: Some((300, 960)), ..w }, 10).1;
+        assert_eq!(names(&late), vec![("deep.pdf", 1), ("scan.pdf", 1)]);
+        // Below a folder.
+        let under = ix.find(r"C:\Users\me\전세 계약\2024").unwrap();
+        let below = ix.gather(&Wanted { under: Some(under), ..w }, 10).1;
+        assert_eq!(names(&below), vec![("deep.pdf", 1), ("2024", 1), ("a", 1), ("b", 1), ("c", 1)]);
+        // `keep` decides last, with the item's path.
+        let no_dirs = |path: &str, _: &str, dir: bool| !dir && !path.contains("전세");
+        assert_eq!(names(&ix.gather(&Wanted { keep: &no_dirs, ..w }, 10).1), vec![("숨은 계약.pdf", 2), ("계약 메모.txt", 2)]);
+    }
+
+    #[test]
+    fn newest_files_of_a_kind_or_period() {
+        let ix = papers();
+        let keep = |path: &str, _: &str, _: bool| !path.contains("deep");
+        let pdf = |name: &str, _: u64| name.ends_with(".pdf");
+        let w = Wanted { terms: &[], kind: Some(&pdf), period: None, under: None, keep: &keep };
+        let names = |found: Vec<EntryInfo>| found.into_iter().map(|e| e.name).collect::<Vec<_>>();
+        // Files only, newest first, never super-hidden ones or system files.
+        assert_eq!(names(ix.newest(&w, 10, &HashSet::new())), vec!["숨은 계약.pdf", "scan.pdf"]);
+        assert_eq!(names(ix.newest(&w, 1, &HashSet::new())), vec!["숨은 계약.pdf"]);
+        let skip = HashSet::from([ix.find(r"C:\Users\me\숨은 계약.pdf").unwrap()]);
+        assert_eq!(names(ix.newest(&w, 10, &skip)), vec!["scan.pdf"]);
+        let any = |_: &str, _: &str, _: bool| true;
+        let period = Wanted { kind: None, period: Some((100, 400)), keep: &any, ..w };
+        assert_eq!(names(ix.newest(&period, 10, &HashSet::new())), vec!["scan.pdf", "전세계약서.hwp", "계약 메모.txt"]);
+        assert_eq!(ix.dirs_where(|n| n == "2024" || n == "users").len(), 2);
     }
 }

@@ -1,0 +1,103 @@
+/* v0.9: 뜻으로 찾기 (jev). The search box's switch is App.css's .scope; the bar over the results is
+   App.css's .diff-bar. Colors come from the variables in App.css. */
+
+/* ---- the search box: room for a second switch ---- */
+.search.with-jev {
+  flex-basis: 420px;
+  min-width: 250px;
+  max-width: 440px;
+}
+
+/* "뜻으로" on: the box says so by its frame too. */
+.search.meaning {
+  border-color: var(--sel-line);
+}
+
+.search.meaning:focus-within {
+  border-color: var(--accent);
+}
+
+/* A run is out: the magnifier breathes. */
+.search.busy .search-icon {
+  color: var(--accent);
+  animation: jev-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes jev-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search.busy .search-icon {
+    animation: none;
+  }
+}
+
+/* ---- the bar over the results ---- */
+.jev-bar {
+  align-items: center;
+}
+
+.jev-bar .jev-asking {
+  color: var(--accent);
+}
+
+.jev-bar .jev-query {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jev-bar .scope.jev-low {
+  margin: -2px 0;
+}
+
+/* ---- the list: the 일치도 column, and the name jev found in a folder ---- */
+.td.score {
+  display: flex;
+  align-items: center;
+}
+
+.score-badge {
+  display: inline-block;
+  min-width: 40px;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.score-badge.high {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.score-badge.mid {
+  color: var(--text);
+}
+
+.score-badge.low {
+  color: var(--muted);
+  border-style: dashed;
+}
+
+/* The program or game's own name after the folder's: it gives way first when the column is narrow. */
+.td.name .alias {
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tr.sel .td.name .alias {
+  color: inherit;
+  opacity: 0.75;
+}

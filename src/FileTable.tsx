@@ -4,7 +4,8 @@ import { formatDate, formatSize, typeLabel } from "./format";
 import { watchPress } from "./shell";
 import { focusTakenByConflict } from "./Transfers";
 
-export type SortKey = "name" | "size" | "files" | "modified" | "type" | "location" | "change";
+/** "score": v0.9's 일치도, the results of a 뜻으로 찾기 (jev) only. */
+export type SortKey = "name" | "size" | "files" | "modified" | "type" | "location" | "change" | "score";
 
 /** A column: one the list sorts by, or "risk" (jev's 위험도, which comes in a while after and is not sorted by). */
 export type ColumnKey = SortKey | "risk";
@@ -13,6 +14,15 @@ export type ColumnKey = SortKey | "risk";
 export type RiskCell = Risk | "asking" | null;
 
 const RISK_LABEL: Record<Risk["level"], string> = { safe: "안전", caution: "주의", danger: "위험" };
+
+/** A row's "일치도" cell (뜻으로 찾기): jev's score, 0..1, and the program or game it found, if named. */
+export interface ScoreCell {
+  score: number;
+  label: string | null;
+}
+
+/** The 일치도 badge's tone: what the list shows at first is 0.5 and over. */
+const scoreTone = (s: number) => (s >= 0.8 ? "high" : s >= 0.5 ? "mid" : "low");
 
 /** A row's "변화" cell: its change since the scan before, as shown and explained. */
 export interface ChangeCell {
@@ -26,6 +36,8 @@ export interface Column {
   label: string;
   width: string;
   align?: "right";
+  /** The header's tooltip. */
+  title?: string;
 }
 
 const ROW = 28;
@@ -58,6 +70,13 @@ interface Props {
   change?: (entry: Entry) => ChangeCell | undefined;
   /** The "위험도" column's cell for a row. */
   risk?: (entry: Entry) => RiskCell;
+  /** The "일치도" column's cell for a row (뜻으로 찾기). */
+  score?: (entry: Entry) => ScoreCell | undefined;
+  /**
+   * Another name for a row, shown muted after its own and in its tooltip: the program or game a
+   * 뜻으로 찾기 found in that folder ("Counter-Strike 2" for "Counter-Strike Global Offensive").
+   */
+  alias?: (entry: Entry) => string | null | undefined;
   /** The rows drawn now (from `first`, up to but not including `last`), scrolled into view or about to be. */
   onRange?: (first: number, last: number) => void;
 }
@@ -162,7 +181,7 @@ export function FileTable(p: Props) {
               {c.label}
             </div>
           ) : (
-            <button key={key} className={`th ${c.align === "right" ? "right" : ""}`} onClick={() => p.onSort(key)}>
+            <button key={key} className={`th ${c.align === "right" ? "right" : ""}`} title={c.title} onClick={() => p.onSort(key)}>
               {c.label}
               {p.sort.key === key && <span className="arrow">{p.sort.desc ? "▼" : "▲"}</span>}
             </button>
@@ -206,19 +225,26 @@ export function FileTable(p: Props) {
   );
 }
 
-function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk }: { col: Column; e: Entry } & Props) {
+function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk, score, alias }: { col: Column; e: Entry } & Props) {
   switch (col.key) {
-    case "name":
+    case "name": {
+      // Only a name that says more than the folder's own.
+      const other = alias?.(e);
+      const also = other && other.trim().toLowerCase() !== e.name.toLowerCase() ? other.trim() : null;
       return (
-        <div className="td name" title={e.path}>
+        <div className="td name" title={also ? `${also}\n${e.path}` : e.path}>
           <span className={`icon ${e.is_dir ? "dir" : "file"} ${e.reparse ? "link" : ""}`} />
           {renaming === e.path ? (
             <RenameBox entry={e} onDone={onRenameDone} />
           ) : (
-            <span className="label">{e.name}</span>
+            <>
+              <span className="label">{e.name}</span>
+              {also && <span className="alias">{also}</span>}
+            </>
           )}
         </div>
       );
+    }
     case "size": {
       const known = sized || !e.is_dir;
       const pct = barTotal > 0 && known ? Math.min(100, (e.size / barTotal) * 100) : 0;
@@ -257,6 +283,18 @@ function Cell({ col, e, barTotal, sized, renaming, onRenameDone, change, risk }:
       return (
         <div className="td risk" title={`jev 위험도 (참고용) · 신뢰도 ${Math.round(r.confidence * 100)}%${regen}`}>
           <span className={`risk-badge ${r.level}`}>{RISK_LABEL[r.level] ?? r.level}</span>
+        </div>
+      );
+    }
+    case "score": {
+      const s = score?.(e);
+      if (!s) return <div className="td score" />;
+      // Rounded down, as the list's 50% line is: 0.497 shows as 49%, with the hits under it.
+      // (The tiny bit keeps 0.29 from reading as 28.999…%.)
+      const pct = Math.floor(Math.max(0, Math.min(1, s.score)) * 100 + 1e-9);
+      return (
+        <div className="td score" title={`${s.label ? `${s.label}\n` : ""}일치도 ${pct}% (jev가 본 값, 참고용)`}>
+          <span className={`score-badge ${scoreTone(s.score)}`}>{pct}%</span>
         </div>
       );
     }

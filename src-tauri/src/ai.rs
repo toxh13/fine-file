@@ -76,7 +76,7 @@ const MAX_TOKENS: u32 = 16_000;
 /// Waits for an answer: a long plan can take minutes; Ollama runs on this PC and may be slower.
 const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
-const JEV_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const JEV_TIMEOUT: Duration = Duration::from_secs(90);
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 /// Tries after the first for 429 and 5xx answers (and dropped connections).
@@ -224,7 +224,7 @@ fn read_key(user: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn need_key(user: &str, label: &str) -> Result<String, String> {
+pub(crate) fn need_key(user: &str, label: &str) -> Result<String, String> {
     read_key(user)?.ok_or_else(|| format!("{label} 키가 없어요. 설정에서 키를 넣어 주세요"))
 }
 
@@ -244,7 +244,7 @@ fn check_key(key: &str) -> Result<&str, String> {
 }
 
 /// An error message with every copy of `key` blanked, should a server have echoed it.
-fn scrub(message: String, key: &str) -> String {
+pub(crate) fn scrub(message: String, key: &str) -> String {
     if key.len() >= 8 { message.replace(key, "***") } else { message }
 }
 
@@ -268,7 +268,7 @@ fn clean_answer(s: &str) -> String {
     kept.trim_end().to_string()
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -294,7 +294,7 @@ fn count(n: u64) -> String {
 }
 
 /// A FILETIME as `YYYY-MM-DD` (UTC), `-` when unknown.
-fn date(ft: i64) -> String {
+pub(crate) fn date(ft: i64) -> String {
     if ft <= 0 {
         return "-".into();
     }
@@ -312,7 +312,7 @@ fn date(ft: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn category_label(c: &str) -> &'static str {
+pub(crate) fn category_label(c: &str) -> &'static str {
     match c {
         "system" => "시스템",
         "program" => "프로그램",
@@ -970,14 +970,25 @@ fn exchange(label: &str, secrets: &[&str], send: &mut dyn FnMut() -> Result<Repl
     }
 }
 
-fn post_json(label: &str, url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration) -> Result<Value, String> {
+pub(crate) fn post_json(label: &str, url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration) -> Result<Value, String> {
+    post_json_counted(label, url, headers, body, timeout).0
+}
+
+/// `post_json`, and how many times the request went out (tries again
+/// included: a provider may bill each one).
+pub(crate) fn post_json_counted(label: &str, url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration) -> (Result<Value, String>, u32) {
     // serde_json writes UTF-8 as it is (no \u escapes, so no surrogate halves).
-    let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let bytes = match serde_json::to_vec(body) {
+        Ok(b) => b,
+        Err(e) => return (Err(e.to_string()), 0),
+    };
     let agent = agent(timeout);
+    let mut sent = 0;
     let text = exchange(
         label,
         &secrets_of(headers),
         &mut || {
+            sent += 1;
             let mut rq = agent.post(url).header("content-type", "application/json");
             for &(k, v) in headers {
                 rq = rq.header(k, v);
@@ -985,8 +996,9 @@ fn post_json(label: &str, url: &str, headers: &[(&str, &str)], body: &Value, tim
             reply(rq.send(&bytes[..]))
         },
         &std::thread::sleep,
-    )?;
-    serde_json::from_str(&text).map_err(|_| format!("{label}: 답을 읽을 수 없어요"))
+    );
+    let value = text.and_then(|t| serde_json::from_str(&t).map_err(|_| format!("{label}: 답을 읽을 수 없어요")));
+    (value, sent)
 }
 
 fn get_json(label: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
@@ -1940,9 +1952,9 @@ fn make_plan(s: &AiSettings, kind: &str, root: &str, shared: Option<crate::Share
 
 // ---- jev ----------------------------------------------------------------------------------------
 
-const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
+pub(crate) const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODELS_URL: &str = "https://api.typesafe.ai/v1/models";
-const JEV_MODEL: &str = "jev-latest";
+pub(crate) const JEV_MODEL: &str = "jev-latest";
 /// Items per request (two questions each), and per call: every step of the
 /// biggest plan (the window asks for up to that many at once).
 const JEV_BATCH: usize = 40;

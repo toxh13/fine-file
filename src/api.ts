@@ -426,6 +426,15 @@ export const ai = {
   explain: (path: string) => invoke<string>("ai_explain", { path }),
   plan: (kind: "structure" | "rename", path: string) => invoke<Plan>("ai_plan", { kind, path }),
   jevRisk: (paths: string[]) => invoke<Risk[]>("jev_risk", { paths }),
+  /**
+   * v0.9 "뜻으로 찾기": jev reads what the query asks for (installed games·programs by genre or
+   * kind, or files by a description, kind and period), the index gathers candidates, and jev
+   * judges each by its path, name, kind, size and date (never its contents). `under`: only below
+   * this folder. Costs jev requests, so it runs only when asked (Enter), never as one types; the
+   * same search again comes from the backend's cache (`requests` 0). Rejects (Korean) while jev is
+   * off or has no key, for an empty or too long query, or before any drive is scanned.
+   */
+  jevFind: (query: string, under: string | null) => invoke<JevFound>("jev_find", { query, under }),
 };
 
 export const plans = {
@@ -597,3 +606,55 @@ export const v082 = {
    */
   startDupLink: (groups: DupLinkGroup[], dup: number | null) => invoke<number>("start_dup_link", { groups, dup }),
 };
+
+// ---- v0.9: 뜻으로 찾기 (jev) — search by meaning (Explorer.tsx's search box, ai.jevFind) ----------
+
+/** The backend's name for an Entry (index.rs EntryInfo): what search returns. */
+export type EntryInfo = Entry;
+
+/** A file kind jev read from the query (meaning.rs); null in JevFound: any kind. */
+export type JevKind = "document" | "image" | "video" | "audio" | "archive" | "program";
+
+/** A period jev read from the query, in local calendar terms (a week starts on Monday). */
+export type JevWhen =
+  | "today"
+  | "yesterday"
+  | "this_week"
+  | "last_week"
+  | "this_month"
+  | "last_month"
+  | "this_year"
+  | "last_year"
+  | "older";
+
+/** One candidate jev judged. */
+export interface JevHit {
+  /** The file or folder (for a game or program, its install folder). */
+  entry: EntryInfo;
+  /** How well it answers the query, 0..1, as jev sees it. The list hides those under 0.5 at first. */
+  score: number;
+  /** A program's display name, or Steam's name for a game (null: none known, the folder's name stands). */
+  label: string | null;
+}
+
+export interface JevFound {
+  /** "app": installed games and programs (a genre or kind: "RPG 게임"); "file": files and folders (a description). */
+  target: "app" | "file";
+  /** Files only; null: any kind. */
+  kind: JevKind | null;
+  /** Files only; null: any time. */
+  when: JevWhen | null;
+  /** The words file candidates were gathered by (empty for "app"). */
+  terms: string[];
+  /** Every candidate judged, the best first. */
+  items: JevHit[];
+  /** Candidates gathered before the cap. */
+  candidates: number;
+  /** Candidates judged: at most the cap, fewer when a request went unanswered. */
+  asked: number;
+  /** Programs whose folder is not in the index (Store apps and the like): left out. */
+  unplaced: number;
+  /** jev requests sent for this search; 0 when every answer came from the cache. */
+  requests: number;
+  elapsed_ms: number;
+}

@@ -295,7 +295,7 @@ fn is_cache(dirs: &[String], ext: &str) -> bool {
 // ---- game ---------------------------------------------------------------------
 
 /// Game stores, launchers and publishers' folders.
-const GAME_DIRS: &[&str] = &[
+pub(crate) const GAME_DIRS: &[&str] = &[
     "steam",
     "steamlibrary",
     "steamapps",
@@ -318,7 +318,9 @@ const GAME_DIRS: &[&str] = &[
     "hoyoplay",
 ];
 
-fn is_game_dir(d: &str) -> bool {
+/// Whether a folder name (lower case) is a game store's, a launcher's or a
+/// publisher's, or one that holds games (`Games`, `XboxGames`, `게임`).
+pub(crate) fn is_game_dir(d: &str) -> bool {
     GAME_DIRS.contains(&d) || d.contains("games") || d.contains("게임")
 }
 
@@ -334,19 +336,33 @@ fn is_program(dirs: &[String]) -> bool {
 
 // ---- by extension -------------------------------------------------------------
 
-fn is_media_ext(ext: &str) -> bool {
+fn is_image_ext(ext: &str) -> bool {
     matches!(
         ext,
-        // pictures
         "jpg" | "jpeg" | "jpe" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "heic" | "heif" | "avif" | "jxl"
             | "psd" | "raw" | "dng" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "rw2" | "raf" | "srw"
-            // video
-            | "mp4" | "m4v" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "mpg" | "mpeg" | "m2ts" | "mts"
-            | "3gp" | "vob" | "ogv" | "rmvb" | "asf"
-            // sound
-            | "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "wma" | "aiff" | "aif" | "ape"
-            | "mid" | "midi" | "amr"
     )
+}
+
+fn is_video_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp4" | "m4v" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "mpg" | "mpeg" | "m2ts" | "mts" | "3gp" | "vob"
+            | "ogv" | "rmvb" | "asf"
+    )
+}
+
+fn is_audio_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "wma" | "aiff" | "aif" | "ape" | "mid" | "midi"
+            | "amr"
+    )
+}
+
+/// Pictures, video and sound.
+fn is_media_ext(ext: &str) -> bool {
+    is_image_ext(ext) || is_video_ext(ext) || is_audio_ext(ext)
 }
 
 fn is_document_ext(ext: &str) -> bool {
@@ -368,6 +384,36 @@ fn is_archive_ext(ext: &str) -> bool {
 /// Setup files: archives when they sit in Downloads, programs anywhere else.
 fn is_installer_ext(ext: &str) -> bool {
     matches!(ext, "exe" | "msi" | "msix" | "msixbundle" | "appx" | "appxbundle")
+}
+
+/// A `.ts` file this big is a video (an MPEG transport stream); a smaller
+/// one is TypeScript code, wherever it is kept.
+const TS_VIDEO: u64 = 1 << 20;
+
+/// What kind of file a name (lower case) of `size` bytes is by its
+/// extension, for 뜻으로 찾기 (meaning.rs): "document" | "image" | "video" |
+/// "audio" | "archive" | "program" (setup files and programs). None for
+/// anything else. Wider than the categories in places: a `.csv` is a
+/// document, and a `.ts` of a megabyte or more a video.
+pub(crate) fn file_kind(name: &str, size: u64) -> Option<&'static str> {
+    let ext = extension(name);
+    if ext.is_empty() {
+        None
+    } else if is_document_ext(ext) || ext == "csv" {
+        Some("document")
+    } else if is_image_ext(ext) {
+        Some("image")
+    } else if is_video_ext(ext) || (ext == "ts" && size >= TS_VIDEO) {
+        Some("video")
+    } else if is_audio_ext(ext) {
+        Some("audio")
+    } else if is_archive_ext(ext) {
+        Some("archive")
+    } else if is_installer_ext(ext) {
+        Some("program")
+    } else {
+        None
+    }
 }
 
 fn by_extension(dirs: &[String], ext: &str) -> Option<&'static str> {
@@ -751,6 +797,31 @@ mod tests {
             let name = path.rsplit('\\').next().unwrap();
             assert_eq!(program_category(path, name, false), Some(category(path, name, false)), "{path}");
         }
+    }
+
+    #[test]
+    fn file_kinds() {
+        let kinds = [
+            ("document", &["a.pdf", "b.hwp", "c.hwpx", "d.docx", "e.xlsx", "f.pptx", "g.txt", "h.md", "i.csv", "j.odt"][..]),
+            ("image", &["a.jpg", "b.jpeg", "c.png", "d.heic", "e.psd", "f.cr2", "g.nef", "h.arw", "i.tiff"]),
+            ("video", &["a.mp4", "b.mkv", "c.mov", "d.webm", "e.m4v", "f.ts"]),
+            ("audio", &["a.mp3", "b.flac", "c.wav", "d.m4a", "e.wma"]),
+            ("archive", &["a.zip", "b.7z", "c.rar", "d.tar", "e.gz", "f.iso", "g.alz", "h.egg"]),
+            ("program", &["setup.exe", "tool.msi"]),
+        ];
+        for (kind, names) in kinds {
+            for name in names {
+                assert_eq!(file_kind(name, 50 << 20), Some(kind), "{name}");
+            }
+        }
+        for name in ["readme", ".pdf", "a.dll", "a.sys", "a.json"] {
+            assert_eq!(file_kind(name, 50 << 20), None, "{name}");
+        }
+        // A small `.ts` is TypeScript, wherever it is; a big one a recording.
+        assert_eq!(file_kind("index.ts", 12_000), None);
+        assert_eq!(file_kind("index.ts", TS_VIDEO - 1), None);
+        assert_eq!(file_kind("녹화.ts", TS_VIDEO), Some("video"));
+        assert_eq!(file_kind("a.pdf", 0), Some("document"));
     }
 
     #[test]

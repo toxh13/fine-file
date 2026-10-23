@@ -413,7 +413,7 @@ input {
   background: transparent;
 }
 
-/* "이 폴더만": a small switch inside the box. */
+/* "이 폴더만" (and v0.9's "뜻으로"): a small switch inside the box, "on" while it is. */
 .scope {
   flex: none;
   display: flex;
@@ -441,7 +441,7 @@ input {
   color: var(--text);
 }
 
-.search.here .scope {
+.scope.on {
   border-color: var(--sel-line);
   background: var(--sel);
   color: var(--text);
