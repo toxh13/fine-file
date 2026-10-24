@@ -36,7 +36,7 @@
 //! file APIs get `win::wide_path`, so a name ending in a dot or a space is
 //! that name and not its neighbour without the dot.
 
-use crate::{dups, win};
+use crate::{dups, links, win};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, OsStr, OsString};
@@ -60,7 +60,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_SUCCESS, ERROR_WRITE_PROTECT, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL, INVALID_HANDLE_VALUE, LocalFree, NTSTATUS,
     POINT,
 };
-use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, InitializeSecurityDescriptor,
     SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, ACE_HEADER, ACL,
@@ -72,12 +72,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileDispositionInfoEx, GetDriveTypeW, GetFileInformationByHandleEx,
     GetFileAttributesW, GetVolumeInformationByHandleW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
     GetVolumePathNameW, MoveFileExW, ReOpenFile, RemoveDirectoryW, SetFileAttributesW, SetFileInformationByHandle, DELETE,
-    FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
     FILE_ATTRIBUTE_TEMPORARY, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, INVALID_FILE_ATTRIBUTES, READ_CONTROL, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+    FILE_LIST_DIRECTORY, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, INVALID_FILE_ATTRIBUTES, READ_CONTROL, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
     SYMBOLIC_LINK_FLAG_DIRECTORY, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -164,14 +164,17 @@ const LINK_KIND: &str = "이 종류의 링크는 복사하지 않았어요";
 const CLIPBOARD_BUSY: &str = "다른 프로그램이 클립보드를 쓰고 있어요. 잠시 후 다시 해 보세요";
 const NO_PARTIAL_NAME: &str = "복사하는 동안 쓸 임시 이름을 고를 수 없어요";
 const TURNED_LINK: &str = "목록을 읽은 뒤에 링크로 바뀐 폴더라서 들어가지 않았어요";
+/// What a path to an entry leads to is not the entry its folder holds (a folder on the way set as a mount point).
+const ENTRY_CHANGED: &str = "목록을 읽은 뒤에 다른 파일로 바뀌어서 복사하지 않았어요";
 const NO_SECURITY_COPY: &str = "권한 설정을 그대로 옮기지 못했어요";
 
 #[derive(Serialize, Clone)]
 pub struct JobInfo {
     pub id: u64,
     /// "copy", "move", "relocate" (`start_relocate`), "restore"
-    /// (`undo_relocate`) or "link" (`start_dup_link`; also `recover_links`
-    /// at start, telling what it did with merges cut short)
+    /// (`undo_relocate`), "link" (`start_dup_link`; also `recover_links`
+    /// at start, telling what it did with merges cut short) or "unlink"
+    /// (`start_unlink`)
     pub op: String,
     /// "running" | "waiting" (on a conflict) | "done" | "failed" | "cancelled"
     pub state: String,
@@ -445,6 +448,9 @@ struct Settings {
     /// Sends the old bytes of a merged copy to the Recycle Bin, once
     /// `binless` found nothing in the way; tests keep the real bin out of it.
     bin: fn(&Path) -> Result<(), String>,
+    /// What the link rule says of a file a merge would make one with another
+    /// (path, size): `links::verdict`; tests judge their own folder.
+    rule: fn(&Path, u64, &links::Markers) -> links::Verdict,
 }
 
 impl Settings {
@@ -454,6 +460,7 @@ impl Settings {
         junction: create_junction,
         hard_link: create_hard_link,
         bin: to_bin,
+        rule: links::verdict,
     };
 }
 
@@ -651,10 +658,25 @@ struct Removal {
     /// A file's size and modified time right after it was copied; it is
     /// kept if either has changed since.
     stamp: (u64, u64),
-    /// Which entry it was when it was copied (`key_at`), where that can be
-    /// told: one found at its path later must be the same, not one a folder
-    /// above it, swapped for a junction meanwhile, leads to.
+    /// Which entry it was when it was copied (as opened in its folder,
+    /// `Within`, else `key_at`), where that can be told: one found at its
+    /// path later must be the same, not one a folder above it, swapped for a
+    /// junction or set as a mount point meanwhile, leads to.
     key: Option<dups::FileKey>,
+}
+
+/// An entry opened in the folder that holds it (`open_child`), and that
+/// folder: what a folder's children carry (`put_dir`), so each is dealt with
+/// as the very entry its folder holds, not as whatever a path to it leads to
+/// now. A held folder cannot be renamed, but an empty one can be set as a
+/// mount point in place, which a path through it would follow.
+#[derive(Clone, Copy)]
+struct Within<'a> {
+    /// The folder, held open (`put_dir`).
+    folder: &'a File,
+    /// The entry itself (a link as the link), with READ_CONTROL for a copy
+    /// that keeps its permissions and DELETE for a move within the volume.
+    entry: &'a File,
 }
 
 enum Copied {
@@ -781,7 +803,7 @@ impl Run {
         for (src, name, meta, deep) in plan {
             self.deep = deep;
             let target = self.dest.join(&name);
-            if let Err(stop) = self.transfer(&src, &meta, target) {
+            if let Err(stop) = self.transfer(&src, &meta, target, None) {
                 // The sources of an item cut short stay where they are.
                 self.to_remove.clear();
                 return Err(stop);
@@ -822,8 +844,12 @@ impl Run {
 
     /// Copies or moves the entry `src` to `target`, a folder with everything
     /// in it. Ok(true) when all of it got there, so a move may let go of the
-    /// source.
-    fn transfer(&mut self, src: &Path, meta: &Metadata, mut target: PathBuf) -> Result<bool, Stop> {
+    /// source. `within` is `src` opened in the folder that holds it, where
+    /// that folder is held (a folder's children carry it, `meta` read from
+    /// it): `src` is then dealt with through those handles, not down a path,
+    /// so a folder swapped for a mount point is never entered nor copied or
+    /// removed from. None at the top, where there is no held folder.
+    fn transfer(&mut self, src: &Path, meta: &Metadata, mut target: PathBuf, within: Option<Within>) -> Result<bool, Stop> {
         self.check()?;
         self.info.current = Some(src.to_string_lossy().into_owned());
         self.tick();
@@ -867,7 +893,7 @@ impl Run {
                     Choice::Cancel => return Err(Stop),
                 }
             }
-            if let Some(complete) = self.put(src, meta, kind, &target, merge)? {
+            if let Some(complete) = self.put(src, meta, kind, &target, merge, within)? {
                 return Ok(complete);
             }
         }
@@ -892,10 +918,16 @@ impl Run {
     }
 
     /// Puts `src` at `target`, which is free (or the folder to merge into).
-    /// None when the name got taken meanwhile.
-    fn put(&mut self, src: &Path, meta: &Metadata, kind: Kind, target: &Path, merge: bool) -> Result<Option<bool>, Stop> {
+    /// None when the name got taken meanwhile. `within`: `src` as opened in
+    /// its held folder (`transfer`).
+    fn put(&mut self, src: &Path, meta: &Metadata, kind: Kind, target: &Path, merge: bool, within: Option<Within>) -> Result<Option<bool>, Stop> {
         if self.is_move && !self.deep && !merge {
-            match rename_entry(src, target) {
+            // The very entry its folder holds, through its handle, where there is one.
+            let renamed = match within {
+                Some(w) => rename_open(w.entry, target),
+                None => rename_entry(src, target),
+            };
+            match renamed {
                 Ok(()) => {
                     self.info.done_bytes += file_len(meta);
                     self.info.done_items += 1;
@@ -911,7 +943,7 @@ impl Run {
                     self.info.total_bytes += bytes - file_len(meta);
                     self.info.total_items += items - 1;
                     self.deep = true;
-                    let put = self.put(src, meta, kind, target, merge);
+                    let put = self.put(src, meta, kind, target, merge, within);
                     self.deep = false;
                     return put;
                 }
@@ -922,14 +954,17 @@ impl Run {
             }
         }
         match kind {
-            Kind::File => self.put_file(src, meta, target),
-            Kind::Link { dir } => self.put_link(src, target, dir),
-            Kind::Dir => self.put_dir(src, meta, target, merge),
+            Kind::File => self.put_file(src, meta, target, within.map(|w| w.entry)),
+            Kind::Link { dir } => self.put_link(src, target, dir, within.map(|w| w.entry)),
+            Kind::Dir => self.put_dir(src, meta, target, merge, within),
         }
     }
 
-    fn put_file(&mut self, src: &Path, meta: &Metadata, target: &Path) -> Result<Option<bool>, Stop> {
-        match self.copy_file(src, meta, target) {
+    /// `entry`: `src` as opened in its held folder (`Within`), where it is.
+    fn put_file(&mut self, src: &Path, meta: &Metadata, target: &Path, entry: Option<&File>) -> Result<Option<bool>, Stop> {
+        // Which file it is, where that can be told from its folder: what is copied must be that very file.
+        let expect = entry.and_then(dups::facts).and_then(|f| f.key);
+        match self.copy_file(src, meta, target, expect) {
             Copied::Done => {}
             Copied::Taken => return Ok(None),
             Copied::Cancelled => return Err(Stop),
@@ -939,18 +974,21 @@ impl Run {
             }
         }
         self.handled += 1;
-        if !self.keep_own_security(src, target) {
+        if !self.keep_own_security(src, target, entry) {
             return Ok(Some(false));
         }
         if self.is_move {
             // Opened, not listed: a listing's size can lag behind for a file still being written.
-            let (now, copy) = (std::fs::symlink_metadata(win::verbatim(src)), std::fs::symlink_metadata(win::verbatim(target)));
-            match (now, copy) {
-                (Ok(now), Ok(copy)) if now.len() == copy.len() => self.to_remove.push(Removal {
+            let now = match entry {
+                Some(e) => dups::facts(e).map(|f| (f.size, f.modified as u64)),
+                None => std::fs::symlink_metadata(win::verbatim(src)).ok().map(|m| (m.len(), m.last_write_time())),
+            };
+            match (now, std::fs::symlink_metadata(win::verbatim(target))) {
+                (Some(now), Ok(copy)) if now.0 == copy.len() => self.to_remove.push(Removal {
                     path: src.to_path_buf(),
                     kind: Kind::File,
-                    stamp: (now.len(), now.last_write_time()),
-                    key: key_at(src),
+                    stamp: now,
+                    key: if entry.is_some() { expect } else { key_at(src) },
                 }),
                 _ => {
                     self.error(src, SIZE_MISMATCH);
@@ -961,7 +999,19 @@ impl Run {
         Ok(Some(true))
     }
 
-    fn put_link(&mut self, src: &Path, target: &Path, dir: bool) -> Result<Option<bool>, Stop> {
+    /// `entry`: `src` as opened in its held folder (`Within`), where it is.
+    fn put_link(&mut self, src: &Path, target: &Path, dir: bool, entry: Option<&File>) -> Result<Option<bool>, Stop> {
+        // Which link it is, as its folder holds it: a path to it that leads to another now is not copied.
+        let key = match entry {
+            Some(e) => dups::facts(e).and_then(|f| f.key),
+            None => key_at(src),
+        };
+        if entry.is_some() && key_at(src) != key {
+            self.info.done_items += 1;
+            self.tick();
+            self.error(src, ENTRY_CHANGED);
+            return Ok(Some(false));
+        }
         let made = copy_link(src, target, dir);
         if matches!(&made, Err(e) if e.kind() == io::ErrorKind::AlreadyExists) {
             return Ok(None);
@@ -973,24 +1023,29 @@ impl Run {
             return Ok(Some(false));
         }
         self.handled += 1;
-        if !self.keep_own_security(src, target) {
+        if !self.keep_own_security(src, target, entry) {
             return Ok(Some(false));
         }
         if self.is_move {
-            self.to_remove.push(Removal { path: src.to_path_buf(), kind: Kind::Link { dir }, stamp: (0, 0), key: key_at(src) });
+            self.to_remove.push(Removal { path: src.to_path_buf(), kind: Kind::Link { dir }, stamp: (0, 0), key });
         }
         Ok(Some(true))
     }
 
     /// With `keep_security` (a relocation and its undo): gives the copy
-    /// `target` the permissions of `src` where they are its own
-    /// (`copy_own_security`); else it keeps those its folder passes down, as
-    /// `src` does. False, with why in the errors, when that cannot be done.
-    fn keep_own_security(&mut self, src: &Path, target: &Path) -> bool {
+    /// `target` the DACL of `src` (`entry`, as opened in its folder, where it
+    /// is), its own or all passed down, as it is (`copy_security`): the
+    /// copy's folders are their owner's alone until all they hold is in
+    /// (`FILLING_SDDL`), so nothing gets what it keeps from them. False, with
+    /// why in the errors, when that cannot be done.
+    fn keep_own_security(&mut self, src: &Path, target: &Path, entry: Option<&File>) -> bool {
         if !self.keep_security {
             return true;
         }
-        let copied = open_itself(src, READ_CONTROL, false).and_then(|from| copy_own_security(&from, target));
+        let copied = match entry {
+            Some(from) => copy_security(from, target, true),
+            None => open_itself(src, READ_CONTROL, false).and_then(|from| copy_security(&from, target, true)),
+        };
         if let Err(e) = copied {
             self.error(src, format!("{NO_SECURITY_COPY}: {}", reason(&e)));
             return false;
@@ -998,7 +1053,7 @@ impl Run {
         true
     }
 
-    fn put_dir(&mut self, src: &Path, meta: &Metadata, target: &Path, merge: bool) -> Result<Option<bool>, Stop> {
+    fn put_dir(&mut self, src: &Path, meta: &Metadata, target: &Path, merge: bool, within: Option<Within>) -> Result<Option<bool>, Stop> {
         if !merge {
             let wide = win::wide_path(target);
             if unsafe { CreateDirectoryW(wide.as_ptr(), null()) } == 0 {
@@ -1015,54 +1070,80 @@ impl Run {
         self.tick();
         let mut complete = true;
         // Held open as itself while what is in it is copied (`open_itself`): neither it nor
-        // a folder above it can be swapped for a junction meanwhile, so the listing below
-        // is of this very folder. One that became a link since it was listed is not entered.
-        let access = if self.keep_security { READ_CONTROL } else { 0 };
-        let held = open_itself(src, access, true).and_then(|dir| kind_open(&dir).map(|(kind, _)| (dir, kind)));
+        // a folder above it can be renamed meanwhile. Opened through its own parent's handle
+        // where there is one (`open_child`), so this very folder is reached, not one a swap on
+        // the way might lead to. One that became a link since it was listed is not entered.
+        // Listed through that handle too (`names_in`), and each entry opened in it (`open_child`):
+        // an empty folder can still be set as a mount point in place while it is held, and a
+        // path through it would then lead elsewhere. No FILE_TRAVERSE: an open relative to a
+        // handle needs none, and asking for it would only turn down folders that do not grant it.
+        let access = FILE_LIST_DIRECTORY | if self.keep_security { READ_CONTROL } else { 0 };
+        let opened = match (within, src.file_name()) {
+            (Some(w), Some(name)) => open_child(w.folder, name, access, true),
+            _ => open_itself(src, access, true),
+        };
+        let held = opened.and_then(|dir| kind_open(&dir).map(|(kind, _)| (dir, kind)));
         let mut key = None;
         let listed = match held {
             Err(e) => Err(format!("폴더를 열 수 없어요: {}", reason(&e))),
             Ok((_, kind)) if kind != Kind::Dir => Err(TURNED_LINK.to_string()),
             Ok((dir, _)) => {
                 key = dups::facts(&dir).and_then(|f| f.key);
-                // Its own permissions on the new folder before anything goes in, which then gets what it passes down.
-                let secured = if self.keep_security && !merge { copy_own_security(&dir, target) } else { Ok(()) };
-                match secured {
-                    Err(e) => Err(format!("{NO_SECURITY_COPY}: {}", reason(&e))),
-                    Ok(()) => std::fs::read_dir(win::verbatim(src))
-                        .map(|read| (dir, read))
-                        .map_err(|e| format!("폴더를 열 수 없어요: {}", reason(&e))),
-                }
+                names_in(&dir).map(|names| (dir, names)).map_err(|e| format!("폴더를 열 수 없어요: {}", reason(&e)))
             }
         };
-        match listed {
+        let held = match listed {
             Err(why) => {
                 self.error(src, why);
                 complete = false;
+                None
             }
-            Ok((_held, read)) => {
-                for entry in read {
-                    let (entry, child) = match entry.and_then(|e| e.metadata().map(|m| (e, m))) {
+            Ok((held, names)) => {
+                // Each entry with what it is dealt with by: its permissions read (a copy that
+                // keeps them), renamed (a move within the volume).
+                let rights = if self.keep_security { READ_CONTROL } else { 0 } | if self.is_move && !self.deep { DELETE } else { 0 };
+                for (name, listed_dir) in names {
+                    // Not a listing's path, which has its `\\?\`: paths are shown as they were given.
+                    let child_src = src.join(&name);
+                    // In this folder, as itself, through its handle: never down a path.
+                    let (entry, child) = match open_child(&held, &name, rights, false).and_then(|f| f.metadata().map(|m| (f, m))) {
                         Ok(c) => c,
                         Err(e) => {
-                            self.error(src, reason(&e));
+                            self.error(&child_src, reason(&e));
                             complete = false;
                             continue;
                         }
                     };
+                    // A folder that is a link now (swapped since it was listed): not entered, nor taken for a link of the user's.
+                    if listed_dir && kind_of(&child).is_link() {
+                        self.error(&child_src, TURNED_LINK);
+                        complete = false;
+                        continue;
+                    }
                     // A merge within a volume counted only the folder; its contents count as they come.
                     if !self.deep {
                         self.info.total_bytes += file_len(&child);
                         self.info.total_items += 1;
                     }
-                    // Not entry.path(): that has the `\\?\` of the listing, and paths are shown as they were given.
-                    let name = entry.file_name();
-                    complete &= self.transfer(&src.join(&name), &child, target.join(&name))?;
+                    let within = Within { folder: &held, entry: &entry };
+                    complete &= self.transfer(&child_src, &child, target.join(&name), Some(within))?;
                 }
+                Some(held)
             }
-        }
+        };
         if !merge {
             copy_folder_look(meta, target);
+        }
+        // A copy that keeps its permissions: the folder's own go on last, once all it holds
+        // is in with its own (from the bottom up). Until then it is its owner's alone, as the
+        // whole copy is (`FILLING_SDDL`): nothing in it is open to more than that meanwhile,
+        // and a folder that lets nobody add to it is filled all the same.
+        if self.keep_security && !merge
+            && let Some(dir) = &held
+            && let Err(e) = copy_security(dir, target, true)
+        {
+            self.error(src, format!("{NO_SECURITY_COPY}: {}", reason(&e)));
+            complete = false;
         }
         if self.is_move && complete {
             self.to_remove.push(Removal { path: src.to_path_buf(), kind: Kind::Dir, stamp: (0, 0), key });
@@ -1076,48 +1157,11 @@ impl Run {
     /// never over anything, once the copy is whole: a copy cut short by a
     /// crash or a kill never has the real name. Cancel takes effect at the
     /// next progress callback; the partial file is removed on cancel and on
-    /// failure.
-    fn copy_file(&mut self, src: &Path, meta: &Metadata, target: &Path) -> Copied {
-        struct Progress {
-            run: *mut Run,
-            base: u64,
-            len: u64,
-            /// The partial file, NUL-terminated (`win::wide_path`).
-            partial: Vec<u16>,
-            /// The copy has made the partial file; until then a failure wrote nothing.
-            started: bool,
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        unsafe extern "system" fn on_progress(
-            _total: i64,
-            done: i64,
-            _stream_size: i64,
-            _stream_done: i64,
-            _stream: u32,
-            _reason: u32,
-            _from: HANDLE,
-            _to: HANDLE,
-            data: *const c_void,
-        ) -> u32 {
-            // SAFETY: `data` is the Progress in copy_file, alive for the whole
-            // copy, and the Run is not touched elsewhere while it runs.
-            let p = unsafe { &mut *(data as *mut Progress) };
-            if !p.started {
-                p.started = true;
-                // Hidden while unfinished. Attributes can be changed while CopyFileEx
-                // has the file open: share modes do not cover them.
-                let attrs = unsafe { GetFileAttributesW(p.partial.as_ptr()) };
-                if attrs != INVALID_FILE_ATTRIBUTES {
-                    unsafe { SetFileAttributesW(p.partial.as_ptr(), (attrs & SETTABLE) | FILE_ATTRIBUTE_HIDDEN) };
-                }
-            }
-            let run = unsafe { &mut *p.run };
-            run.info.done_bytes = p.base + (done.max(0) as u64).min(p.len);
-            run.tick();
-            if run.cancel.load(Ordering::SeqCst) { PROGRESS_CANCEL } else { PROGRESS_CONTINUE }
-        }
-
+    /// failure. With `expect` (which file `src` is, as its folder holds it),
+    /// the file CopyFileEx opened must be that one before anything of it is
+    /// written (`copy_progress`): a path that leads elsewhere now is not
+    /// copied from.
+    fn copy_file(&mut self, src: &Path, meta: &Metadata, target: &Path, expect: Option<dups::FileKey>) -> Copied {
         let len = meta.len();
         let base = self.info.done_bytes;
         // Taken since it was looked at: asked about again, before anything is written.
@@ -1128,19 +1172,26 @@ impl Run {
         let mut failed = NO_PARTIAL_NAME.to_string();
         for n in 1..=PARTIAL_TRIES {
             let Some(partial) = partial_name(target, n) else { break };
-            let mut p = Progress { run: self, base, len, partial: win::wide_path(&partial), started: false };
+            let mut p = CopyProgress::new(self, base, len, &partial, expect);
             let ok = unsafe {
-                CopyFileExW(from.as_ptr(), p.partial.as_ptr(), Some(on_progress), (&raw mut p).cast(), null_mut(), COPY_FLAGS)
+                CopyFileExW(from.as_ptr(), p.partial.as_ptr(), Some(copy_progress), (&raw mut p).cast(), null_mut(), COPY_FLAGS)
             } != 0;
             let err = io::Error::last_os_error();
-            let (started, wide) = (p.started, p.partial);
-            if ok {
+            let (started, other, checked, wide) = (p.started, p.other, p.checked, p.partial);
+            // Not seen by the callback (it is called for each stream, an empty one too, so this
+            // is the odd case): asked of its path at least, before the copy gets the name.
+            let unseen = ok && expect.is_some() && !checked && key_at(src) != expect;
+            if ok && !unseen {
                 return self.name_copy(&partial, &wide, meta, target, base);
             }
             // Once started, the partial file is our own unfinished copy: the
             // copy only begins on a name that was free.
-            if started {
+            if started || unseen {
                 remove_partial(&partial);
+            }
+            if other || unseen {
+                failed = ENTRY_CHANGED.into();
+                break;
             }
             if self.check().is_err() || err.raw_os_error() == Some(ERROR_REQUEST_ABORTED as i32) {
                 self.info.done_bytes = base;
@@ -1312,6 +1363,72 @@ impl Run {
         registry().prune();
         jobs_state().ended.notify_all();
     }
+}
+
+/// What a job's CopyFileEx calls back with (`copy_progress`).
+struct CopyProgress {
+    run: *mut Run,
+    base: u64,
+    len: u64,
+    /// The file being written, NUL-terminated (`win::wide_path`).
+    partial: Vec<u16>,
+    /// The copy has made the file; until then a failure wrote nothing.
+    started: bool,
+    /// Which file the copy must be made of (`Run::copy_file`), if that is told.
+    expect: Option<dups::FileKey>,
+    /// The file CopyFileEx opened was looked at against `expect`...
+    checked: bool,
+    /// ...and was another: the copy was called off before any of it was written.
+    other: bool,
+}
+
+impl CopyProgress {
+    fn new(run: &mut Run, base: u64, len: u64, partial: &Path, expect: Option<dups::FileKey>) -> CopyProgress {
+        CopyProgress { run, base, len, partial: win::wide_path(partial), started: false, expect, checked: false, other: false }
+    }
+}
+
+/// CopyFileEx's progress: the file it writes hidden from the start, the
+/// file it reads checked against the one expected before anything of it is
+/// written, the job's bytes done, and a cancel at the next block.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn copy_progress(
+    _total: i64,
+    done: i64,
+    _stream_size: i64,
+    _stream_done: i64,
+    _stream: u32,
+    _reason: u32,
+    from: HANDLE,
+    _to: HANDLE,
+    data: *const c_void,
+) -> u32 {
+    // SAFETY: `data` is the CopyProgress of the caller, alive for the whole
+    // copy, and the Run is not touched elsewhere while it runs.
+    let p = unsafe { &mut *(data as *mut CopyProgress) };
+    if !p.started {
+        p.started = true;
+        // Hidden while unfinished. Attributes can be changed while CopyFileEx
+        // has the file open: share modes do not cover them.
+        let attrs = unsafe { GetFileAttributesW(p.partial.as_ptr()) };
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            unsafe { SetFileAttributesW(p.partial.as_ptr(), (attrs & SETTABLE) | FILE_ATTRIBUTE_HIDDEN) };
+        }
+        // The first call comes as the first stream is about to be copied: nothing of it is
+        // written yet. CopyFileEx's own handle, borrowed (it closes it).
+        if let Some(want) = p.expect {
+            let source = std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(from as RawHandle) });
+            p.checked = true;
+            if dups::facts(&source).and_then(|f| f.key) != Some(want) {
+                p.other = true;
+                return PROGRESS_CANCEL;
+            }
+        }
+    }
+    let run = unsafe { &mut *p.run };
+    run.info.done_bytes = p.base + (done.max(0) as u64).min(p.len);
+    run.tick();
+    if run.cancel.load(Ordering::SeqCst) { PROGRESS_CANCEL } else { PROGRESS_CONTINUE }
 }
 
 /// Sends `target` to the Recycle Bin to make room for `src`, or says why it
@@ -1585,9 +1702,10 @@ fn copy_link(src: &Path, target: &Path, dir: bool) -> io::Result<()> {
 }
 
 /// Junctions need no special rights: an empty folder gets the source's
-/// reparse data as it is.
+/// reparse data as it is. A copied junction keeps what its folder passes down,
+/// as every other copied entry does (`owner_only` off).
 fn copy_junction(src: &Path, target: &Path) -> io::Result<()> {
-    make_reparse_folder(target, &read_reparse(src)?)
+    make_reparse_folder(target, &read_reparse(src)?, false)
 }
 
 /// The reparse data of the link at `path`, read without following it.
@@ -1617,11 +1735,30 @@ fn read_reparse(path: &Path) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// An owner-only, protected security descriptor (`D:P(A;;FA;;;OW)`): only
+/// whoever owns the object may touch it, nothing passed down. A junction a
+/// relocation leaves starts life with this, until its recorded permissions go
+/// on, so it is never, even for a moment, open to more than its maker.
+fn owner_only_sd() -> Option<Security> {
+    sddl_to_security("D:P(A;;FA;;;OW)").ok()
+}
+
 /// Makes the folder `target`, never over anything, and gives it the reparse
-/// data `data` (a junction's). Nothing is left of it when that fails.
-fn make_reparse_folder(target: &Path, data: &[u8]) -> io::Result<()> {
+/// data `data` (a junction's). With `owner_only` it is made owner-only and
+/// protected (`owner_only_sd`) rather than with what its folder passes down,
+/// for a junction whose recorded permissions go on right after. Nothing is
+/// left of it when that fails.
+fn make_reparse_folder(target: &Path, data: &[u8], owner_only: bool) -> io::Result<()> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     let wide = win::wide_path(target);
-    if unsafe { CreateDirectoryW(wide.as_ptr(), null()) } == 0 {
+    let lock = owner_only.then(owner_only_sd).flatten();
+    let sa = lock.as_ref().map(|sd| SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    });
+    let sa_ptr: *const SECURITY_ATTRIBUTES = sa.as_ref().map_or(null(), |s| s);
+    if unsafe { CreateDirectoryW(wide.as_ptr(), sa_ptr) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let set = || -> io::Result<()> {
@@ -1681,7 +1818,7 @@ fn remove_source(r: &Removal) -> Result<(), String> {
 
 /// A short Korean reason for a failed file operation; Windows's own message
 /// for the rarer ones.
-fn reason(e: &io::Error) -> String {
+pub(crate) fn reason(e: &io::Error) -> String {
     let Some(code) = e.raw_os_error().map(|c| c as u32) else { return e.to_string() };
     let short = match code {
         ERROR_ACCESS_DENIED => "권한이 없어요",
@@ -1837,8 +1974,14 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_OFFLINE;
     use windows_sys::Win32::System::DataExchange::EnumClipboardFormats;
 
-    const TEST: Settings =
-        Settings { gap: Duration::ZERO, rename: true, junction: create_junction, hard_link: create_hard_link, bin: test_bin };
+    const TEST: Settings = Settings {
+        gap: Duration::ZERO,
+        rename: true,
+        junction: create_junction,
+        hard_link: create_hard_link,
+        bin: test_bin,
+        rule: |_, _, _| links::Verdict::Allowed,
+    };
 
     /// The Recycle Bin of tests, which keep the real one out of it: `x\.c.ff-link`
     /// goes to `xin .c.ff-link`.
@@ -2932,6 +3075,7 @@ mod tests {
             created_at: filetime_now(),
             state: "active".into(),
             pending: None,
+            root_security: None,
         };
         book.keep(&record("1")).unwrap();
         let list = book.list().unwrap();
@@ -3069,7 +3213,12 @@ mod tests {
     }
 
     /// The record of a job cut short in `state` ("relocating", "restoring").
-    fn cut_short(t: &Temp, state: &str, [original, target, old, copy]: [&Path; 4], tally: Tally) -> String {
+    fn cut_short(t: &Temp, state: &str, paths: [&Path; 4], tally: Tally) -> String {
+        cut_short_keeping(t, state, paths, tally, None)
+    }
+
+    /// `cut_short`, with the folder's own permissions recorded (`root_security`).
+    fn cut_short_keeping(t: &Temp, state: &str, [original, target, old, copy]: [&Path; 4], tally: Tally, root: Option<RootSecurity>) -> String {
         let created_at = filetime_now();
         let record = Relocation {
             id: format!("{created_at:016x}"),
@@ -3079,6 +3228,7 @@ mod tests {
             created_at,
             state: state.into(),
             pending: Some(Pending { old: shown(old), copy: shown(copy), tally }),
+            root_security: root,
         };
         book_in(t).keep(&record).unwrap();
         record.id
@@ -3325,6 +3475,7 @@ mod tests {
             created_at: 0,
             state: state.into(),
             pending: Some(Pending { old: shown(old), copy: shown(copy), tally: Tally::default() }),
+            root_security: None,
         };
         let holds = |state: &str, paths: [&Path; 4]| {
             let r = record(state, paths);
@@ -3542,6 +3693,274 @@ mod tests {
     }
 
     #[test]
+    fn an_inherited_folder_comes_back_inheriting_and_its_junction_carries_its_permissions() {
+        let _turn = one_relocation_at_a_time();
+        let t = Temp::new("relocate-acl-inherit");
+        let (home, other) = (t.dir("home"), t.dir("other drive"));
+        let folder = home.join("app");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("a.txt"), "a").unwrap();
+        // Not protected: one ACE of its own, the rest passed down from `home`.
+        set_dacl(&folder, "D:(A;OICI;0x1301bf;;;AU)");
+        let before = dacl_of(&folder);
+        assert!(!before.0, "an inherited DACL, not a protected one");
+        assert!(before.1.iter().any(|a| a.ends_with(";AU") && !a.contains("ID")), "its own ACE: {:?}", before.1);
+        assert!(before.1.iter().any(|a| a.contains("ID")), "and inherited ones: {:?}", before.1);
+
+        let job = relocate_in(&t, &folder, &other, ACROSS).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        // The junction left in its place is reached under the folder's own permissions.
+        assert_eq!(win::reparse_tag(&folder), Some(IO_REPARSE_TAG_MOUNT_POINT));
+        assert_eq!(dacl_of(&folder), before, "the junction carries the folder's DACL");
+
+        // Undo: the folder is back, still inheriting — not turned into a protected copy.
+        let id = book_in(&t).list().unwrap()[0].id.clone();
+        let job = restore_in(&t, &id).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert_eq!(win::reparse_tag(&folder), Some(0));
+        assert_eq!(dacl_of(&folder), before, "its own permissions back exactly, inherited still inherited");
+
+        // A record from before this was kept (no root_security) is left to the copy
+        // routines: the folder comes back as their protected copy, and the undo still goes.
+        let folder = home.join("plain");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("a.txt"), "a").unwrap();
+        set_dacl(&folder, "D:(A;OICI;0x1301bf;;;AU)");
+        assert!(!dacl_of(&folder).0);
+        let job = relocate_in(&t, &folder, &other, ACROSS).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        let book = book_in(&t);
+        let id = book.list().unwrap().iter().find(|r| r.original.ends_with("plain")).unwrap().id.clone();
+        let bare = book.read().unwrap().into_iter().find(|r| r.id == id).map(|r| Relocation { root_security: None, ..r }).unwrap();
+        book.keep(&bare).unwrap();
+        let job = restore_in(&t, &id).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(dacl_of(&folder).0, "without a record the copy's protected DACL is left as it is");
+    }
+
+    #[test]
+    fn a_folder_that_lets_nobody_add_to_it_is_relocated_its_copy_its_owners_while_filled() {
+        let _turn = one_relocation_at_a_time();
+        let t = Temp::new("relocate-acl-locked");
+        let (home, other) = (t.dir("home"), t.dir("other drive"));
+        let folder = home.join("locked");
+        fs::create_dir_all(folder.join("sub")).unwrap();
+        fs::write(folder.join("a.txt"), "a").unwrap();
+        fs::write(folder.join("sub").join("b.bin"), content(2 << 20, 31)).unwrap();
+        fs::write(folder.join("secret.kdbx"), "s").unwrap();
+        // Signed-in users may read, run and delete, passed down, but nobody may add anything;
+        // one file is its owner's alone, stricter than its folder.
+        set_dacl(&folder, "D:P(A;OICI;0x1300a9;;;AU)(A;OICI;FA;;;SY)");
+        set_dacl(&folder.join("secret.kdbx"), "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+        let entries = ["", "a.txt", "sub", "sub\\b.bin", "secret.kdbx"];
+        let at = |root: &Path, e: &str| if e.is_empty() { root.to_path_buf() } else { root.join(e) };
+        let before: Vec<(bool, Vec<String>)> = entries.iter().map(|e| dacl_of(&at(&folder, e))).collect();
+        // What the copy and a folder in it are while the job is at `sub\b.bin`.
+        let filling = Arc::new(Mutex::new(None));
+        let (seen, copy) = (filling.clone(), other.join(".locked.ff-relocating"));
+        let hook = move |job: &JobInfo| {
+            if job.current.as_deref().is_some_and(|c| c.ends_with(r"sub\b.bin")) {
+                seen.lock().unwrap().get_or_insert_with(|| (dacl_of(&copy), dacl_of(&copy.join("sub"))));
+            }
+        };
+        let sink = Sink { on_progress: Some(Arc::new(hook)), ..Sink::default() };
+        let job = wait(begin_relocate(&folder, &other, sink, ACROSS, book_in(&t)).unwrap());
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        let (top, sub) = filling.lock().unwrap().clone().expect("seen while filled");
+        assert_eq!(top, (true, vec!["A;OICI;FA;;;OW".to_string()]), "the copy is its owner's alone while filled");
+        assert_eq!(sub, (false, vec!["A;OICIID;FA;;;OW".to_string()]), "and so is all that goes in");
+        // Each with what it had, the folder protected with every ACE its own.
+        let target = real_path(&other).unwrap().join("locked");
+        for (e, want) in entries.iter().zip(&before) {
+            assert_eq!(&dacl_of(&at(&target, e)), want, "{e}");
+        }
+        // And back again, the same.
+        let id = book_in(&t).list().unwrap()[0].id.clone();
+        let job = restore_in(&t, &id).unwrap();
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        for (e, want) in entries.iter().zip(&before) {
+            assert_eq!(&dacl_of(&at(&folder, e)), want, "{e}");
+        }
+        set_dacl(&folder.join("secret.kdbx"), "D:P(A;;FA;;;AU)");
+        set_dacl(&folder, "D:P(A;OICI;FA;;;AU)(A;OICI;FA;;;SY)");
+    }
+
+    #[test]
+    fn a_start_puts_on_the_permissions_a_job_cut_short_did_not() {
+        let _turn = one_relocation_at_a_time();
+        let t = Temp::new("recover-acl");
+        let (home, other) = (t.dir("home"), t.dir("other"));
+        let folder = home.join("app");
+        let want = filled(&folder);
+        set_dacl(&folder, "D:(A;OICI;0x1301bf;;;AU)");
+        let before = dacl_of(&folder);
+        let rs = root_security(&folder).unwrap();
+
+        // A relocation cut short right after its junction was made: owner-only still.
+        let (old, target) = (home.join("app.ff-old"), other.join("app"));
+        copy_tree(&folder, &target);
+        fs::rename(&folder, &old).unwrap();
+        let target = real_path(&target).unwrap();
+        create_junction(&folder, &target).unwrap();
+        assert_ne!(dacl_of(&folder), before);
+        let id = cut_short_keeping(&t, "relocating", [&folder, &target, &old, &other.join(".app.ff-relocating")], want, Some(rs.clone()));
+        recover(&book_in(&t));
+        assert_eq!(state_of(&t, &id).as_deref(), Some("active"));
+        assert_eq!(dacl_of(&folder), before, "the junction carries the folder's permissions");
+        assert!(gone(&old));
+
+        // An undo cut short right after its copy got the folder's name: the copy's protected DACL still.
+        fs::remove_dir(&folder).unwrap();
+        copy_tree(&target, &folder);
+        put_sddl(&folder, "D:P(A;OICI;FA;;;OW)(A;OICI;0x1301bf;;;AU)");
+        let old = other.join("app.ff-old");
+        fs::rename(&target, &old).unwrap();
+        let id = cut_short_keeping(&t, "restoring", [&folder, &target, &old, &home.join(".app.ff-restoring")], want, Some(rs));
+        recover(&book_in(&t));
+        assert_eq!(state_of(&t, &id).as_deref(), Some("restored"));
+        assert_eq!(dacl_of(&folder), before, "its own permissions back, inherited still inherited");
+        assert!(gone(&old));
+        assert_eq!(tally_of(&folder), want);
+    }
+
+    #[test]
+    fn a_child_is_opened_in_its_parent_not_down_a_path() {
+        let t = Temp::new("open-child");
+        let (root, outside) = (t.dir("root"), t.dir("outside"));
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("f.txt"), "f").unwrap();
+        create_junction(&root.join("link"), &outside).unwrap();
+        // Held with no right of its own: an open relative to it needs none (FILE_TRAVERSE neither).
+        let parent = open_itself(&root, 0, true).unwrap();
+        // A real child folder, opened in the held parent: the very entry its path names.
+        let sub = open_child(&parent, OsStr::new("sub"), 0, true).unwrap();
+        assert_eq!(names(&root.join("sub")), ["f.txt"]);
+        let f = open_child(&sub, OsStr::new("f.txt"), 0, false).unwrap();
+        assert_eq!(dups::facts(&f).and_then(|f| f.key), key_at(&root.join("sub").join("f.txt")));
+        drop(f);
+        assert_eq!(kind_open(&sub).unwrap().0, Kind::Dir);
+        assert_eq!(dups::facts(&sub).and_then(|f| f.key), key_at(&root.join("sub")));
+        // A junction child is the reparse point itself, never what it leads to.
+        let link = open_child(&parent, OsStr::new("link"), 0, false).unwrap();
+        assert_eq!(kind_open(&link).unwrap().0, Kind::Link { dir: true });
+        assert_eq!(names(&outside), [] as [String; 0]);
+        // Anything that would lead out of the parent is turned down.
+        for bad in ["", ".", "..", "a\\b", "a/b"] {
+            assert!(open_child(&parent, OsStr::new(bad), 0, false).is_err(), "{bad}");
+        }
+        drop((parent, sub, link));
+        fs::remove_dir(root.join("link")).unwrap();
+    }
+
+    /// Read only for signed-in users (icacls `(R)`, Explorer's "Read" without "Read & execute":
+    /// no FILE_TRAVERSE), passed down; SYSTEM may do anything. Its owner may still change it.
+    const READ_ONLY: &str = "D:P(A;OICI;0x120089;;;AU)(A;OICI;FA;;;SY)";
+
+    #[test]
+    fn folders_that_only_let_users_read_are_copied_and_removed() {
+        let t = Temp::new("read-only-acl");
+        let (src, dst) = (t.dir("src"), t.dir("dst"));
+        let ro = src.join("ro");
+        fs::create_dir_all(ro.join("sub")).unwrap();
+        fs::write(ro.join("a.txt"), "a").unwrap();
+        fs::write(ro.join("sub").join("b.txt"), "b").unwrap();
+        set_dacl(&ro, READ_ONLY);
+        let job = wait(start("copy", vec![shown(&ro)], shown(&dst), Sink::default(), TEST).unwrap());
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert_eq!(fs::read_to_string(dst.join("ro").join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(dst.join("ro").join("sub").join("b.txt")).unwrap(), "b");
+        // An empty one (a copy that could not be filled) goes: DELETE alone, which its folder
+        // grants, is all it takes.
+        let empty = t.dir("empty");
+        set_dacl(&empty, READ_ONLY);
+        remove_tree(&empty).unwrap();
+        assert!(gone(&empty));
+        // A file a program holds without letting others read it goes too: nothing asked of it
+        // is checked against how it is shared but DELETE.
+        let tree = t.dir("tree");
+        fs::write(tree.join("log.txt"), "log").unwrap();
+        let held = OpenOptions::new().write(true).share_mode(FILE_SHARE_DELETE).open(tree.join("log.txt")).unwrap();
+        remove_tree(&tree).unwrap();
+        drop(held);
+        assert!(gone(&tree));
+        set_dacl(&ro, "D:P(A;OICI;FA;;;AU)(A;OICI;FA;;;SY)");
+    }
+
+    /// Sets the empty folder `dir` as a mount point to `to`, in place: what another program can
+    /// do to a folder a job holds open, which it cannot rename.
+    fn mount_in_place(dir: &Path, to: &Path) {
+        let data = junction_data(to).unwrap();
+        let f = OpenOptions::new().write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).open(win::verbatim(dir)).unwrap();
+        let mut unused = 0u32;
+        let set = unsafe {
+            DeviceIoControl(f.as_raw_handle() as HANDLE, FSCTL_SET_REPARSE_POINT, data.as_ptr().cast(), data.len() as u32, null_mut(), 0, &mut unused, null_mut())
+        };
+        assert!(set != 0, "{}", io::Error::last_os_error());
+    }
+
+    #[test]
+    fn copies_and_moves_never_follow_a_held_folder_set_as_a_mount_point() {
+        let t = Temp::new("mounted");
+        let (src, dst, outside) = (t.dir("src"), t.dir("dst"), t.dir("outside"));
+        let names_there = ["a.bin", "b.txt", "c.txt"];
+        for (name, text) in names_there.iter().zip(["secret a", "secret b", ""]) {
+            fs::write(outside.join(name), text).unwrap();
+        }
+        // `op` on src\<name>, whose folder `x` is emptied and set as a mount point to `outside` in
+        // place when the job gets to its file `at` (`x` held and listed by then).
+        let run_mounting = |op: &str, name: &str, at: &str, settings: Settings| {
+            let x = src.join(name).join("x");
+            fs::create_dir_all(&x).unwrap();
+            for n in names_there {
+                fs::write(x.join(n), format!("mine {n}")).unwrap();
+            }
+            let (done, at, out, inside) = (Arc::new(AtomicBool::new(false)), x.join(at), outside.clone(), x.clone());
+            let hook = move |job: &JobInfo| {
+                if job.current.as_deref() == Some(&*at.to_string_lossy()) && !done.swap(true, Ordering::SeqCst) {
+                    for n in names(&inside) {
+                        fs::remove_file(inside.join(n)).unwrap();
+                    }
+                    mount_in_place(&inside, &out);
+                }
+            };
+            let sink = Sink { on_progress: Some(Arc::new(hook)), ..Sink::default() };
+            let job = wait(start(op, vec![shown(&src.join(name))], shown(&dst), sink, settings).unwrap());
+            (job, x)
+        };
+        let at_x = |x: &Path, n: &str, why: &str| (x.join(n).to_string_lossy().into_owned(), why.to_string());
+        let outside_intact = || {
+            for (name, text) in names_there.iter().zip(["secret a", "secret b", ""]) {
+                assert_eq!(fs::read_to_string(outside.join(name)).unwrap(), text, "{name}");
+            }
+        };
+
+        // A copy, the folder mounted as it gets to its first file: the file CopyFileEx opens down
+        // the path is not the one the folder holds, and the rest are not in the folder any more.
+        let (job, x) = run_mounting("copy", "copy", "a.bin", TEST);
+        assert_eq!(job.errors[0], at_x(&x, "a.bin", ENTRY_CHANGED));
+        // Opened in the folder itself, which is a mount point now: turned down (Windows says it
+        // cannot resolve the name), never followed.
+        let paths: Vec<&str> = job.errors.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, [at_x(&x, "a.bin", "").0, at_x(&x, "b.txt", "").0, at_x(&x, "c.txt", "").0]);
+        assert!(names(&dst.join("copy").join("x")).is_empty(), "nothing from outside: {:?}", names(&dst.join("copy").join("x")));
+        outside_intact();
+        fs::remove_dir(&x).unwrap();
+
+        // A move to another volume, mounted at its last file (an empty one), the others copied by
+        // then: that one is not copied from outside, and what is outside under the names of the
+        // others is not removed for them.
+        let (job, x) = run_mounting("move", "move", "c.txt", ACROSS);
+        assert_eq!(job.errors, [at_x(&x, "c.txt", ENTRY_CHANGED), at_x(&x, "a.bin", SOURCE_CHANGED), at_x(&x, "b.txt", SOURCE_CHANGED)]);
+        assert_eq!(names(&dst.join("move").join("x")), ["a.bin", "b.txt"]);
+        assert_eq!(fs::read_to_string(dst.join("move").join("x").join("a.bin")).unwrap(), "mine a.bin");
+        outside_intact();
+        fs::remove_dir(&x).unwrap();
+    }
+
+    #[test]
     fn copies_and_moves_never_follow_a_folder_swapped_for_a_junction() {
         let t = Temp::new("swapped");
         let (src, dst, outside) = (t.dir("src"), t.dir("dst"), t.dir("outside"));
@@ -3576,7 +3995,9 @@ mod tests {
         });
         let job = run_swapping("copy", &c, TEST, c.join("aa.bin"), swap);
         assert!(job.errors.contains(&(c.join("zz").to_string_lossy().into_owned(), TURNED_LINK.to_string())), "{:?}", job.errors);
-        assert!(names(&dst.join("c").join("zz")).is_empty(), "nothing of where it leads was copied");
+        // (Told apart as it is opened in its folder, before anything is made for it.)
+        let left = dst.join("c").join("zz");
+        assert!(!left.exists() || names(&left).is_empty(), "nothing of where it leads was copied");
         assert_eq!(fs::read(dst.join("c").join("aa.bin")).unwrap(), big);
         assert_eq!(names(&outside), ["f.txt"]);
         fs::remove_dir(c.join("zz")).unwrap();
@@ -3678,9 +4099,14 @@ mod tests {
     /// Merges `others` into `keep` as the finder `found` them and waits for
     /// the job, which leaves no page behind.
     fn merge(found: &[dups::DupGroup], keep: &Path, others: &[&Path], settings: Settings, cancel_mid_file: bool) -> JobInfo {
+        merge_asking(found, keep, others, settings, cancel_mid_file, false)
+    }
+
+    /// `merge`, with big models and archives in programs' folders too when `allow_programs`.
+    fn merge_asking(found: &[dups::DupGroup], keep: &Path, others: &[&Path], settings: Settings, cancel_mid_file: bool, allow_programs: bool) -> JobInfo {
         let sink = Sink { cancel_mid_file, ..Sink::default() };
         let book = book_for(keep);
-        let job = wait(begin_link(vec![link_group(keep, others)], found, sink, settings, &book).unwrap());
+        let job = wait(begin_link(vec![link_group(keep, others)], found, sink, settings, &book, allow_programs).unwrap());
         assert!(book.pages().is_empty(), "{:?}", book.pages());
         job
     }
@@ -3726,8 +4152,10 @@ mod tests {
         for p in [&keep, &copy, &third] {
             fs::write(p, &data).unwrap();
         }
-        // A read-only file that stays takes links too.
-        set_attrs(&keep, FILE_ATTRIBUTE_READONLY);
+        // Read-only files take links too (a copy only when it is read-only as well: its name keeps the mark).
+        for p in [&keep, &copy, &third] {
+            set_attrs(p, FILE_ATTRIBUTE_READONLY);
+        }
         let found = search(&[&keep, &copy, &third]);
         assert_eq!(found.len(), 1);
         assert_ne!(key(&keep), key(&copy));
@@ -3751,8 +4179,16 @@ mod tests {
         assert_eq!(names(&t.0.join("b")), ["model.gguf"]);
         let binned = t.0.join("bin").join("b .model.gguf.ff-link");
         assert_eq!(fs::read(&binned).unwrap(), data);
-        assert_eq!(attrs(&binned) & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY), 0);
+        assert_eq!(attrs(&binned) & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY), FILE_ATTRIBUTE_READONLY);
         assert_eq!(job.freed_bytes, 3 << 20);
+        // Written down, as the window shows it.
+        let ledger = book_for(&keep).ledger();
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+        let merged = links::Merge { kept: shown_at(&keep), linked: shown_at(&copy), size: 3 << 20, at: 0 };
+        let read = ledger.read();
+        assert_eq!(read.len(), 1);
+        assert_eq!((&read[0].kept, &read[0].linked, read[0].size), (&merged.kept, &merged.linked, merged.size));
+        assert!(links::still_linked(&read[0]));
 
         // Again from the same result: the merged copy is one file with it
         // already, and the third one is merged now.
@@ -3764,6 +4200,9 @@ mod tests {
         assert_eq!(names_of(&keep), 3);
         assert_eq!(again.freed_bytes, 3 << 20);
         assert_eq!(names(&t.0.join("bin")), ["b .model.gguf.ff-link", "c .model.gguf.ff-link"]);
+        // The one merged now goes in too; the one that was one file already does not again.
+        let linked: Vec<String> = ledger.read().into_iter().map(|m| m.linked).collect();
+        assert_eq!(linked, [shown_at(&copy), shown_at(&third)]);
     }
 
     #[test]
@@ -3895,7 +4334,9 @@ mod tests {
         let t = Temp::new("link-undo");
         let data = content(200_000, 5);
         let (keep, copy, found) = twins(&t, "x.bin", &data);
+        // Read-only both, as a merge takes them (`links::pair_refusal`).
         set_attrs(&copy, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        set_attrs(&keep, FILE_ATTRIBUTE_READONLY);
         let refused = Settings { hard_link: |_, _| Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)), ..TEST };
         let job = merge(&found, &keep, &[&copy], refused, false);
         assert_eq!(job.state, "failed");
@@ -4155,7 +4596,7 @@ mod tests {
         let found = search(&[&x1, &x2, &y1, &y2]);
         assert_eq!(found.len(), 2);
         let book = LinkBook(t.0.join("merges"));
-        let refused = |groups: Vec<LinkGroup>| match begin_link(groups, &found, Sink::default(), TEST, &book) {
+        let refused = |groups: Vec<LinkGroup>| match begin_link(groups, &found, Sink::default(), TEST, &book, false) {
             Ok(id) => panic!("job {id} started: {:?}", wait(id).errors),
             Err(why) => why,
         };
@@ -4192,6 +4633,210 @@ mod tests {
         }
         let t = Temp::new("link-system");
         assert!(!in_windows(&t.0.join("x.bin"), windows.as_deref()));
+    }
+
+    // ---- v0.10.3: the link rule in the merge, names made files of their own --------
+
+    /// The app's link rule (`links::verdict`), with the test folder taken for one in `seen_in`.
+    fn seen_in(seen_in: &str, path: &Path, size: u64, markers: &links::Markers) -> links::Verdict {
+        let rest = path.strip_prefix(std::env::temp_dir()).unwrap();
+        let seen = Path::new(seen_in).join(rest);
+        links::verdict_as(&seen.to_string_lossy(), path, size, markers)
+    }
+
+    /// The rule as for a folder in the user's Downloads...
+    const IN_DOWNLOADS: Settings = Settings { rule: |p, size, m| seen_in(r"C:\Users\me\Downloads", p, size, m), ..TEST };
+    /// ...and in a program's app data.
+    const IN_APP_DATA: Settings = Settings { rule: |p, size, m| seen_in(r"C:\Users\me\AppData\Local", p, size, m), ..TEST };
+
+    /// `keep` and `copy` (in folders of their own in `t`), both `bytes`, and what the finder makes of them.
+    fn pair_in(t: &Temp, keep: &str, copy: &str, bytes: &[u8]) -> (PathBuf, PathBuf, Vec<dups::DupGroup>) {
+        let (keep, copy) = (t.0.join(keep), t.0.join(copy));
+        for p in [&keep, &copy] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, bytes).unwrap();
+        }
+        let found = search(&[&keep, &copy]);
+        assert_eq!(found.len(), 1);
+        (keep, copy, found)
+    }
+
+    #[test]
+    fn the_merge_keeps_to_the_link_rule() {
+        let t = Temp::new("link-rule");
+        let data = content(70_000, 21);
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+        let refused = |keep: &Path, copy: &Path, found: &[dups::DupGroup], settings: Settings, why: String| {
+            let job = merge(found, keep, &[copy], settings, false);
+            assert_eq!(job.state, "failed");
+            assert_eq!(job.errors, [(shown_at(copy), why)]);
+            untouched(keep, copy, &data, &data);
+        };
+
+        // The user's own pictures merge.
+        let (keep, copy, found) = pair_in(&t, r"a\photo.jpg", r"b\photo.jpg", &data);
+        let job = merge(&found, &keep, &[&copy], IN_DOWNLOADS, false);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert_eq!(key(&keep), key(&copy));
+
+        // What programs rewrite in place: never, the file that stays neither.
+        let (keep, copy, found) = pair_in(&t, r"c\settings.json", r"d\settings.json", &data);
+        refused(&keep, &copy, &found, IN_DOWNLOADS, format!("{KEEP_FAILED}(settings.json) — {}", links::LB_REWRITTEN));
+        // A mod pack's, by its folders' names or by what they hold.
+        let (keep, copy, found) = pair_in(&t, r"e\pack.zip", r"f\mods\pack.zip", &data);
+        refused(&keep, &copy, &found, IN_DOWNLOADS, links::LB_GAME.into());
+        refused(&copy, &keep, &found, IN_DOWNLOADS, format!("{KEEP_FAILED}(pack.zip) — {}", links::LB_GAME));
+        let (keep, copy, found) = pair_in(&t, r"g\icon.png", r"Big Adventure\icon.png", &data);
+        fs::write(t.0.join("Big Adventure").join("eula.txt"), b"eula=true").unwrap();
+        // (Not `untouched`: the copy's folder holds more than the copy now.)
+        let job = merge(&found, &keep, &[&copy], IN_DOWNLOADS, false);
+        assert_eq!(job.errors, [(shown_at(&copy), links::LB_GAME.to_string())]);
+        assert_ne!(key(&keep), key(&copy));
+
+        // A big model in a program's folder: only when the user asks.
+        let (keep, copy, found) = pair_in(&t, r"h\model.gguf", r"i\model.gguf", &data);
+        refused(&keep, &copy, &found, IN_APP_DATA, format!("{KEEP_FAILED}(model.gguf) — {}", links::LB_PROGRAM_OPTIN));
+        let job = merge_asking(&found, &keep, &[&copy], IN_APP_DATA, false, true);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert_eq!(key(&keep), key(&copy));
+        // Anything else there, not even then.
+        let (keep, copy, found) = pair_in(&t, r"j\tool.dll", r"k\tool.dll", &data);
+        let job = merge_asking(&found, &keep, &[&copy], IN_APP_DATA, false, true);
+        assert_eq!(job.errors, [(shown_at(&copy), format!("{KEEP_FAILED}(tool.dll) — {}", links::LB_PROGRAM))]);
+        untouched(&keep, &copy, &data, &data);
+        // Nor two models whose folders pass down different permissions, as a Store app's package
+        // folder does (an ACE for the app's own SID): one name would lose them. Asking does not help.
+        let (keep, copy, found) = pair_in(&t, r"h2\model.gguf", r"i2\model.gguf", &data);
+        set_dacl(&t.0.join("i2"), "D:(A;OICI;FA;;;S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-3232135806-4053264122-3456934681)");
+        let job = merge_asking(&found, &keep, &[&copy], IN_APP_DATA, false, true);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(shown_at(&copy), links::LB_SECURITY_APPS.to_string())]);
+        untouched(&keep, &copy, &data, &data);
+
+        // Two files that would not keep their own attributes or permissions as one.
+        let (keep, copy, found) = pair_in(&t, r"l\hidden.jpg", r"m\hidden.jpg", &data);
+        set_attrs(&copy, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE);
+        refused(&keep, &copy, &found, IN_DOWNLOADS, links::LB_ATTRS.into());
+        let (keep, copy, found) = pair_in(&t, r"n\own.jpg", r"o\own.jpg", &data);
+        set_dacl(&copy, KEPT_TO_ITSELF);
+        refused(&keep, &copy, &found, IN_DOWNLOADS, links::LB_SECURITY.into());
+        // As the app has it: the test folder is app data and a cache, nothing merges.
+        let (keep, copy, found) = pair_in(&t, r"p\photo.jpg", r"q\photo.jpg", &data);
+        refused(&keep, &copy, &found, Settings { rule: links::verdict, ..TEST }, format!("{KEEP_FAILED}(photo.jpg) — {}", links::LB_CACHE));
+        // The finder says the same of each file.
+        assert!(found[0].files.iter().all(|f| f.link_block == Some(links::LB_CACHE) && !f.link_optin));
+    }
+
+    /// The id of the file at `p`, its times (created, modified) and its names.
+    fn stamp(p: &Path) -> (dups::FileKey, SystemTime, SystemTime, u32) {
+        let m = fs::metadata(p).unwrap();
+        (key(p), m.created().unwrap(), m.modified().unwrap(), names_of(p))
+    }
+
+    /// Makes `paths` files of their own, with the ledger next to the test folder `t`.
+    fn unlink(t: &Temp, paths: &[&Path]) -> JobInfo {
+        let ledger = links::Ledger::beside(&t.0.join("merges"));
+        wait(begin_unlink(paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(), Sink::default(), TEST, ledger).unwrap())
+    }
+
+    #[test]
+    fn unlinked_names_become_files_of_their_own() {
+        let t = Temp::new("unlink");
+        let data = content(2 << 20, 22);
+        let (a, b, c) = (t.dir("a").join("x.zip"), t.dir("b").join("x.zip"), t.dir("c").join("x.zip"));
+        fs::write(&a, &data).unwrap();
+        // Downloaded: the mark of the web, an alternate stream, goes along.
+        let zone = |p: &Path| PathBuf::from(format!("{}:Zone.Identifier", p.display()));
+        fs::write(zone(&a), b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        File::options().write(true).open(&a).unwrap().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000)).unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        fs::hard_link(&a, &c).unwrap();
+        set_attrs(&a, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+        let ledger = links::Ledger::beside(&t.0.join("merges"));
+        let merge = |linked: &Path| links::Merge { kept: shown_at(&a), linked: shown_at(linked), size: 2 << 20, at: 1 };
+        ledger.add(&merge(&b)).unwrap();
+        ledger.add(&merge(&c)).unwrap();
+        let before = stamp(&a);
+        assert_eq!(before.3, 3);
+
+        let job = unlink(&t, &[&b]);
+        assert_eq!((job.op.as_str(), job.state.as_str()), ("unlink", "done"), "{:?}", job.errors);
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert_eq!((job.done_items, job.total_items), (1, 1));
+        assert_eq!((job.done_bytes, job.total_bytes), (6 << 20, 6 << 20));
+        // `b` is a file of its own with the same content, times, attributes and stream; `a` and `c` are one file still.
+        let (mine, theirs) = (stamp(&b), stamp(&a));
+        assert_ne!(mine.0, theirs.0);
+        assert_eq!(key(&c), theirs.0);
+        assert_eq!((mine.1, mine.2, mine.3), (before.1, before.2, 1));
+        assert_eq!((theirs.1, theirs.2, theirs.3), (before.1, before.2, 2));
+        assert_eq!(fs::read(&b).unwrap(), data);
+        assert_eq!(fs::read(&a).unwrap(), data);
+        assert_eq!(fs::read(zone(&b)).unwrap(), fs::read(zone(&a)).unwrap());
+        assert_eq!(attrs(&b) & SETTABLE, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        assert_eq!(attrs(&a) & SETTABLE, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+        // Nothing left beside it, and the ledger forgets the merge that is undone.
+        assert_eq!(names(&t.0.join("b")), ["x.zip"]);
+        assert_eq!(ledger.read(), [merge(&c)]);
+
+        // The last two names: both files of their own (the second has only itself left by then).
+        let job = unlink(&t, &[&a, &c]);
+        assert_eq!(job.state, "done");
+        assert!(job.errors.is_empty(), "{:?}", job.errors);
+        assert_ne!(key(&a), key(&c));
+        assert_eq!((names_of(&a), names_of(&c)), (1, 1));
+        assert_eq!(fs::read(&c).unwrap(), data);
+        assert!(ledger.read().is_empty());
+        for p in [&a, &b, &c] {
+            set_attrs(p, FILE_ATTRIBUTE_NORMAL);
+        }
+    }
+
+    #[test]
+    fn unlink_turns_down_what_it_may_not_touch_and_leaves_nothing_behind() {
+        let t = Temp::new("unlink-refused");
+        let data = content(300_000, 23);
+        let shown_at = |p: &Path| p.to_string_lossy().into_owned();
+        let only = t.dir("o").join("only.bin");
+        fs::write(&only, &data).unwrap();
+        let gone_one = t.0.join("gone.bin");
+        let remote = PathBuf::from(r"\\nas\share\x.bin");
+        let mut refusals = vec![
+            (only.clone(), UNLINK_LAST.to_string()),
+            (gone_one.clone(), UNLINK_GONE.to_string()),
+            (remote.clone(), UNLINK_NOT_LOCAL.to_string()),
+            (t.dir("o").clone(), UNLINK_NOT_PLAIN.to_string()),
+        ];
+        // Windows's own programs are names of files in WinSxS.
+        let dism = known_folder(&FOLDERID_Windows).map(|w| w.join("System32").join("Dism").join("DismCore.dll")).filter(|p| p.exists());
+        if let Some(d) = &dism {
+            refusals.push((d.clone(), UNLINK_SYSTEM.to_string()));
+        }
+        let paths: Vec<&Path> = refusals.iter().map(|(p, _)| p.as_path()).collect();
+        let job = unlink(&t, &paths);
+        assert_eq!(job.state, "failed");
+        let want: Vec<(String, String)> = refusals.iter().map(|(p, why)| (shown_at(p), why.clone())).collect();
+        assert_eq!(job.errors, want);
+        assert_eq!(fs::read(&only).unwrap(), data);
+        assert!(matches!(begin_unlink(Vec::new(), Sink::default(), TEST, links::Ledger::beside(&t.0)), Err(why) if why == NOTHING_TO_UNLINK));
+
+        // A name a program holds without letting it go: the copy made for it goes again, nothing changes.
+        let (a, b) = (t.dir("a").join("x.bin"), t.dir("b").join("x.bin"));
+        fs::write(&a, &data).unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&b).unwrap();
+        let job = unlink(&t, &[&b]);
+        drop(held);
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.errors, [(shown_at(&b), format!("{UNLINK_NOT_PUT}: 다른 프로그램이 쓰고 있어요"))]);
+        assert_eq!(key(&a), key(&b));
+        assert_eq!(names(&t.0.join("b")), ["x.bin"]);
+        assert_eq!(fs::read(&b).unwrap(), data);
+        // Let go of, it goes through.
+        let job = unlink(&t, &[&b]);
+        assert_eq!(job.state, "done", "{:?}", job.errors);
+        assert_ne!(key(&a), key(&b));
     }
 }
 
@@ -4282,6 +4927,11 @@ const TARGET_TAKEN: &str = "옮겨 갈 곳에 같은 이름이 이미 있어요"
 const NO_COPY_FOLDER: &str = "복사본을 담을 폴더를 만들 수 없어요";
 const IN_USE: &str = "사용 중인 파일이 있어서 옮기지 못했어요 — 프로그램을 닫고 다시 시도하세요";
 const NO_JUNCTION: &str = "정션을 만들지 못해서 옮기지 않았어요";
+const NO_JUNCTION_SECURITY: &str = "정션에 원래 폴더의 권한을 그대로 옮기지 못해서 옮기지 않았어요";
+/// The junction stays (a move done, an undo put back) but did not get the folder's permissions.
+const JUNCTION_BARE: &str = "정션에 원래 폴더의 권한을 입히지 못했어요 (지금은 소유자만 열 수 있어요)";
+/// An undo is done, but the folder did not get its own permissions back exactly.
+const FOLDER_BARE: &str = "되돌렸지만 폴더의 원래 권한을 그대로 돌려놓지 못했어요 (옮겨 갔던 곳의 권한 복사본이 남아 있어요)";
 const JUNCTION_STAYS: &str = "정션을 지우지 못해서 되돌리지 않았어요";
 const NOT_OUR_JUNCTION: &str = "정션이 옮긴 폴더가 아닌 다른 곳을 가리키고 있어요";
 const STUCK: &str = "원래대로 되돌리지도 못했어요";
@@ -4321,6 +4971,24 @@ pub struct Relocation {
     /// needs to put things right after a crash or a power cut there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<Pending>,
+    /// The original folder's own permissions (`root_security`), taken before
+    /// it was moved, so an undo puts them back exactly (not the protected
+    /// copy the move leaves on the target) and the junction left in its place
+    /// carries them. A record from before v0.10.3 has none: the undo then
+    /// leaves the folder's permissions as the move's copy routines made them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_security: Option<RootSecurity>,
+}
+
+/// A folder's own DACL and owner, kept so a relocation's undo and its junction
+/// can put them back as they were — an inherited DACL inherited, a protected
+/// one protected, not turned into the other.
+#[derive(Serialize, Deserialize, Clone)]
+struct RootSecurity {
+    /// The owner and DACL as SDDL (`O:...D:...`), `security_sddl`.
+    sddl: String,
+    /// Whether the DACL was protected from what its folder passes down.
+    protected: bool,
 }
 
 /// Where a relocation or undo has the folder while it switches it over.
@@ -4712,7 +5380,7 @@ fn real_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// A path as the window shows it: without the `\\?\` of a listing.
-fn shown(path: &Path) -> String {
+pub(crate) fn shown(path: &Path) -> String {
     let text = path.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
         Some(rest) if rest.get(1..3) == Some(r":\") => rest.to_string(),
@@ -4992,9 +5660,10 @@ fn recover(book: &Book) {
             continue;
         }
         let (original, target, old, copy) = (Path::new(&r.original), Path::new(&r.target), Path::new(&p.old), Path::new(&p.copy));
+        let root = r.root_security.as_ref();
         let mended = match r.state.as_str() {
-            "relocating" => recover_relocation(original, target, old, copy, &p.tally),
-            "restoring" => recover_restore(original, target, old, copy, &p.tally),
+            "relocating" => recover_relocation(original, target, old, copy, &p.tally, root),
+            "restoring" => recover_restore(original, target, old, copy, &p.tally, root),
             _ => Mended::Left,
         };
         let _ = match mended {
@@ -5005,8 +5674,12 @@ fn recover(book: &Book) {
     }
 }
 
-fn recover_relocation(original: &Path, target: &Path, old: &Path, copy: &Path, want: &Tally) -> Mended {
+/// `root`: the folder's own permissions as recorded (`Relocation::root_security`).
+fn recover_relocation(original: &Path, target: &Path, old: &Path, copy: &Path, want: &Tally, root: Option<&RootSecurity>) -> Mended {
     if linked(original, target) {
+        // Made owner-only, the job may have stopped before it got the folder's permissions:
+        // they go on now (again, if it got them).
+        let _ = dress_junction(original, root);
         if holds(old, want) {
             let _ = remove_tree(old);
         }
@@ -5035,11 +5708,17 @@ fn recover_relocation(original: &Path, target: &Path, old: &Path, copy: &Path, w
     Mended::Undone
 }
 
-fn recover_restore(original: &Path, target: &Path, old: &Path, copy: &Path, want: &Tally) -> Mended {
+fn recover_restore(original: &Path, target: &Path, old: &Path, copy: &Path, want: &Tally, root: Option<&RootSecurity>) -> Mended {
     if is_plain_dir(original) && gone(copy) {
         // What the copy came from goes only while the copy still holds the
         // same: otherwise this folder may not be ours.
-        if holds(original, want) && holds(old, want) {
+        let ours = holds(original, want);
+        // Its own permissions back on it, which the job may have stopped short of (the
+        // copy has a protected copy of them): only on the very copy the job made.
+        if ours && let Some(rs) = root {
+            let _ = put_root_security(original, rs);
+        }
+        if ours && holds(old, want) {
             let _ = remove_tree(old);
         }
         return Mended::Now("restored");
@@ -5053,6 +5732,9 @@ fn recover_restore(original: &Path, target: &Path, old: &Path, copy: &Path, want
     if !linked(original, target) || !gone(old) {
         return Mended::Left;
     }
+    // Back to active: the junction leads to the folder again and carries the
+    // folder's own permissions (it was remade owner-only just now).
+    let _ = dress_junction(original, root);
     if holds(copy, want) {
         let _ = remove_tree(copy);
     }
@@ -5134,6 +5816,14 @@ fn junction_target(path: &Path) -> Option<PathBuf> {
 /// Makes `link` a junction to the folder `to` (`D:\x`), as `mklink /J`
 /// does. Never over anything: `link` must be free.
 pub(crate) fn create_junction(link: &Path, to: &Path) -> io::Result<()> {
+    // Owner-only until its permissions go on (a relocation then puts the
+    // original folder's on): the stand-in for a folder is never, for a moment,
+    // open to more than its maker.
+    make_reparse_folder(link, &junction_data(to)?, true)
+}
+
+/// The reparse data of a junction to the folder `to` (`D:\x`).
+fn junction_data(to: &Path) -> io::Result<Vec<u8>> {
     let mut print: Vec<u16> = to.as_os_str().encode_wide().collect();
     let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
     if print.starts_with(&verbatim) {
@@ -5155,7 +5845,7 @@ pub(crate) fn create_junction(link: &Path, to: &Path) -> io::Result<()> {
     for unit in substitute.iter().chain([&0]).chain(&print).chain([&0]) {
         data.extend(unit.to_le_bytes());
     }
-    make_reparse_folder(link, &data)
+    Ok(data)
 }
 
 /// Removes the junction `link` if it leads to `target`: the junction alone
@@ -5271,9 +5961,11 @@ fn tally(root: &Path, cancel: &AtomicBool) -> Result<Tally, Halt> {
 ///
 /// Depth first, by handles: each folder is opened as itself and held
 /// (`open_itself`) from before it is listed until it goes, and so is every
-/// folder above it, so none of them can be swapped for a junction meanwhile;
-/// each entry is opened as itself too and goes through that handle. One a
-/// folder turned into since it was listed (a junction, a symbolic link) goes
+/// folder above it, so none of them can be swapped for a junction meanwhile.
+/// Each entry is opened as itself too, relative to the handle of the folder
+/// that holds it (`open_child`, never down a fresh path), and goes through
+/// that handle: one a folder turned into since it was listed (a junction, a
+/// symbolic link, a mount point set in place) is the reparse point, and goes
 /// as the link it now is, never entered.
 fn remove_tree(root: &Path) -> Result<(), String> {
     /// A folder held open while what is in it goes.
@@ -5283,7 +5975,6 @@ fn remove_tree(root: &Path) -> Result<(), String> {
         attrs: u32,
         entries: Option<std::fs::ReadDir>,
     }
-    let open = |path: &Path| open_to_delete(path, true).and_then(|f| kind_open(&f).map(|(kind, attrs)| (f, kind, attrs)));
     // What did not go, with why.
     let mut failed: Vec<(PathBuf, io::Error)> = Vec::new();
     let level = |path: PathBuf, dir: File, attrs: u32, failed: &mut Vec<(PathBuf, io::Error)>| {
@@ -5291,14 +5982,15 @@ fn remove_tree(root: &Path) -> Result<(), String> {
         Level { path, dir, attrs, entries }
     };
     let top = win::verbatim(root);
-    let mut stack = match open(&top) {
+    let opened = open_to_delete(&top, true).and_then(|f| kind_open(&f).map(|(kind, attrs)| (f, kind, attrs)));
+    let mut stack = match opened {
         Ok((dir, Kind::Dir, attrs)) => vec![level(top, dir, attrs, &mut failed)],
         Ok(_) => return Err(NOT_A_FOLDER.into()),
         Err(e) => return Err(reason(&e)),
     };
     while let Some(at) = stack.last_mut() {
-        let path = match at.entries.as_mut().and_then(Iterator::next) {
-            Some(Ok(entry)) => entry.path(),
+        let entry = match at.entries.as_mut().and_then(Iterator::next) {
+            Some(Ok(entry)) => entry,
             Some(Err(e)) => {
                 failed.push((at.path.clone(), e));
                 continue;
@@ -5312,7 +6004,11 @@ fn remove_tree(root: &Path) -> Result<(), String> {
                 continue;
             }
         };
-        match open(&path) {
+        let (name, path) = (entry.file_name(), entry.path());
+        // In the held folder, through its handle: an entry swapped in since the
+        // listing is still resolved in this very folder, not down a path.
+        let opened = open_child_to_delete(&at.dir, &name, true).and_then(|f| kind_open(&f).map(|(kind, attrs)| (f, kind, attrs)));
+        match opened {
             Ok((dir, Kind::Dir, attrs)) => {
                 let next = level(path, dir, attrs, &mut failed);
                 stack.push(next);
@@ -5354,6 +6050,133 @@ fn open_to_delete(path: &Path, hold: bool) -> io::Result<File> {
         Some(c) if c == ERROR_ACCESS_DENIED as i32 => open_itself(path, DELETE, hold),
         _ => Err(e),
     })
+}
+
+/// NTSTATUS failures are NT codes; these turn into the Win32 errors the rest
+/// of the file reads (`reason`).
+const STATUS_SUCCESS: NTSTATUS = 0;
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+/// NtCreateFile: open an existing object only.
+const FILE_OPEN: u32 = 1;
+/// NtCreateFile CreateOptions (ntifs.h): the reparse point itself, a folder
+/// (backup intent), synchronous.
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+const FILE_OPEN_REPARSE_POINT_OPT: u32 = 0x0020_0000;
+
+/// A counted UTF-16 string (ntdef.h), for `ObjectAttributes`.
+#[repr(C)]
+struct UnicodeString {
+    /// Bytes in use, and the buffer's size, both without a NUL.
+    length: u16,
+    maximum: u16,
+    buffer: *mut u16,
+}
+
+/// What to open, relative to a folder handle (ntdef.h); only the fields used.
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    /// The folder the name is resolved in; NtCreateFile goes no further up.
+    root: HANDLE,
+    name: *const UnicodeString,
+    attributes: u32,
+    security: *const c_void,
+    sqos: *const c_void,
+}
+
+/// Opens the entry `name` directly inside the folder open as `parent`, as
+/// itself (a link, a mount point among them, is the reparse point, never what
+/// it leads to). Resolved in that very folder through its handle, not down a
+/// path a folder swapped for a mount point in the meantime could bend: what is
+/// opened is a real child of `parent`. `parent` needs no particular right for
+/// it (FILE_TRAVERSE least of all: an open relative to a handle is not a
+/// traverse of it, and asking for that right only turns down folders that do
+/// not grant it, or that a program holds without letting others read).
+/// `access` and `hold` are as `open_itself`.
+fn open_child(parent: &File, name: &OsStr, access: u32, hold: bool) -> io::Result<File> {
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    // A single name in `parent`, never a path or `.`/`..` that would lead out
+    // of it (a listing never gives those, but the open goes relative to `parent`).
+    let out = wide.is_empty() || wide.contains(&(b'\\' as u16)) || wide.contains(&(b'/' as u16)) || name == "." || name == "..";
+    if out {
+        return Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32));
+    }
+    let bytes = (wide.len() * 2) as u16;
+    let us = UnicodeString { length: bytes, maximum: bytes, buffer: wide.as_mut_ptr() };
+    let oa = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root: parent.as_raw_handle() as HANDLE,
+        name: &us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security: null(),
+        sqos: null(),
+    };
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | if hold { 0 } else { FILE_SHARE_DELETE };
+    let options = FILE_OPEN_REPARSE_POINT_OPT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT;
+    let mut handle: HANDLE = null_mut();
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        NtCreateFile(&mut handle, access | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &oa, &mut status_block, null(), 0, share, FILE_OPEN, options, null(), 0)
+    };
+    if status != STATUS_SUCCESS {
+        return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+    }
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+/// `open_child` with DELETE, and with the right to change its attributes
+/// where that is given (as `open_to_delete`): a folder's handle is then the
+/// one its own children are opened through, which needs no right of its own.
+fn open_child_to_delete(parent: &File, name: &OsStr, hold: bool) -> io::Result<File> {
+    open_child(parent, name, DELETE | FILE_WRITE_ATTRIBUTES, hold).or_else(|e| match e.raw_os_error() {
+        Some(c) if c == ERROR_ACCESS_DENIED as i32 => open_child(parent, name, DELETE, hold),
+        _ => Err(e),
+    })
+}
+
+/// The names in the folder open as `dir` (with FILE_LIST_DIRECTORY), read
+/// through that very handle, without `.` and `..`: what this folder holds,
+/// never what a path to it may lead to by now (an empty folder set as a mount
+/// point in place while it is held). With each, whether it was listed as a
+/// folder (not a link to one).
+fn names_in(dir: &File) -> io::Result<Vec<(OsString, bool)>> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FILE_FULL_DIR_INFO};
+    let h = dir.as_raw_handle() as HANDLE;
+    // 64 KiB, aligned as the records are (8).
+    let mut buf = vec![0u64; 8 << 10];
+    let mut class = FileFullDirectoryRestartInfo;
+    let mut names = Vec::new();
+    let (dot, dots): (&[u16], &[u16]) = (&[b'.' as u16], &[b'.' as u16, b'.' as u16]);
+    loop {
+        if unsafe { GetFileInformationByHandleEx(h, class, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32) } == 0 {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) { Ok(names) } else { Err(e) };
+        }
+        class = FileFullDirectoryInfo;
+        let mut at = 0usize;
+        loop {
+            // SAFETY: Windows wrote whole records into `buf`, each at an 8-aligned offset, its
+            // name (FileNameLength bytes) running on past the struct.
+            let (next, name, attrs, tag) = unsafe {
+                let record = buf.as_ptr().cast::<u8>().add(at).cast::<FILE_FULL_DIR_INFO>();
+                let len = (*record).FileNameLength as usize / 2;
+                let start = std::ptr::addr_of!((*record).FileName).cast::<u16>();
+                // A reparse point's tag is where the size of its extended attributes would be.
+                ((*record).NextEntryOffset as usize, std::slice::from_raw_parts(start, len), (*record).FileAttributes, (*record).EaSize)
+            };
+            if name != dot && name != dots {
+                // A name surrogate (a junction, a symbolic link) is a link, as `kind_of` has it.
+                let link = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & 0x2000_0000 != 0;
+                names.push((OsString::from_wide(name), attrs & FILE_ATTRIBUTE_DIRECTORY != 0 && !link));
+            }
+            if next == 0 {
+                break;
+            }
+            at += next;
+        }
+    }
 }
 
 /// What the entry open as `file` (`open_itself`) is, as `kind_of` tells a
@@ -5410,13 +6233,17 @@ fn delete_open(file: &File, attrs: u32) -> io::Result<()> {
 }
 
 /// Makes the hidden folder a copy goes into, next to `to` and named after it
-/// with `ext`. A new one: a folder of that name already there is not ours,
-/// and the next free name is taken.
+/// with `ext`, its owner's alone (`FILLING_SDDL`) from the moment it is
+/// there. A new one: a folder of that name already there is not ours, and
+/// the next free name is taken.
 fn make_copy_folder(to: &Path, ext: &str) -> Result<PathBuf, Halt> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    let lock = sddl_to_security(FILLING_SDDL).map_err(|e| Halt::Why(format!("{NO_COPY_FOLDER}: {}", reason(&e))))?;
+    let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: lock.0, bInheritHandle: 0 };
     for n in 1..=PARTIAL_TRIES {
         let Some(copy) = marked_name(to, true, ext, n) else { break };
         let wide = win::wide_path(&copy);
-        if unsafe { CreateDirectoryW(wide.as_ptr(), null()) } != 0 {
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &sa) } != 0 {
             return Ok(copy);
         }
         let e = io::Error::last_os_error();
@@ -5432,14 +6259,22 @@ fn make_copy_folder(to: &Path, ext: &str) -> Result<PathBuf, Halt> {
 // A copy gets what its new folder passes down: on another drive that often
 // lets every signed-in user change what is in it, and a relocation's copy
 // takes the folder's place behind a junction, where nobody would notice. So
-// before anything goes in, the copy's folder gets the folder's DACL (and its
-// owner, where Windows lets that be set), protected from what passes down
-// there and with every ACE its own (`keep_root_security`). Each entry whose
-// DACL is its own (protected, or with an ACE of its own) gets that DACL on
-// its copy (`copy_own_security`), a folder's before anything goes in; the
-// rest get what their folder passes down, as they do where they come from.
-// Written through the kernel's own call (SetKernelObjectSecurity): as it
-// is, with nothing worked out from the folder above or passed on below.
+// the copy's folder is made its owner's alone, protected, passing that down
+// (`FILLING_SDDL`), and everything goes in under that: nothing in it is open
+// to more than its owner while it is filled, and a folder that lets nobody
+// add to it (read and run only) is filled all the same. Each entry gets the
+// DACL of what it copies once it is in (`Run::keep_own_security`), its own
+// or all passed down, as it is; a folder once all it holds is in (from the
+// bottom up). The copy's folder gets the folder's DACL last (and its owner,
+// where Windows lets that be set), protected from what passes down there and
+// with every ACE its own (`keep_root_security`). Written through the
+// kernel's own call (SetKernelObjectSecurity): as it is, with nothing worked
+// out from the folder above or passed on below.
+
+/// A relocation's or an undo's copy while it is filled: its owner's alone
+/// (OW: the user, or Administrators for an elevated app), protected, passed
+/// down to all that goes in.
+const FILLING_SDDL: &str = "D:P(A;OICI;FA;;;OW)";
 
 /// A security descriptor GetSecurityInfo gave, let go of with LocalFree.
 struct Security(PSECURITY_DESCRIPTOR);
@@ -5542,15 +6377,22 @@ fn put_owner(file: &File, owner: PSID) -> io::Result<()> {
     if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-/// Gives the new, still empty folder `copy` the permissions of the folder
-/// `from`: its DACL protected and with every ACE its own (so it is what it
-/// is at `from`, whatever passes down at `copy`), and its owner where
-/// Windows lets that be set.
-fn keep_root_security(from: &Path, copy: &Path) -> io::Result<()> {
-    let have = Security::of(&open_itself(from, READ_CONTROL, false)?, true)?;
+/// The owner and DACL of the folder `from`, read before a relocation or an
+/// undo copies anything (`keep_root_security` puts them on the copy once it
+/// is filled): one whose permissions cannot be read is not moved.
+fn root_security_of(from: &Path) -> io::Result<Security> {
+    Security::of(&open_itself(from, READ_CONTROL, false)?, true)
+}
+
+/// Gives the filled folder `copy` the permissions `have` of the folder it
+/// copies (`root_security_of`): its DACL protected and with every ACE its own
+/// (so it is what it is there, whatever passes down at `copy`), and its owner
+/// where Windows lets that be set. Last, once everything in it has its own
+/// (`Run::keep_own_security`), so it changes nothing below it.
+fn keep_root_security(have: &Security, copy: &Path) -> io::Result<()> {
     let dacl = have.dacl()?;
     let to = open_itself(copy, WRITE_DAC | WRITE_OWNER | READ_CONTROL, true).or_else(|_| open_itself(copy, WRITE_DAC | READ_CONTROL, true))?;
-    // Made just now and held from here: what gets the permissions is the folder made.
+    // Made by the job and held from here: what gets the permissions is the folder made.
     if kind_open(&to)?.0 != Kind::Dir {
         return Err(io::Error::other(TURNED_LINK));
     }
@@ -5569,10 +6411,20 @@ fn keep_root_security(from: &Path, copy: &Path) -> io::Result<()> {
 /// READ_CONTROL) where that is the entry's own (`Security::own`): a
 /// protected one as it is, with every ACE its own; any other as it is, ACEs
 /// passed down and all, which are what the copy's folder passes down too.
-/// One whose DACL all comes from its folder is left as it is: so does the copy's.
+/// One whose DACL all comes from its folder is left as it is: so does the
+/// copy's, made in the same folder (an unlink's).
 fn copy_own_security(from: &File, target: &Path) -> io::Result<()> {
+    copy_security(from, target, false)
+}
+
+/// `copy_own_security`, and with `all` a DACL all passed down too, as it is
+/// (ACEs passed down and all): a relocation's copy, whose folders pass down
+/// nothing of their own while it is filled (`FILLING_SDDL`), gets on each
+/// entry what its folder will pass down once it has its own. Written through
+/// the raw call: nothing is worked out again, nothing passed on below.
+fn copy_security(from: &File, target: &Path, all: bool) -> io::Result<()> {
     let have = Security::of(from, false)?;
-    if !have.own()? {
+    if !all && !have.own()? {
         return Ok(());
     }
     let dacl = have.dacl()?;
@@ -5585,6 +6437,98 @@ fn copy_own_security(from: &File, target: &Path) -> io::Result<()> {
     }
     let own = own_aces(dacl);
     put_dacl(&to, own.as_ptr().cast(), true)
+}
+
+/// The owner and DACL of the folder `path`, as SDDL, and whether the DACL is
+/// protected — kept in the relocation record (`RootSecurity`) so an undo puts
+/// the folder's own permissions back exactly. None when they cannot be read.
+fn root_security(path: &Path) -> Option<RootSecurity> {
+    let have = Security::of(&open_itself(path, READ_CONTROL, false).ok()?, true).ok()?;
+    Some(RootSecurity { sddl: security_sddl(&have)?, protected: have.protected() })
+}
+
+/// `sd`'s owner and DACL as an SDDL string (`O:...D:...`).
+fn security_sddl(sd: &Security) -> Option<String> {
+    use windows_sys::Win32::Security::Authorization::{ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1};
+    let mut text: PWSTR = null_mut();
+    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    if unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd.0, SDDL_REVISION_1, what, &mut text, null_mut()) } == 0 || text.is_null() {
+        return None;
+    }
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    let sddl = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    unsafe { LocalFree(text.cast()) };
+    Some(sddl)
+}
+
+/// A security descriptor parsed from SDDL, let go of with LocalFree (the
+/// allocator ConvertString... uses).
+fn sddl_to_security(sddl: &str) -> io::Result<Security> {
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    let text = win::wide(sddl);
+    let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Security(sd))
+}
+
+/// Puts the recorded owner and DACL `rs` back on the folder `path`, exactly as
+/// they were: a protected DACL as it is, an inherited one as it is too,
+/// unprotected, ACEs passed down and all (the folder it is in is the same as
+/// before, so they are what it passes down). The owner where Windows lets it
+/// be set. Used by an undo on the folder it brings back and on the junction a
+/// relocation leaves.
+///
+/// Through the raw kernel call (`put_dacl`): this entry alone. SetSecurityInfo
+/// would work the inherited ACEs out again and pass them on to everything in
+/// the folder, which the copy routines gave them already: the same result,
+/// at a cost that grows with the tree, with no progress and no cancel. The
+/// handle is the entry itself (a junction included, never what it leads to).
+fn put_root_security(path: &Path, rs: &RootSecurity) -> io::Result<()> {
+    let sd = sddl_to_security(&rs.sddl)?;
+    let to = open_itself(path, WRITE_DAC | WRITE_OWNER | READ_CONTROL, false).or_else(|_| open_itself(path, WRITE_DAC | READ_CONTROL, false))?;
+    // The owner on its own (the user, or a group the user is in): one Windows
+    // will not let be set does not keep the DACL from going on.
+    let owner = sd.owner();
+    if !owner.is_null() {
+        let _ = put_owner(&to, owner);
+    }
+    put_dacl(&to, sd.dacl()?, rs.protected)
+}
+
+/// Clears the junction `link` to what its folder passes down (a present but
+/// empty DACL, unprotected, so SetSecurityInfo fills in the inherited ACEs):
+/// for a relocation with no recorded folder permissions (an older one, or one
+/// whose folder could not be read), as a junction made before this was kept
+/// would have been — never left owner-only, which could shut a service out of
+/// a relocated app folder.
+fn inherit_junction(link: &Path) -> io::Result<()> {
+    const ACL_REVISION: u8 = 2;
+    let mut empty = [0u32; 2];
+    // An empty ACL: 8-byte header, no ACEs.
+    unsafe {
+        let acl = empty.as_mut_ptr().cast::<ACL>();
+        (*acl).AclRevision = ACL_REVISION;
+        (*acl).AclSize = std::mem::size_of::<ACL>() as u16;
+    }
+    let to = open_itself(link, WRITE_DAC | READ_CONTROL, false)?;
+    let what = DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION;
+    let e = unsafe { SetSecurityInfo(to.as_raw_handle() as HANDLE, SE_FILE_OBJECT, what, null_mut(), null_mut(), empty.as_ptr().cast(), null_mut()) };
+    if e == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(e as i32)) }
+}
+
+/// Puts the recorded original folder permissions on the junction `link`
+/// (`put_root_security`), or, with none, lets it inherit from its folder
+/// (`inherit_junction`): for the paths that have already committed to the
+/// junction (an undo put back, a start putting a job cut short right), which
+/// tell a failure (JUNCTION_BARE) where there is a job to tell it in. Again
+/// on a junction that has them already changes nothing.
+fn dress_junction(link: &Path, rs: Option<&RootSecurity>) -> io::Result<()> {
+    match rs {
+        Some(rs) => put_root_security(link, rs),
+        None => inherit_junction(link),
+    }
 }
 
 /// Why a relocation or an undo stopped short.
@@ -5629,6 +6573,10 @@ impl Run {
 
     fn relocate_steps(&mut self, plan: &Plan, book: &Book) -> Result<(), Halt> {
         let (from, to) = (&plan.from, &plan.to);
+        // The folder's own permissions, taken while it is still in place, so
+        // the undo puts them back exactly and the junction left behind carries
+        // them. None (unreadable) leaves the undo to the move's copy routines.
+        let root = root_security(from);
         let (copy, tally) = self.copy_whole(from, &plan.meta, to, RELOCATING_EXT)?;
         let created_at = filetime_now();
         let mut record = Relocation {
@@ -5639,6 +6587,7 @@ impl Run {
             created_at,
             state: "relocating".into(),
             pending: Some(Pending { old: String::new(), copy: shown(&copy), tally }),
+            root_security: root,
         };
         // Written down before the folder is taken away (`take_away` says
         // where to), so a crash from here on is put right at the next start
@@ -5679,6 +6628,27 @@ impl Run {
             let halt = self.put_back(&old, from, to, format!("{NO_JUNCTION}: {}", reason(&e)));
             unnote(noted);
             return Err(halt);
+        }
+        // The junction (made owner-only) gets the original folder's own
+        // permissions, so it is reached as the folder was. A failure undoes
+        // the switch like a junction that could not be made, as long as the
+        // junction goes again; one that stays leads to the whole checked copy,
+        // so the move is done (as the next start would finish it) and the job
+        // says the junction is still its owner's alone. So does one that
+        // could not take on what its folder passes down (no recorded permissions).
+        let dressed = match &record.root_security {
+            Some(rs) => match put_root_security(from, rs) {
+                Err(e) if remove_junction(from, to).is_ok() => {
+                    let halt = self.put_back(&old, from, to, format!("{NO_JUNCTION_SECURITY}: {}", reason(&e)));
+                    unnote(noted);
+                    return Err(halt);
+                }
+                dressed => dressed,
+            },
+            None => inherit_junction(from),
+        };
+        if let Err(e) = dressed {
+            self.error(from, format!("{JUNCTION_BARE}: {}", reason(&e)));
         }
         let done = Relocation { state: "active".into(), pending: None, ..record.clone() };
         let saved = book.keep(&done);
@@ -5742,14 +6712,27 @@ impl Run {
         }
         if let Err(e) = win::rename(&copy, &original) {
             let why = format!("복사본의 이름을 바꾸지 못해서 되돌리지 않았어요: {}", reason(&e));
-            // As it was: the folder back at the target, and the junction to it.
+            // As it was: the folder back at the target, and the junction to it
+            // with the original folder's permissions again.
             if win::rename(&old, &target).and_then(|()| (self.settings.junction)(&original, &target)).is_ok() {
+                if let Err(e) = dress_junction(&original, record.root_security.as_ref()) {
+                    self.error(&original, format!("{JUNCTION_BARE}: {}", reason(&e)));
+                }
                 self.discard(&copy);
                 unnote(noted);
                 return Err(Halt::Why(why));
             }
             let at = if std::fs::symlink_metadata(win::verbatim(&old)).is_ok() { &old } else { &target };
             return Err(Halt::Why(format!("{why}. {STUCK}. 폴더는 {}에, 복사본은 {}에 있어요", shown(at), shown(&copy))));
+        }
+        // The folder is back where it was; its own permissions go back on it
+        // exactly (the move's copy left a protected copy of them). The folder
+        // is restored either way, and for a protected folder the copy already
+        // matches: a failure is told, not undone.
+        if let Some(rs) = &record.root_security
+            && let Err(e) = put_root_security(&original, rs)
+        {
+            self.error(&original, format!("{FOLDER_BARE}: {}", reason(&e)));
         }
         let done = Relocation { state: "restored".into(), pending: None, ..record.clone() };
         let saved = book.keep(&done);
@@ -5780,20 +6763,23 @@ impl Run {
         if free.is_none_or(|f| f < need) {
             return Err(Halt::Why(no_room(to, need, free)));
         }
+        let no_security = |run: &Run, e: &io::Error| Halt::Why(format!("권한 설정을 그대로 옮기지 못해서 {} 않았어요: {}", run.not_done(), reason(e)));
+        // The folder's permissions, read before anything is copied: one whose cannot be is not moved.
+        let root = root_security_of(from).map_err(|e| no_security(self, &e))?;
+        // Its owner's alone while it is filled; everything in it gets its own as it goes in,
+        // and the copy's folder the folder's last, once nothing in it is to come.
         let copy = make_copy_folder(to, ext)?;
-        // The folder's permissions on the copy before anything goes in: what goes in
-        // gets what they pass down, and nobody the folder kept out can change it meanwhile.
-        if let Err(e) = keep_root_security(from, &copy) {
-            self.discard(&copy);
-            return Err(Halt::Why(format!("권한 설정을 그대로 옮기지 못해서 {} 않았어요: {}", self.not_done(), reason(&e))));
-        }
         self.keep_security = true;
         let errors = self.info.error_count;
         // The speed starts with the first bytes, not from zero during the count.
         self.speed = Speed::new();
         // Nothing in a new folder is in the way: no question is ever asked.
         self.always = Some(Choice::Skip);
-        match self.fill(from, meta, &copy, errors) {
+        let filled = self.fill(from, meta, &copy, errors).and_then(|tally| match keep_root_security(&root, &copy) {
+            Ok(()) => Ok(tally),
+            Err(e) => Err(no_security(self, &e)),
+        });
+        match filled {
             Ok(tally) => Ok((copy, tally)),
             Err(halt) => {
                 self.discard(&copy);
@@ -5829,7 +6815,8 @@ impl Run {
 
     /// Copies what is in `from` into the folder `copy` and checks the copy.
     fn fill(&mut self, from: &Path, meta: &Metadata, copy: &Path, errors: u64) -> Result<Tally, Halt> {
-        let complete = self.put_dir(from, meta, copy, true)?;
+        // The top of a relocation: `from` has no held parent, so it is opened by path.
+        let complete = self.put_dir(from, meta, copy, true, None)?;
         copy_folder_look(meta, copy);
         if complete != Some(true) || self.info.error_count > errors {
             return Err(Halt::Why(format!("복사하지 못한 항목이 있어서 {} 않았어요", self.not_done())));
@@ -6005,12 +6992,17 @@ impl Guards {
 // content, stored once. Sizes, modified times and hashes come from the
 // finder's own result, not from the window. For each copy:
 //
-// 1. look, changing nothing: both are plain files (no link or other reparse
-//    point, nothing only in the cloud) outside Windows's own folders, on one
-//    local NTFS volume, of the size and modified time the finder saw, and not
-//    one file already (then there is nothing to do); the copy has no other
-//    name (merging it would free nothing), the file that stays has room for
-//    one more (NTFS: 1023), and the Recycle Bin takes the copy;
+// 1. look, changing nothing: the link rule (links.rs, v0.10.3) allows both
+//    (by where they are and what they are; a big model or archive in a
+//    program's folder only with `allow_programs`); both are plain files (no
+//    link or other reparse point, nothing only in the cloud) outside
+//    Windows's own folders, on one local NTFS volume, of the size and
+//    modified time the finder saw, and not one file already (then there is
+//    nothing to do); they have the same read-only, hidden and system
+//    attributes, owner and permissions (which the copy's name would take on
+//    from the file that stays); the copy has no other name (merging it would
+//    free nothing), the file that stays has room for one more (NTFS: 1023),
+//    and the Recycle Bin takes the copy;
 // 2. read both whole (blake3) through handles that let nobody write to them
 //    until the copy is merged, and compare them with the finder's hash;
 // 3. write down what is about to happen (`LinkBook`), all the way to the
@@ -6020,7 +7012,9 @@ impl Guards {
 //    path since), and check that the name leads to it;
 // 4. send `.name.ff-link`, with the copy's own attributes back, to the
 //    Recycle Bin (the checks of `trash_paths`): its bytes come free once the
-//    bin is emptied (`JobInfo.freed_bytes`). Then the note goes.
+//    bin is emptied (`JobInfo.freed_bytes`). Then the note goes, and the
+//    merge is written in the ledger (`links::Ledger`), which `link_ledger`
+//    and `hardlinks_find` show and `start_unlink` can undo.
 //
 // Nothing is changed before step 3. A step 3 that fails is undone: the name
 // made is taken away again (the one the link call made, whatever it leads
@@ -6102,25 +7096,48 @@ pub struct LinkGroup {
 /// that every path still opens the same content, stored once (see above).
 /// `dup` is the duplicate search the groups come from (DupReport.id); without
 /// it, the newest search that has them. The groups are checked against that
-/// search's result before a job (op "link") starts; returns its id.
+/// search's result before a job (op "link") starts; returns its id. A file
+/// the link rule does not allow (DupFile.link_block) is turned down in the
+/// job, unless it is one the user may ask for (`link_optin`) and
+/// `allow_programs` asks.
 #[tauri::command]
-pub async fn start_dup_link(app: AppHandle, groups: Vec<LinkGroup>, dup: Option<u64>) -> Result<u64, String> {
+pub async fn start_dup_link(app: AppHandle, groups: Vec<LinkGroup>, dup: Option<u64>, allow_programs: Option<bool>) -> Result<u64, String> {
     blocking(move || {
         let found = dups::found(dup).map_err(|_| NO_DUP_RESULT.to_string())?;
-        begin_link(groups, &found, app, Settings::APP, &LinkBook::app())
+        begin_link(groups, &found, app, Settings::APP, &LinkBook::app(), allow_programs.unwrap_or(false))
     })
     .await?
 }
 
 /// Checks `groups` against what the duplicate finder `found`, then starts
-/// the job, which writes down in `book` what it is doing.
-fn begin_link(groups: Vec<LinkGroup>, found: &[dups::DupGroup], events: impl Events, settings: Settings, book: &LinkBook) -> Result<u64, String> {
+/// the job, which writes down in `book` what it is doing (and in its ledger
+/// what it did).
+fn begin_link(
+    groups: Vec<LinkGroup>,
+    found: &[dups::DupGroup],
+    events: impl Events,
+    settings: Settings,
+    book: &LinkBook,
+    allow_programs: bool,
+) -> Result<u64, String> {
     let plans = plan_links(groups, found)?;
     let mut page = book.page()?;
+    let how = LinkHow { allow_programs, ledger: book.ledger(), markers: links::Markers::default() };
     let all = plans.iter().flat_map(|p| std::iter::once(&p.keep.0).chain(p.others.iter().map(|(o, _)| o)));
     let dest = shown(&common_folder(all));
     let run = new_job("link", false, Vec::new(), dest, events, settings);
-    launch(run, move |run| run.link_all(&plans, &mut page))
+    launch(run, move |run| run.link_all(&plans, &mut page, &how))
+}
+
+/// What a merge goes by besides its groups.
+struct LinkHow {
+    /// The user asked for big models and archives in programs' folders too
+    /// (`links::Verdict::OptIn`).
+    allow_programs: bool,
+    /// Where each merge done is written down.
+    ledger: links::Ledger,
+    /// What the folders hold, for the link rule; looked at once per merge.
+    markers: links::Markers,
 }
 
 /// One group to merge, as the duplicate finder found it.
@@ -6199,6 +7216,8 @@ struct Held {
     file: File,
     attrs: u32,
     key: dups::FileKey,
+    /// What its names share (`links::sharing_of`); None when that cannot be read.
+    sharing: Option<links::Sharing>,
     /// Names (hard links) it had when it was opened.
     links: u32,
     /// Its size and modified time (FILETIME), as the duplicate finder saw them.
@@ -6234,7 +7253,8 @@ fn open_for_link(path: &Path, size: u64, modified: i64, windows: Option<&Path>, 
     let facts = dups::facts(&file).ok_or(LINK_NO_OPEN)?;
     judge_link(facts.attrs, facts.size, facts.modified, size, modified)?;
     let key = facts.key.filter(|_| on_ntfs(&file)).ok_or(LINK_NOT_NTFS)?;
-    Ok(Held { file, attrs: facts.attrs, key, links: facts.links, size, modified })
+    let sharing = links::sharing_of(&file);
+    Ok(Held { file, attrs: facts.attrs, key, sharing, links: facts.links, size, modified })
 }
 
 /// Whether a file with these attributes, size and modified time is still the
@@ -6255,7 +7275,7 @@ fn judge_link(attrs: u32, now_size: u64, now_modified: i64, size: u64, modified:
 /// Whether `path` is in a folder of Windows itself, as written or where it
 /// really is: `classify`'s "system" (`\Windows`, `\Recovery`, `\$Recycle.Bin`
 /// and the like at a drive's root) or the Windows folder wherever it is.
-fn in_windows(path: &Path, windows: Option<&Path>) -> bool {
+pub(crate) fn in_windows(path: &Path, windows: Option<&Path>) -> bool {
     let system = |p: &Path| {
         let text = p.to_string_lossy();
         let name = text.rsplit('\\').next().unwrap_or_default();
@@ -6284,7 +7304,7 @@ fn on_ntfs(file: &File) -> bool {
 }
 
 /// Which file `path` names (`dups::FileKey`); a link there is taken as itself.
-fn key_at(path: &Path) -> Option<dups::FileKey> {
+pub(crate) fn key_at(path: &Path) -> Option<dups::FileKey> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -6314,12 +7334,30 @@ struct LinkInformation {
 
 /// FileLinkInformation (FILE_INFORMATION_CLASS, wdm.h).
 const FILE_LINK_INFORMATION: i32 = 11;
+/// FileRenameInformation: its FILE_RENAME_INFORMATION is laid out as LinkInformation.
+const FILE_RENAME_INFORMATION: i32 = 10;
 
 // What CreateHardLinkW does underneath, but on a handle: one feature of
 // windows-sys (Wdk) for one function is not worth it.
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
     fn NtSetInformationFile(file: HANDLE, io: *mut IO_STATUS_BLOCK, info: *const c_void, length: u32, class: i32) -> NTSTATUS;
+    /// Opens a file by name relative to `attrs.root` (`open_child`): no path is
+    /// walked, so a folder on the way cannot be swapped for a mount point.
+    #[allow(clippy::too_many_arguments)]
+    fn NtCreateFile(
+        handle: *mut HANDLE,
+        access: u32,
+        attrs: *const ObjectAttributes,
+        io: *mut IO_STATUS_BLOCK,
+        allocation: *const i64,
+        file_attributes: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        ea: *const c_void,
+        ea_length: u32,
+    ) -> NTSTATUS;
 }
 
 /// Makes `link` a new name of the open file `existing`, never over anything.
@@ -6327,14 +7365,7 @@ unsafe extern "system" {
 /// that was opened (and read), even if another one has been put at its
 /// path since.
 fn create_hard_link(link: &Path, existing: &File) -> io::Result<()> {
-    let mut wide = win::wide_path(link);
-    wide.pop();
-    // `\\?\C:\x` is `\??\C:\x` to the kernel (`\\?\UNC\...` likewise).
-    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
-    let Some(rest) = wide.strip_prefix(verbatim.as_slice()) else {
-        return Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32));
-    };
-    let name: Vec<u16> = r"\??\".encode_utf16().chain(rest.iter().copied()).collect();
+    let name = nt_name(link)?;
     // Through a handle of its own on that very file, closed right after: the
     // file's change time and archive mark are set then, as by CreateHardLinkW
     // (else only once `existing` is closed, past an undo that puts them back).
@@ -6350,6 +7381,31 @@ fn create_hard_link(link: &Path, existing: &File) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let same = unsafe { File::from_raw_handle(h as RawHandle) };
+    set_name(&same, &name, FILE_LINK_INFORMATION)
+}
+
+/// Moves the entry open as `file` (with DELETE) to `target`, on its volume,
+/// never over anything: as `rename_entry` does, but the very entry opened
+/// (in its folder, `Within`), not whatever a path to it leads to by now.
+fn rename_open(file: &File, target: &Path) -> io::Result<()> {
+    set_name(file, &nt_name(target)?, FILE_RENAME_INFORMATION)
+}
+
+/// `path` as the kernel names it: `\\?\C:\x` is `\??\C:\x` (`\\?\UNC\...` likewise).
+fn nt_name(path: &Path) -> io::Result<Vec<u16>> {
+    let mut wide = win::wide_path(path);
+    wide.pop();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let Some(rest) = wide.strip_prefix(verbatim.as_slice()) else {
+        return Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32));
+    };
+    Ok(r"\??\".encode_utf16().chain(rest.iter().copied()).collect())
+}
+
+/// Gives the open `file` the name `name` (`nt_name`), never over anything: a
+/// new one (FILE_LINK_INFORMATION) or in place of its own
+/// (FILE_RENAME_INFORMATION, laid out the same).
+fn set_name(file: &File, name: &[u16], class: i32) -> io::Result<()> {
     let head = std::mem::offset_of!(LinkInformation, name);
     let size = head + name.len() * 2;
     // Zeroed (no replacing, no root folder) and aligned for the struct.
@@ -6359,9 +7415,8 @@ fn create_hard_link(link: &Path, existing: &File) -> io::Result<()> {
     let status = unsafe {
         (*info).name_length = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), buf.as_mut_ptr().cast::<u8>().add(head).cast::<u16>(), name.len());
-        NtSetInformationFile(same.as_raw_handle() as HANDLE, &mut status_block, buf.as_ptr().cast(), size as u32, FILE_LINK_INFORMATION)
+        NtSetInformationFile(file.as_raw_handle() as HANDLE, &mut status_block, buf.as_ptr().cast(), size as u32, class)
     };
-    drop(same);
     if status < 0 {
         return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
     }
@@ -6393,6 +7448,13 @@ fn unlink_extra(path: &Path) -> bool {
     let marked = unsafe { SetFileInformationByHandle(h, FileDispositionInfoEx, (&raw const ex).cast(), size) != 0 } || delete_on_close(&file);
     drop(file);
     marked && gone(path)
+}
+
+/// Writes down in `ledger` that `linked` became a name of the file at
+/// `kept`. A ledger that cannot be written changes nothing of the merge,
+/// which is done: it only shows less of what was merged.
+fn record_merge(ledger: &links::Ledger, kept: &Path, linked: &Path, size: u64) {
+    let _ = ledger.add(&links::Merge { kept: shown(kept), linked: shown(linked), size, at: filetime_now() });
 }
 
 /// Why a merge does not start on a copy the Recycle Bin would not take.
@@ -6443,7 +7505,7 @@ enum Merged {
 
 impl Run {
     /// A merge: each group in turn, each switch written down on `page` first.
-    fn link_all(&mut self, plans: &[LinkPlan], page: &mut Page) -> Result<(), Stop> {
+    fn link_all(&mut self, plans: &[LinkPlan], page: &mut Page, how: &LinkHow) -> Result<(), Stop> {
         // Every copy is read whole, and once per group the file that stays.
         for p in plans {
             self.info.total_items += p.others.len() as u64;
@@ -6455,19 +7517,25 @@ impl Run {
         let mut buf = vec![0; HASH_BUF];
         for plan in plans {
             self.check()?;
-            self.link_group(plan, windows.as_deref(), &mut buf, page)?;
+            self.link_group(plan, windows.as_deref(), &mut buf, page, how)?;
         }
         Ok(())
     }
 
     /// Merges the copies of one group into the file it keeps, which is read
     /// once for all of them and held meanwhile, so that nobody writes to it.
-    fn link_group(&mut self, plan: &LinkPlan, windows: Option<&Path>, buf: &mut [u8], page: &mut Page) -> Result<(), Stop> {
+    fn link_group(&mut self, plan: &LinkPlan, windows: Option<&Path>, buf: &mut [u8], page: &mut Page, how: &LinkHow) -> Result<(), Stop> {
         let (keep, modified) = (&plan.keep.0, plan.keep.1);
         let base = self.info.done_bytes;
         self.info.current = Some(keep.to_string_lossy().into_owned());
         self.tick();
-        let kept = match open_for_link(keep, plan.size, modified, windows, false) {
+        // The file that stays must be one the rule allows too: what it is becomes what all of them are.
+        let refused = (self.settings.rule)(keep, plan.size, &how.markers).refusal(how.allow_programs);
+        let opened = match refused {
+            Some(why) => Err(why.to_string()),
+            None => open_for_link(keep, plan.size, modified, windows, false),
+        };
+        let kept = match opened {
             Ok(mut held) => match self.hash_whole(&mut held.file, plan.size, buf) {
                 Ok(hash) if hash == plan.hash => Ok(held),
                 Ok(_) => Err(Halt::Why(LINK_CHANGED.into())),
@@ -6496,15 +7564,17 @@ impl Run {
             let start = self.info.done_bytes;
             self.info.current = Some(other.0.to_string_lossy().into_owned());
             self.tick();
-            match self.link_one(&kept, plan, other, windows, buf, page) {
+            match self.link_one(&kept, plan, other, windows, buf, page, how) {
                 Ok(Merged::Binned) => {
                     self.handled += 1;
                     self.info.freed_bytes += plan.size;
+                    record_merge(&how.ledger, keep, &other.0, plan.size);
                 }
                 Ok(Merged::Left(temp, why)) => {
                     self.handled += 1;
                     let name = temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     self.error(&temp, format!("{LINK_LEFT}({name})을 휴지통에 넣지 못했어요: {why}"));
+                    record_merge(&how.ledger, keep, &other.0, plan.size);
                 }
                 Ok(Merged::Same) => self.handled += 1,
                 Err(Halt::Why(why)) => self.error(&other.0, why),
@@ -6519,6 +7589,7 @@ impl Run {
 
     /// Merges the copy at `path` into the file that stays (`kept`): steps 1
     /// to 4 above. Nothing is changed before the copy has been read whole.
+    #[allow(clippy::too_many_arguments)]
     fn link_one(
         &mut self,
         kept: &Held,
@@ -6527,10 +7598,15 @@ impl Run {
         windows: Option<&Path>,
         buf: &mut [u8],
         page: &mut Page,
+        how: &LinkHow,
     ) -> Result<Merged, Halt> {
         // Merged before: then it has the times of the file that stays, not its own.
         if key_at(path) == Some(kept.key) {
             return Ok(Merged::Same);
+        }
+        let verdict = (self.settings.rule)(path, plan.size, &how.markers);
+        if let Some(why) = verdict.refusal(how.allow_programs) {
+            return Err(Halt::Why(why.into()));
         }
         let mut copy = open_for_link(path, plan.size, *modified, windows, true).map_err(Halt::Why)?;
         if copy.key == kept.key {
@@ -6539,6 +7615,16 @@ impl Run {
         // The volume serials; tests take any two files for two volumes.
         if !self.settings.rename || copy.key.0 != kept.key.0 {
             return Err(Halt::Why(LINK_OTHER_DRIVE.into()));
+        }
+        // Its name would take on the attributes, owner and permissions of the file that stays.
+        let (Some(k), Some(c)) = (&kept.sharing, &copy.sharing) else { return Err(Halt::Why(links::LB_NO_SECURITY.into())) };
+        if let Some(why) = links::pair_refusal(k, c) {
+            // A model in a program's folder, asked for: asking does not help when the permissions differ.
+            let mine = match verdict {
+                links::Verdict::OptIn(_) => verdict,
+                _ => (self.settings.rule)(&plan.keep.0, plan.size, &how.markers),
+            };
+            return Err(Halt::Why(links::security_why(why, mine).into()));
         }
         if copy.links > 1 {
             return Err(Halt::Why(LINK_HAS_NAMES.into()));
@@ -6624,9 +7710,15 @@ impl Run {
     /// blake3 of all `size` bytes of `file`, read `buf` at a time into the
     /// job's bytes done.
     fn hash_whole(&mut self, file: &mut File, size: u64, buf: &mut [u8]) -> Result<[u8; 32], Halt> {
+        self.hash_whole_as(file, size, buf, (LINK_CHANGED, LINK_NO_READ))
+    }
+
+    /// `hash_whole`, telling a file shorter than `size` (it changed) and one
+    /// that cannot be read by these reasons.
+    fn hash_whole_as(&mut self, file: &mut File, size: u64, buf: &mut [u8], (changed, unread): (&str, &str)) -> Result<[u8; 32], Halt> {
         let failed = |e: io::Error| {
             // Shorter than it said: it changed meanwhile.
-            Halt::Why(if e.kind() == io::ErrorKind::UnexpectedEof { LINK_CHANGED.into() } else { format!("{LINK_NO_READ}: {}", reason(&e)) })
+            Halt::Why(if e.kind() == io::ErrorKind::UnexpectedEof { changed.into() } else { format!("{unread}: {}", reason(&e)) })
         };
         file.seek(SeekFrom::Start(0)).map_err(failed)?;
         let mut hasher = blake3::Hasher::new();
@@ -6712,6 +7804,11 @@ impl LinkBook {
     fn pages(&self) -> Vec<PathBuf> {
         let Ok(read) = std::fs::read_dir(&self.0) else { return Vec::new() };
         read.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect()
+    }
+
+    /// Where the merges done are written down: next to the book.
+    fn ledger(&self) -> links::Ledger {
+        links::Ledger::beside(&self.0)
     }
 }
 
@@ -6866,6 +7963,10 @@ fn mend_links(book: &LinkBook, bin: fn(&Path) -> Result<(), String>, events: imp
         let mend = read_switch(&mut file).map(|s| {
             // The page is in the app's data folder, which any program of this account can write.
             let mend = if switch_holds(&s, windows.as_deref()) { mend_link(&s, bin) } else { Mend::Lost(LINK_CUT_ODD.into()) };
+            // Merged after all: written down as the merge would have.
+            if matches!(mend, Mend::Finished | Mend::Left(_)) {
+                record_merge(&book.ledger(), &s.keep, &s.path, s.size);
+            }
             (s, mend)
         });
         if !matches!(mend, Some((_, Mend::Stuck(_)))) {
@@ -6963,5 +8064,367 @@ fn bin_refusal(why: Binless) -> String {
         Binless::Disabled => "이 드라이브는 휴지통을 쓰지 않도록 설정돼 있어요".into(),
         Binless::TooBig(max) => format!("휴지통보다 커요 (휴지통 최대 {}MB)", max >> 20),
         Binless::Unknown => "휴지통으로 옮길 수 있는지 확인할 수 없어요".into(),
+    }
+}
+
+// ---- v0.10.3: names of a hard-linked file made files of their own ---------------
+//
+// `start_unlink` (job op "unlink", the usual "job-progress" events, cancel
+// with `cancel_job`) takes names of files that have more than one (hard
+// links; `links::hardlinks_find` lists them) and makes each a file of its
+// own with the same content, times and attributes, so that a program that
+// writes to it no longer changes the others. For each name:
+//
+// 1. look, changing nothing: a plain file (no link or other reparse point,
+//    nothing only in the cloud) on a local fixed NTFS volume, with another
+//    name besides this one, none of its names in Windows's own folders
+//    (`links::protected`), and room on the drive for one more copy and
+//    SPACE_MARGIN;
+// 2. open the file through another of its names, so that nobody can write
+//    to it until this name is done, and copy it beside the name to a hidden
+//    `.name.ff-unlink` (CopyFileEx: data, alternate streams, attributes;
+//    never onto anything);
+// 3. read both whole (blake3) and compare them; give the copy the file's
+//    times, and its permissions where they are its own; write it all the
+//    way to the disk (the rename below is written through, the data not);
+// 4. right after checking the name still leads to the file, put the copy in
+//    its place in one step (MoveFileEx, replacing it, written through).
+//
+// Nothing is deleted and nothing goes to the Recycle Bin: what the name held
+// is still there under the file's other names. A copy whose name fails
+// anywhere before the end of step 4 is removed again (it is our own), and
+// the name is as it was. Merges in the ledger that are undone so are taken
+// out of it. Cancel works between names and while copying or reading.
+
+/// The hidden name a name's own copy has until it takes the name's place.
+const UNLINK_EXT: &str = ".ff-unlink";
+
+const NOTHING_TO_UNLINK: &str = "풀 파일이 없어요";
+const TOO_MANY_UNLINKS: &str = "한 번에 풀 수 있는 파일은 10,000개까지예요";
+const UNLINK_SYSTEM: &str = "Windows 시스템 폴더의 파일은 풀지 않아요";
+const UNLINK_NOT_LOCAL: &str = "이 컴퓨터에 붙은 NTFS 드라이브의 파일만 풀 수 있어요 (USB 메모리, 네트워크 드라이브 말고)";
+const UNLINK_NOT_PLAIN: &str = "링크나 특수한 파일이라서 풀지 않았어요";
+const UNLINK_CLOUD: &str = "온라인 전용 파일이라서 풀지 않았어요 (읽으면 내려받게 돼요)";
+const UNLINK_GONE: &str = "파일을 찾을 수 없어요";
+const UNLINK_LAST: &str = "다른 이름(하드 링크)이 없는 파일이라 풀 것이 없어요";
+const UNLINK_NO_OPEN: &str = "파일을 열 수 없어서 풀지 않았어요";
+const UNLINK_NO_READ: &str = "파일을 다 읽지 못해서 풀지 않았어요";
+const UNLINK_CHANGED: &str = "푸는 동안 파일이 바뀌어서 풀지 않았어요";
+const UNLINK_NO_COPY: &str = "복사본을 만들지 못해서 풀지 않았어요";
+const UNLINK_DIFFERENT: &str = "복사본이 원래 내용과 달라서 풀지 않았어요";
+const UNLINK_NO_SECURITY: &str = "권한 설정을 그대로 옮기지 못해서 풀지 않았어요";
+const UNLINK_NOT_PUT: &str = "복사본을 제자리에 놓지 못해서 풀지 않았어요";
+
+/// Makes each of `paths` (names of files with more than one) a file of its
+/// own (see above). Returns the id of the job (op "unlink") at once; a name
+/// it may not touch is turned down in the job, with why.
+#[tauri::command]
+pub async fn start_unlink(app: AppHandle, paths: Vec<String>) -> Result<u64, String> {
+    blocking(move || begin_unlink(paths, app, Settings::APP, links::Ledger::app())).await?
+}
+
+fn begin_unlink(paths: Vec<String>, events: impl Events, settings: Settings, ledger: links::Ledger) -> Result<u64, String> {
+    let mut seen = HashSet::new();
+    let paths: Vec<PathBuf> = paths.into_iter().filter(|p| seen.insert(p.trim_end_matches('\\').to_lowercase())).map(PathBuf::from).collect();
+    if paths.is_empty() {
+        return Err(NOTHING_TO_UNLINK.into());
+    }
+    if paths.len() > MAX_LINKS {
+        return Err(format!("{TOO_MANY_UNLINKS} (고른 파일 {}개)", paths.len()));
+    }
+    let dest = shown(&common_folder(&paths));
+    let run = new_job("unlink", false, Vec::new(), dest, events, settings);
+    launch(run, move |run| run.unlink_all(&paths, &ledger))
+}
+
+/// Whether the entry at `path` is on a local fixed NTFS volume, where it
+/// really is (a drive with a letter: `real_path`).
+fn local_ntfs(path: &Path) -> bool {
+    real_path(path).and_then(|real| volume(&real)).is_some_and(|v| v.fixed && v.fs.eq_ignore_ascii_case("NTFS"))
+}
+
+/// Opens a name of a file whose other name is to become a file of its own:
+/// to read it, with nobody writing to it meanwhile (no FILE_SHARE_WRITE),
+/// and to set its attributes where that is given. Replacing its other names
+/// still works (FILE_SHARE_DELETE).
+fn open_shared(path: &Path) -> io::Result<File> {
+    let open = |access: u32| {
+        OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(win::verbatim(path))
+    };
+    open(GENERIC_READ | FILE_WRITE_ATTRIBUTES).or_else(|e| match e.raw_os_error() {
+        Some(c) if c == ERROR_ACCESS_DENIED as i32 => open(GENERIC_READ),
+        _ => Err(e),
+    })
+}
+
+/// Why the name `path` could not be replaced (`e`). Windows says "denied"
+/// also when a program holds the file open without letting its names go,
+/// which a look with every kind of sharing tells apart.
+fn replace_reason(path: &Path, e: &io::Error) -> String {
+    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        let look = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(win::verbatim(path));
+        if let Err(held) = look
+            && held.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+        {
+            return reason(&held);
+        }
+    }
+    reason(e)
+}
+
+/// The times and attributes of the file open as `file`.
+fn basic_info(file: &File) -> Option<FILE_BASIC_INFO> {
+    let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as u32;
+    let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle() as HANDLE, FileBasicInfo, (&raw mut info).cast(), size) } != 0;
+    ok.then_some(info)
+}
+
+/// Sets on the file open as `file` (with FILE_WRITE_ATTRIBUTES) the times of
+/// `info` that are not 0, and its attributes unless they are 0. Whether
+/// that was done.
+fn put_basic(file: &File, info: &FILE_BASIC_INFO) -> bool {
+    let size = std::mem::size_of_val(info) as u32;
+    unsafe { SetFileInformationByHandle(file.as_raw_handle() as HANDLE, FileBasicInfo, (info as *const FILE_BASIC_INFO).cast(), size) != 0 }
+}
+
+/// Gives the file open as `file` the attributes `attrs` (those
+/// SetFileAttributes changes), its times as they are.
+fn put_attrs_open(file: &File, attrs: u32) -> bool {
+    let attrs = attrs & SETTABLE;
+    let info = FILE_BASIC_INFO { FileAttributes: if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs }, ..unsafe { std::mem::zeroed() } };
+    put_basic(file, &info)
+}
+
+impl Run {
+    /// An unlink: each name in turn.
+    fn unlink_all(&mut self, paths: &[PathBuf], ledger: &links::Ledger) -> Result<(), Stop> {
+        // Each name is copied once and read twice (`unlink_switch`).
+        let sizes: Vec<u64> = paths.iter().map(|p| std::fs::symlink_metadata(win::verbatim(p)).map_or(0, |m| file_len(&m))).collect();
+        self.info.total_items = paths.len() as u64;
+        self.info.total_bytes = sizes.iter().map(|s| s.saturating_mul(3)).sum();
+        self.publish();
+        self.speed = Speed::new();
+        let windows = known_folder(&FOLDERID_Windows);
+        let mut buf = vec![0; HASH_BUF];
+        let mut freed = HashSet::new();
+        // The files whose names were made files of their own in this job.
+        let mut split = HashSet::new();
+        let mut ended = Ok(());
+        for (path, &size) in paths.iter().zip(&sizes) {
+            if let Err(stop) = self.check() {
+                ended = Err(stop);
+                break;
+            }
+            let start = self.info.done_bytes;
+            self.info.current = Some(path.to_string_lossy().into_owned());
+            self.tick();
+            // The last name of a file whose other names this job made files of their own: one already.
+            let left = key_at(path).filter(|k| split.contains(k) && links::names_of(path).is_some_and(|n| n.len() == 1));
+            let done = match left {
+                Some(_) => Ok(()),
+                None => self.unlink_one(path, windows.as_deref(), &mut buf).map(|shared| {
+                    split.insert(shared);
+                }),
+            };
+            match done {
+                Ok(()) => {
+                    self.handled += 1;
+                    freed.insert(shown(path).to_lowercase());
+                    freed.extend(real_path(path).map(|p| shown(&p).to_lowercase()));
+                }
+                Err(Halt::Why(why)) => self.error(path, why),
+                Err(Halt::Stop) => {
+                    ended = Err(Stop);
+                    break;
+                }
+            }
+            self.info.done_bytes = start + size.saturating_mul(3);
+            self.info.done_items += 1;
+            self.tick();
+        }
+        // The merges written down that these names were in and that are undone now.
+        if !freed.is_empty() {
+            let named = |p: &str| freed.contains(&p.to_lowercase());
+            let _ = ledger.forget(|m| (named(&m.kept) || named(&m.linked)) && !links::still_linked(m));
+        }
+        ended
+    }
+
+    /// Makes the name `path` a file of its own: steps 1 to 4 above. Nothing
+    /// is changed before its copy has been compared. Gives which file it was
+    /// a name of, which keeps its other names.
+    fn unlink_one(&mut self, path: &Path, windows: Option<&Path>, buf: &mut [u8]) -> Result<dups::FileKey, Halt> {
+        let refuse = |why: &str| Halt::Why(why.into());
+        if !path.is_absolute() {
+            return Err(refuse(BAD_PATH));
+        }
+        // A share on the network (`\\server\share`) is told by its name, without asking the network.
+        if shown(path).starts_with(r"\\") {
+            return Err(refuse(UNLINK_NOT_LOCAL));
+        }
+        let lost = |e: io::Error| match e.kind() {
+            io::ErrorKind::NotFound => refuse(UNLINK_GONE),
+            _ => Halt::Why(format!("{UNLINK_NO_OPEN}: {}", reason(&e))),
+        };
+        let meta = std::fs::symlink_metadata(win::verbatim(path)).map_err(lost)?;
+        if !local_ntfs(path) {
+            return Err(refuse(UNLINK_NOT_LOCAL));
+        }
+        if links::protected(path, windows) {
+            return Err(refuse(UNLINK_SYSTEM));
+        }
+        if dups::online_only(meta.file_attributes()) {
+            return Err(refuse(UNLINK_CLOUD));
+        }
+        if kind_of(&meta) != Kind::File || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refuse(UNLINK_NOT_PLAIN));
+        }
+        // Every name of the file: none may be Windows's, and another must be left.
+        let names = links::names_of(path).ok_or_else(|| refuse(UNLINK_NO_OPEN))?;
+        if names.iter().any(|n| links::protected(Path::new(n), windows)) {
+            return Err(refuse(UNLINK_SYSTEM));
+        }
+        let me = key_at(path).ok_or_else(|| refuse(UNLINK_NO_OPEN))?;
+        let real = real_path(path).unwrap_or_else(|| path.to_path_buf());
+        let others: Vec<&String> = names.iter().filter(|n| !same_text(Path::new(n), &real)).collect();
+        if others.is_empty() {
+            return Err(refuse(UNLINK_LAST));
+        }
+        // Held through another name, so that this one can be replaced.
+        let mut opened = Err(io::Error::from(io::ErrorKind::NotFound));
+        for other in others {
+            opened = open_shared(Path::new(other));
+            if opened.is_ok() {
+                break;
+            }
+        }
+        let mut held = opened.map_err(|e| Halt::Why(format!("{UNLINK_NO_OPEN}: {}", reason(&e))))?;
+        let facts = dups::facts(&held).ok_or_else(|| refuse(UNLINK_NO_OPEN))?;
+        if facts.key != Some(me) {
+            return Err(refuse(UNLINK_CHANGED));
+        }
+        if facts.links < 2 {
+            return Err(refuse(UNLINK_LAST));
+        }
+        let need = facts.size.saturating_add(SPACE_MARGIN);
+        match win::free_space(path.parent().unwrap_or(path)) {
+            Some(free) if free >= need => {}
+            free => return Err(Halt::Why(no_room(path, need, free))),
+        }
+        let temp = self.unlink_copy(path, facts.size)?;
+        let done = self.unlink_switch(path, &temp, &mut held, &facts, buf);
+        // Our own copy, which did not get the name.
+        if done.is_err() && !gone(&temp) {
+            remove_partial(&temp);
+        }
+        done.map(|()| me)
+    }
+
+    /// Step 2: copies the file at `path` (`size` bytes) beside it under a
+    /// free hidden `.name.ff-unlink`, never onto anything (CopyFileEx, with
+    /// alternate streams and attributes). A copy cut short is removed.
+    fn unlink_copy(&mut self, path: &Path, size: u64) -> Result<PathBuf, Halt> {
+        let from = win::wide_path(path);
+        let base = self.info.done_bytes;
+        for n in 1..=PARTIAL_TRIES {
+            let Some(temp) = marked_name(path, true, UNLINK_EXT, n) else { break };
+            let mut p = CopyProgress::new(self, base, size, &temp, None);
+            let ok = unsafe {
+                CopyFileExW(from.as_ptr(), p.partial.as_ptr(), Some(copy_progress), (&raw mut p).cast(), null_mut(), COPY_FLAGS)
+            } != 0;
+            let err = io::Error::last_os_error();
+            if ok {
+                return Ok(temp);
+            }
+            // Once started, it is our own unfinished copy: the copy only begins on a name that was free.
+            if p.started {
+                remove_partial(&temp);
+            }
+            if self.check().is_err() || err.raw_os_error() == Some(ERROR_REQUEST_ABORTED as i32) {
+                return Err(Halt::Stop);
+            }
+            // One that is there already (another job's, one a crash left) is not ours to touch.
+            if !p.started && err.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(Halt::Why(format!("{UNLINK_NO_COPY}: {}", reason(&err))));
+        }
+        Err(Halt::Why(format!("{UNLINK_NO_COPY}: {NO_FREE_NAME}")))
+    }
+
+    /// Steps 3 and 4: the copy at `temp` compared with the file (`held`,
+    /// open through another of its names, `facts` what it said then), given
+    /// its times and its own permissions, and put in the place of `path`.
+    fn unlink_switch(&mut self, path: &Path, temp: &Path, held: &mut File, facts: &dups::Facts, buf: &mut [u8]) -> Result<(), Halt> {
+        // Our own copy, opened to write (to flush it, below): the read-only mark CopyFileEx gave
+        // it is off until it has the name, when it gets the file's attributes.
+        let attrs = unsafe { GetFileAttributesW(win::wide_path(temp).as_ptr()) };
+        if attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_READONLY != 0 {
+            put_attrs(temp, attrs & !FILE_ATTRIBUTE_READONLY);
+        }
+        // Held from here as well: nobody else writes to it until it has the name.
+        let mut copy = OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(win::verbatim(temp))
+            .map_err(|e| Halt::Why(format!("{UNLINK_NO_COPY}: {}", reason(&e))))?;
+        let copied = dups::facts(&copy).ok_or_else(|| Halt::Why(UNLINK_NO_COPY.into()))?;
+        if copied.size != facts.size || copied.key.is_none() || copied.key == facts.key {
+            return Err(Halt::Why(UNLINK_DIFFERENT.into()));
+        }
+        let texts = (UNLINK_CHANGED, UNLINK_NO_READ);
+        let theirs = self.hash_whole_as(held, facts.size, buf, texts)?;
+        let ours = self.hash_whole_as(&mut copy, facts.size, buf, texts)?;
+        if ours != theirs {
+            return Err(Halt::Why(UNLINK_DIFFERENT.into()));
+        }
+        // The file's times (CopyFileEx gives it only some of them); its attributes once it has the name.
+        let basic = basic_info(held).ok_or_else(|| Halt::Why(UNLINK_NO_OPEN.into()))?;
+        let times = FILE_BASIC_INFO {
+            CreationTime: basic.CreationTime,
+            LastAccessTime: basic.LastAccessTime,
+            LastWriteTime: basic.LastWriteTime,
+            ..unsafe { std::mem::zeroed() }
+        };
+        if !put_basic(&copy, &times) {
+            return Err(Halt::Why(format!("{UNLINK_NO_COPY}: {}", reason(&io::Error::last_os_error()))));
+        }
+        copy_own_security(held, temp).map_err(|e| Halt::Why(format!("{UNLINK_NO_SECURITY}: {}", reason(&e))))?;
+        // All of it on the disk before it takes the name: MOVEFILE_WRITE_THROUGH writes the rename
+        // through, not the copy's data, which a power cut right after could leave as zeros there.
+        copy.sync_all().map_err(|e| Halt::Why(format!("{UNLINK_NO_COPY}: {}", reason(&e))))?;
+        // A read-only file's names cannot be replaced: the mark (the file's, at every name) is off for the moment.
+        let read_only = facts.attrs & FILE_ATTRIBUTE_READONLY != 0;
+        if read_only && !put_attrs_open(held, facts.attrs & !FILE_ATTRIBUTE_READONLY) {
+            return Err(Halt::Why(format!("{UNLINK_NOT_PUT}: {}", reason(&io::Error::last_os_error()))));
+        }
+        // The name still leads to the file, right before it is replaced.
+        let moved = if key_at(path) != facts.key {
+            Err(Halt::Why(UNLINK_CHANGED.into()))
+        } else {
+            let (from, to) = (win::wide_path(temp), win::wide_path(path));
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+                Err(Halt::Why(format!("{UNLINK_NOT_PUT}: {}", replace_reason(path, &io::Error::last_os_error()))))
+            } else {
+                Ok(())
+            }
+        };
+        if read_only {
+            put_attrs_open(held, facts.attrs);
+        }
+        moved?;
+        // The name's own file now: the file's attributes, not hidden unless it was.
+        put_attrs_open(&copy, facts.attrs);
+        Ok(())
     }
 }

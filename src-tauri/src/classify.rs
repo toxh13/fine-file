@@ -273,23 +273,24 @@ fn is_dev(dirs: &[String], ext: &str) -> bool {
 
 // ---- cache --------------------------------------------------------------------
 
-/// Temporary and half-downloaded files, crash dumps.
+/// Temporary and half-downloaded files, crash dumps, and the app's own
+/// working copies (ops.rs: a copy being written, a merge's and an unlink's
+/// hidden `.name.ff-link` and `.name.ff-unlink`, which a crash can leave).
 fn is_temp_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "tmp" | "temp" | "crdownload" | "part" | "partial" | "download" | "ff-partial" | "dmp" | "mdmp"
+        "tmp" | "temp" | "crdownload" | "part" | "partial" | "download" | "ff-partial" | "ff-link" | "ff-unlink" | "dmp" | "mdmp"
     )
 }
 
 fn is_cache(dirs: &[String], ext: &str) -> bool {
-    is_temp_ext(ext)
-        || dirs.iter().any(|d| {
-            matches!(
-                d.as_str(),
-                "temp" | "tmp" | "임시" | "temporary internet files" | "crashdumps" | "crashpad" | "huggingface"
-            ) || d.contains("cache")
-                || d.contains("캐시")
-        })
+    is_temp_ext(ext) || dirs.iter().any(|d| is_cache_dir(d))
+}
+
+fn is_cache_dir(d: &str) -> bool {
+    matches!(d, "temp" | "tmp" | "임시" | "temporary internet files" | "crashdumps" | "crashpad" | "huggingface")
+        || d.contains("cache")
+        || d.contains("캐시")
 }
 
 // ---- game ---------------------------------------------------------------------
@@ -316,6 +317,25 @@ pub(crate) const GAME_DIRS: &[&str] = &[
     "pearl abyss",
     "krafton",
     "hoyoplay",
+    // Minecraft launchers, with the mod packs, instances and backups they keep.
+    "curseforge",
+    "modrinth",
+    "modrinthapp",
+    "com.modrinth.theseus",
+    "prismlauncher",
+    "polymc",
+    "multimc",
+    "atlauncher",
+    "gdlauncher",
+    "gdlauncher_carbon",
+    "ftba",
+    ".technic",
+    "tlauncher",
+    ".tlauncher",
+    "lunarclient",
+    ".lunarclient",
+    "minecraft launcher",
+    "minecraftlauncher",
 ];
 
 /// Whether a folder name (lower case) is a game store's, a launcher's or a
@@ -454,6 +474,158 @@ const DOCUMENT_DIRS: &[&str] = &["documents", "my documents", "desktop", "문서
 
 fn is_cloud_dir(d: &str) -> bool {
     d.starts_with("onedrive") || matches!(d, "dropbox" | "google drive" | "icloud drive" | "icloudrive" | "내 드라이브")
+}
+
+// ---- hard links ---------------------------------------------------------------
+//
+// Which duplicates may be merged into one file under two names (links.rs has
+// the rule; dups.rs shows it, ops.rs's merge keeps to it). A hard link is one
+// file: a program that rewrites it in place, changes its attributes or
+// permissions, or checks and repairs its own folder changes it under every
+// name. So only the user's own pictures, videos, music, archives, setup files,
+// PDFs and model files merge by themselves; a big model or archive in a
+// program's folder only when the user asks; anything a game, launcher, mod
+// pack, backup, code project, cache or Windows keeps, never.
+
+/// Where a file is, for merging duplicates into hard links. The first that
+/// holds wins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LinkPlace {
+    /// Windows's own folders (rule 1 of `category`).
+    System,
+    /// A game's, a launcher's, a mod pack's or a server pack's folder, an
+    /// instance's or a save's; `backup` when in a backup folder of one.
+    Game { backup: bool },
+    /// Rules 2 and 7.
+    Dev,
+    /// Rule 3, the Windows temp folder too, but not a Store app's own app
+    /// data (`Packages\<app>\LocalCache`).
+    Cache,
+    /// A backup folder anywhere (`Backup`, `백업`, `WindowsImageBackup`, File History).
+    Backup,
+    /// Program files and app data (`program_category`'s "program"); `below`
+    /// is how many folders the file is in below `AppData\Local` (`Roaming`,
+    /// `LocalLow`), `Program Files*` or `ProgramData`.
+    Program { below: usize },
+    /// The user's own folders: Downloads, Documents, Desktop, Pictures,
+    /// Videos, Music and cloud drives, in a user's folder (`Users\<name>`) or
+    /// at a drive's root; `below` is how many folders the file is in below that one.
+    User { below: usize },
+    Elsewhere,
+}
+
+/// What a file is, by its name, for merging duplicates into hard links.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LinkKind {
+    /// Settings, saves, worlds, databases, logs, scripts, virtual disks:
+    /// programs rewrite them in place.
+    Rewritten,
+    /// Documents, which get edited.
+    Document,
+    /// A model's weights (a `.bin` of 100 MB or more among them) or a zip,
+    /// 7z or iso archive: what two programs may each keep a copy of.
+    Bulky,
+    /// Pictures, video, sound, archives and disk images, setup files, PDFs:
+    /// written once and then only read.
+    Settled,
+    Other,
+}
+
+/// A `.bin` this big is a model's weights; a smaller one can be anything.
+const MODEL_BIN: u64 = 100 << 20;
+
+/// Folders of a mod pack, a server pack or a game's instance, whichever
+/// launcher made them (or none: one unpacked in Downloads).
+fn is_pack_dir(d: &str) -> bool {
+    matches!(
+        d,
+        "mods" | "modpacks" | "resourcepacks" | "shaderpacks" | "texturepacks" | "datapacks" | "saves" | "kubejs"
+            | "defaultconfigs" | "global_packs" | "crash-reports" | "minecraft" | "instances"
+    ) || ["modpack", "mod pack", "mod-pack", "server-pack", "serverpack", "server pack", "server_pack", "server-files", "serverfiles", "server files"]
+        .iter()
+        .any(|p| d.contains(p))
+}
+
+fn is_backup_dir(d: &str) -> bool {
+    d.contains("backup") || d.contains("백업") || matches!(d, "filehistory" | "file history")
+}
+
+/// The user's own folders, as `LinkPlace::User` has them.
+fn is_user_dir(d: &str) -> bool {
+    matches!(d, "downloads" | "download" | "다운로드")
+        || MEDIA_DIRS.contains(&d)
+        || DOCUMENT_DIRS.contains(&d)
+        || is_cloud_dir(d)
+}
+
+/// Where the file `path` (`name` its last part) is, for merging it with a
+/// copy into a hard link.
+pub(crate) fn link_place(path: &str, name: &str) -> LinkPlace {
+    let all = parts(path, name);
+    let name = all.last().map(String::as_str).unwrap_or_default();
+    let dirs = &all[..all.len().saturating_sub(1)];
+    let ext = extension(name);
+    match system_or_temp(&all, dirs, name, false) {
+        Some("system") => return LinkPlace::System,
+        Some(_) => return LinkPlace::Cache,
+        None => {}
+    }
+    if let Some(at) = dirs.iter().position(|d| is_game_dir(d) || is_pack_dir(d)) {
+        return LinkPlace::Game { backup: dirs[at..].iter().any(|d| is_backup_dir(d)) };
+    }
+    if is_dev(dirs, ext) || dirs.iter().any(|d| DEV_ROOTS.contains(&d.as_str())) {
+        return LinkPlace::Dev;
+    }
+    // `Packages\<app>\LocalCache` is where a Store app keeps its app data.
+    let cache = |(i, d): (usize, &String)| is_cache_dir(d) && !(d == "localcache" && i >= 2 && dirs[i - 2] == "packages");
+    if is_temp_ext(ext) || dirs.iter().enumerate().any(cache) {
+        return LinkPlace::Cache;
+    }
+    if dirs.iter().any(|d| is_backup_dir(d)) {
+        return LinkPlace::Backup;
+    }
+    // Folders below `dirs[root]`.
+    let below = |root: usize| dirs.len().saturating_sub(root + 1);
+    let top = dirs.first().map(String::as_str).unwrap_or_default();
+    if top.starts_with("program files") || top == "programdata" {
+        return LinkPlace::Program { below: below(0) };
+    }
+    if let Some(i) = dirs.iter().position(|d| d == "appdata") {
+        let area = dirs.get(i + 1).is_some_and(|d| matches!(d.as_str(), "local" | "roaming" | "locallow"));
+        return LinkPlace::Program { below: below(if area { i + 1 } else { i }) };
+    }
+    let at_top = |i: usize| i == 0 || (i == 2 && top == "users");
+    match dirs.iter().enumerate().find(|&(i, d)| at_top(i) && is_user_dir(d)) {
+        Some((i, _)) => LinkPlace::User { below: below(i) },
+        None => LinkPlace::Elsewhere,
+    }
+}
+
+/// What a file named `name` (any case) of `size` bytes is, for merging it
+/// with a copy into a hard link.
+pub(crate) fn link_kind(name: &str, size: u64) -> LinkKind {
+    let name = name.to_lowercase();
+    let ext = extension(&name);
+    let rewritten = matches!(
+        ext,
+        "json" | "json5" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "config" | "txt" | "md" | "csv" | "xml"
+            | "properties" | "prefs" | "plist" | "reg" | "dat" | "dat_old" | "db" | "db3" | "sqlite" | "sqlite3" | "db-wal"
+            | "db-shm" | "db-journal" | "wal" | "ldb" | "mdb" | "accdb" | "log" | "nbt" | "snbt" | "mca" | "mcr" | "sav"
+            | "save" | "bak" | "old" | "lock" | "bp" | "js" | "zs" | "lua" | "vdf" | "acf" | "pst" | "ost" | "vhd" | "vhdx"
+            | "vmdk" | "vdi" | "qcow2"
+    );
+    let model = matches!(ext, "gguf" | "ggml" | "safetensors" | "onnx" | "pt" | "pth" | "ckpt") || (ext == "bin" && size >= MODEL_BIN);
+    if rewritten {
+        LinkKind::Rewritten
+    } else if model || matches!(ext, "zip" | "7z" | "iso") {
+        LinkKind::Bulky
+    } else if is_media_ext(ext) || is_archive_ext(ext) || is_installer_ext(ext) || ext == "pdf" {
+        LinkKind::Settled
+    } else if is_document_ext(ext) {
+        LinkKind::Document
+    } else {
+        LinkKind::Other
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +771,8 @@ mod tests {
                 (r"C:\Users\me\Downloads\setup.tmp", F),
                 (r"C:\Users\me\Downloads\movie.mp4.crdownload", F),
                 (r"C:\Users\me\Downloads\.big.iso.ff-partial", F),
+                (r"C:\Users\me\Downloads\.model.gguf.ff-link", F),
+                (r"C:\Users\me\Videos\.clip.mkv.ff-unlink", F),
                 // A game's shader cache can go; the game stays.
                 (r"D:\SteamLibrary\steamapps\shadercache", D),
                 (r"C:\Program Files (x86)\Steam\appcache", D),
@@ -822,6 +996,97 @@ mod tests {
         assert_eq!(file_kind("index.ts", TS_VIDEO - 1), None);
         assert_eq!(file_kind("녹화.ts", TS_VIDEO), Some("video"));
         assert_eq!(file_kind("a.pdf", 0), Some("document"));
+    }
+
+    #[test]
+    fn minecraft_launchers_are_games() {
+        check(
+            &[
+                (r"C:\Users\me\curseforge", D),
+                (r"C:\Users\me\curseforge\minecraft\Instances\PS Homegrown - Sunlit Valley\mods\create.jar", F),
+                (r"C:\Users\me\curseforge\minecraft\Backups\pack\config\a.toml", F),
+                (r"C:\Users\me\AppData\Roaming\ModrinthApp\profiles\pack", D),
+                (r"C:\Users\me\AppData\Roaming\PrismLauncher\instances\x\.minecraft\saves", D),
+                (r"C:\Users\me\AppData\Roaming\.tlauncher", D),
+                (r"C:\Program Files (x86)\Minecraft Launcher", D),
+            ],
+            "game",
+        );
+    }
+
+    #[test]
+    fn where_files_are_for_hard_links() {
+        use LinkPlace::*;
+        let place = |path: &str| link_place(path, path.rsplit('\\').next().unwrap_or_default());
+        for (path, want) in [
+            (r"C:\Windows\WinSxS\amd64_x\a.dll", System),
+            (r"C:\Windows\Temp\a.zip", Cache),
+            // The packs and backups of the bug that made the rule.
+            (r"C:\Users\me\curseforge\minecraft\Instances\PS Homegrown - Sunlit Valley\config\portable_blueprints\a.bp", Game { backup: false }),
+            (r"C:\Users\me\curseforge\minecraft\Instances\PS Homegrown - Sunlit Valley\saves\W\portable_blueprints\a.bp", Game { backup: false }),
+            (r"C:\Users\me\curseforge\minecraft\Backups\Sunlit Valley\mods\jna-5.12.1.jar", Game { backup: true }),
+            (r"C:\Users\me\Downloads\Abyssal-Ascent-server-pack\libraries\jna-5.12.1.jar", Game { backup: false }),
+            (r"C:\Users\me\Downloads\Abyssal-Ascent-server-pack\server-icon.png", Game { backup: false }),
+            (r"D:\minecraft\world.zip", Game { backup: false }),
+            (r"D:\SteamLibrary\steamapps\common\Game\movie.mp4", Game { backup: false }),
+            (r"D:\GitHub\app\assets\logo.png", Dev),
+            (r"C:\Users\me\work\app\node_modules\x\a.png", Dev),
+            (r"C:\Users\me\.cache\huggingface\hub\m\model.safetensors", Cache),
+            (r"C:\Users\me\AppData\Local\Temp\x\a.zip", Cache),
+            (r"D:\Backup\2024\photo.jpg", Backup),
+            (r"C:\Users\me\Documents\백업\photo.jpg", Backup),
+            (r"C:\Users\me\AppData\Local\VideoTranslator\models\Qwen3-8B-Q4_K_M.gguf", Program { below: 2 }),
+            // A Store app's own app data is not a cache.
+            (r"C:\Users\me\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\VideoTranslator\models\Qwen3-8B-Q4_K_M.gguf", Program { below: 6 }),
+            (r"C:\Users\me\AppData\Local\Programs\REA\ghidra_11.2\Ghidra\lib\jna-5.12.1.jar", Program { below: 5 }),
+            (r"C:\Program Files\App\data.zip", Program { below: 1 }),
+            (r"C:\ProgramData\Vendor\a.iso", Program { below: 1 }),
+            (r"C:\Users\me\Downloads\photo.jpg", User { below: 0 }),
+            (r"C:\Users\me\Pictures\2024\trip\a.jpg", User { below: 2 }),
+            (r"C:\Users\me\OneDrive\사진\a.jpg", User { below: 1 }),
+            (r"C:\Users\Public\Desktop\a.pdf", User { below: 0 }),
+            (r"D:\사진\제주\a.jpg", User { below: 1 }),
+            (r"D:\Downloads\a.iso", User { below: 0 }),
+            // Not the user's own folders: a well-known name deep in another folder counts for nothing.
+            (r"D:\Anime\a.mkv", Elsewhere),
+            (r"D:\Tools\x\music\a.mp3", Elsewhere),
+            (r"C:\Users\me\a.mp4", Elsewhere),
+        ] {
+            assert_eq!(place(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn what_files_are_for_hard_links() {
+        use LinkKind::*;
+        for (name, size, want) in [
+            ("options.TXT", 10, Rewritten),
+            ("a.json", 10, Rewritten),
+            ("server.properties", 10, Rewritten),
+            ("level.dat", 10, Rewritten),
+            ("r.0.0.mca", 10, Rewritten),
+            ("x.bp", 10, Rewritten),
+            ("disk.vhdx", 10, Rewritten),
+            ("Qwen3-8B.gguf", 10, Bulky),
+            ("model.safetensors", 10, Bulky),
+            ("pytorch_model.bin", MODEL_BIN, Bulky),
+            ("pack.zip", 10, Bulky),
+            ("win.iso", 10, Bulky),
+            ("photo.jpg", 10, Settled),
+            ("clip.mkv", 10, Settled),
+            ("song.flac", 10, Settled),
+            ("old.rar", 10, Settled),
+            ("setup.exe", 10, Settled),
+            ("manual.pdf", 10, Settled),
+            ("report.docx", 10, Document),
+            ("공문.hwp", 10, Document),
+            ("small.bin", MODEL_BIN - 1, Other),
+            ("jna-5.12.1.jar", 10, Other),
+            ("a.dll", 10, Other),
+            ("README", 10, Other),
+        ] {
+            assert_eq!(link_kind(name, size), want, "{name}");
+        }
     }
 
     #[test]

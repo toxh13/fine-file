@@ -20,6 +20,7 @@ import {
 import { driveKey, formatDate, formatSize, normalizePath, shown } from "./format";
 import "./components.css";
 import "./v04.css";
+import "./v0103.css";
 
 // ---- dialog frame (shared by the v0.4 dialogs) ------------------------------------
 
@@ -162,12 +163,50 @@ const inWindows = (f: DupFile): boolean => f.category === "system";
 const inBin = (p: string): boolean => /^[a-z]:\\\$recycle\.bin(\\|$)/i.test(p.replace(/^\\\\\?\\/, ""));
 
 const APP_NOTE =
-  "프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일이에요. 지우면 그 프로그램이 동작하지 않을 수 있어서, 따로 켜지 않으면 자동 선택에서 빠져요. 두 프로그램이 각자 쓰는 파일이면 휴지통 대신 \"하드 링크로 합치기\"가 안전해요(고르지 않았어도 합칠지 물어요)";
+  "프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일이에요. 지우면 그 프로그램이 동작하지 않을 수 있어서, 따로 켜지 않으면 자동 선택에서 빠져요";
 
 const WINDOWS_NOTE = "Windows 폴더 안의 파일이에요. 자동 선택에서 늘 빠지고, 하드 링크로 합치지도 않아요";
 
 /** ops.rs's reason for a duplicate made into a link whose old copy did not go to the Recycle Bin. */
 const LINK_LEFT = "합쳤지만";
+
+// v0.10.3: what may become a hard link is the backend's rule (DupFile.link_block, the one
+// start_dup_link enforces): files of games, modpacks, launchers, programs, backups, Windows,
+// development trees and caches never are, nor settings and saves that programs rewrite in place.
+// 0.8.2 linked any equal files, and a modpack linked with its backups would not start until its
+// launcher downloaded the files again. The window only follows the rule (and says why per file).
+
+/** The link prompt's opt-in: big models and archives in program folders (DupFile.link_optin). */
+const OPTIN_LABEL = "프로그램 폴더 안의 큰 모델·압축 파일도 합치기";
+
+/**
+ * When merging is right, and when not: the link button's tooltip and the prompt. Pictures, video,
+ * sound and PDFs the rule allows wait for the prompt's box (EDITABLE), so they are not offered here.
+ */
+const LINK_FITS =
+  "같은 압축·설치 파일, 디스크 이미지, 모델 파일이 여러 폴더에 있을 때 알맞아요. 사진·영상·음악·PDF는 확인 창에서 따로 켜야 합쳐요";
+const LINK_NOT =
+  "게임·모드팩·프로그램·백업 폴더 안 파일, 설정·저장 파일은 합치지 않아요. 프로그램이 그런 파일을 고치거나 검사해서 다시 받으면 다른 쪽까지 바뀌거나 깨져요";
+
+/** Where merged files are made separate again. */
+const UNLINK_AT = '정리 ▾ → "하드 링크 찾기·풀기…"';
+
+const WINDOWS_REASON = "Windows 폴더 안 파일이라 합치지 않아요";
+const OTHER_DRIVE = "남길 파일과 드라이브가 달라서 합치지 않아요";
+/** An older backend that does not say what may be linked: nothing is. */
+const NO_RULE = "합쳐도 되는지 알 수 없어서 합치지 않아요";
+
+/** Why `f` is not made into a hard link now (null: it may be), with the opt-in on or off. */
+function linkRefusal(f: DupFile, programs: boolean): string | null {
+  if (inWindows(f)) return WINDOWS_REASON;
+  if (f.link_block === undefined) return NO_RULE;
+  if (f.link_block === null || (programs && f.link_optin)) return null;
+  return f.link_block;
+}
+
+/** The badge's tooltip for a file that is not linked by default (the opt-in's reason names its box). */
+const blockNote = (f: DupFile) =>
+  f.link_optin ? `${shown(f.link_block ?? "")}. 확인 창에서 켤 수 있어요` : shown(f.link_block ?? NO_RULE);
 
 /** Groups drawn at first; more on request (a big drive can have thousands). */
 const GROUP_PAGE = 100;
@@ -178,7 +217,10 @@ const GROUP_PAGE = 100;
  */
 const TRASH_CHUNK = 200;
 
-/** Files often edited in place, which hard links would tie together: the link prompt leaves them out unless ticked. */
+/**
+ * Files often edited in place, which hard links would tie together: the link prompt leaves them
+ * out unless ticked, also where the rule allows them.
+ */
 const EDITABLE = new Set<Category>(["document", "media"]);
 const editable = (f: DupFile): boolean => EDITABLE.has(f.category);
 
@@ -194,13 +236,6 @@ const KIND_LABEL: Record<Category, string> = {
   archive: "압축·설치 파일",
   personal: "사용자 폴더의 다른 파일",
   other: "그 밖의 파일",
-};
-
-/** What stays in each group under a rule, for the link prompt. */
-const RULE_KEEPS: Record<Rule, string> = {
-  newest: "가장 최신 파일",
-  oldest: "가장 오래된 파일",
-  shortest: "경로가 가장 짧은 파일",
 };
 
 type Rule = "newest" | "oldest" | "shortest";
@@ -298,15 +333,12 @@ interface Picked {
   unseen: number;
 }
 
-/** What goes into a hard-link plan besides the files chosen, as the link prompt's boxes say. */
+/** What goes into a hard-link plan of the files chosen, as the link prompt's boxes say. */
 interface LinkOptions {
   /** The rule of the auto-select the selection still is (its keeper stays), else null. */
   rule: Rule | null;
-  /**
-   * Also the files not chosen in program and app-data folders (not Windows'), which auto-select
-   * leaves alone: two programs' copies of one model stay usable as links, so this is safe for them.
-   */
-  app: boolean;
+  /** The opt-in (OPTIN_LABEL): big models and archives in program folders too (DupFile.link_optin). */
+  programs: boolean;
   /** Also documents and media (EDITABLE), which are often edited in place. */
   editable: boolean;
 }
@@ -319,13 +351,11 @@ interface LinkPlan {
   bytes: number;
   /** Of the groups, those not drawn now (below "묶음 더 보기"). */
   unseen: number;
-  /** Files left out: in a Windows folder, or to be linked to a file in one. */
-  windows: number;
-  /** Files left out: on another drive than the file that stays. */
-  otherDrive: number;
-  /** Files not chosen in program folders that could be merged (in `files` with `app`), and their groups. */
-  appFiles: number;
-  appGroups: number;
+  /** Chosen files left out by the rule (linkRefusal), on another drive, or with no file to stay: by reason, most first. */
+  left: [string, number][];
+  leftFiles: number;
+  /** Of `files`, those only the opt-in lets in (it or the file it is linked to). */
+  programs: number;
   /** Documents and media chosen that could be merged (in `files` with `editable`). */
   editable: number;
   /** Of `files`, how many of each kind (KIND_LABEL), most first. */
@@ -334,25 +364,26 @@ interface LinkPlan {
 
 /**
  * The file a group keeps when merged: the rule's keeper while the selection is as auto-select
- * made it; else the newest file not chosen (of all, when every one is), never one in Windows'
- * folders. None when only such files could stay.
+ * made it; else the newest file not chosen (of all, when every one is). Only a file the rule lets
+ * be linked (linkRefusal), so never one in Windows' folders: the copies are linked to it, so it is
+ * bound as much as they are. None when no such file could stay.
  */
-function linkKeeper(g: DupGroup, selected: Set<string>, rule: Rule | null): DupFile | undefined {
+function linkKeeper(g: DupGroup, selected: Set<string>, rule: Rule | null, programs: boolean): DupFile | undefined {
+  const ok = (f: DupFile) => linkRefusal(f, programs) === null;
   if (rule) {
     const k = keeperOf(g, rule);
     const f = g.files.find((x) => x.path === k);
-    if (f && !selected.has(f.path) && !inWindows(f)) return f;
+    if (f && !selected.has(f.path) && ok(f)) return f;
   }
   const free = g.files.filter((f) => !selected.has(f.path));
-  const pool = (free.length ? free : g.files).filter((f) => !inWindows(f));
+  const pool = (free.length ? free : g.files).filter(ok);
   return pool.length ? pool.reduce((b, f) => (f.modified > b.modified ? f : b)) : undefined;
 }
 
 /**
- * The selection as hard links: each group keeps one file (linkKeeper) and each chosen one becomes
- * a link to it. With `app`, so do the files not chosen in program folders (the ones auto-select
- * skips), also in groups where nothing is chosen ("newest stays", or the rule's keeper). Documents
- * and media only with `editable`. Groups with nothing to merge are left alone.
+ * The selection as hard links: each group keeps one file (linkKeeper) and each chosen one the
+ * rule lets be linked becomes a link to it; the others stay as they are, counted by reason.
+ * Documents and media only with `editable`. Files not chosen are never merged.
  */
 function linkPlanOf(groups: DupGroup[], selected: Set<string>, drawn: number, o: LinkOptions): LinkPlan {
   const plan: LinkPlan = {
@@ -360,51 +391,51 @@ function linkPlanOf(groups: DupGroup[], selected: Set<string>, drawn: number, o:
     files: 0,
     bytes: 0,
     unseen: 0,
-    windows: 0,
-    otherDrive: 0,
-    appFiles: 0,
-    appGroups: 0,
+    left: [],
+    leftFiles: 0,
+    programs: 0,
     editable: 0,
     kinds: [],
   };
   const kinds = new Map<string, number>();
+  const left = new Map<string, number>();
+  const leave = (why: string, n = 1) => {
+    left.set(why, (left.get(why) ?? 0) + n);
+    plan.leftFiles += n;
+  };
+  // Only the opt-in lets it be linked.
+  const optin = (f: DupFile) => linkRefusal(f, false) !== null;
   groups.forEach((g, i) => {
     const sel = g.files.filter((f) => selected.has(f.path));
-    // Not chosen, in a program's folder: what auto-select spares.
-    const spared = g.files.filter((f) => !selected.has(f.path) && inAppFolder(f) && !inWindows(f));
-    if (!sel.length && !spared.length) return;
-    const keep = linkKeeper(g, selected, o.rule);
+    if (!sel.length) return;
+    const keep = linkKeeper(g, selected, o.rule, o.programs);
     if (!keep) {
-      plan.windows += sel.length >= g.files.length ? sel.length - 1 : sel.length;
+      // Nothing may stay to be linked to: what would have, says why (every copy chosen: one stays).
+      const stays = g.files.find((f) => !selected.has(f.path)) ?? g.files[0];
+      const why = linkRefusal(stays, o.programs) ?? NO_RULE;
+      leave(`남길 파일을 합칠 수 없어요: ${why}`, sel.length >= g.files.length ? sel.length - 1 : sel.length);
       return;
     }
     const others: string[] = [];
-    let extra = 0;
-    for (const f of [...sel, ...spared]) {
+    for (const f of sel) {
       if (f === keep) continue;
-      const chosen = selected.has(f.path);
-      if (inWindows(f)) {
-        plan.windows++;
+      const why = linkRefusal(f, o.programs);
+      if (why !== null) {
+        leave(why);
         continue;
       }
       if (driveKey(f.path) !== driveKey(keep.path)) {
-        if (chosen || o.app) plan.otherDrive++;
+        leave(OTHER_DRIVE);
         continue;
       }
-      if (!chosen) {
-        extra++;
-        if (!o.app) continue;
-      } else if (editable(f)) {
+      if (editable(f)) {
         plan.editable++;
         if (!o.editable) continue;
       }
       others.push(f.path);
+      if (optin(f) || optin(keep)) plan.programs++;
       const kind = KIND_LABEL[f.category] ?? KIND_LABEL.other;
       kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
-    }
-    if (extra) {
-      plan.appFiles += extra;
-      plan.appGroups++;
     }
     if (!others.length) return;
     plan.groups.push({ keep: keep.path, others });
@@ -413,6 +444,7 @@ function linkPlanOf(groups: DupGroup[], selected: Set<string>, drawn: number, o:
     if (i >= drawn) plan.unseen++;
   });
   plan.kinds = [...kinds].sort((a, b) => b[1] - a[1]);
+  plan.left = [...left].sort((a, b) => b[1] - a[1]);
   return plan;
 }
 
@@ -425,10 +457,9 @@ interface LinkRun {
   adopted?: boolean;
 }
 
-/** The link prompt as it opens: the rule of the selection, and whether its program-folder box starts ticked. */
+/** The link prompt as it opens: the rule of the selection. Its boxes start off. */
 interface LinkAsk {
   rule: Rule | null;
-  app: boolean;
 }
 
 export function Duplicates({
@@ -739,7 +770,7 @@ export function Duplicates({
     const notes: string[] = [];
     if (spared > 0) {
       notes.push(
-        `프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일 ${spared.toLocaleString()}개는 지우면 그 프로그램이 동작하지 않을 수 있어서 고르지 않았어요. 휴지통으로 같이 보내려면 위의 "프로그램·앱 데이터 폴더 안 파일도 자동으로 고르기"를 켜세요. 두 프로그램이 각자 쓰는 파일(모델·설치 파일 등)이면 고르지 않은 채로 "하드 링크로 합치기"를 누르세요. 이 파일들도 같이 합칠지 묻고, 합쳐도 두 경로 모두 그대로 열려요.`,
+        `프로그램·게임·개발 도구·앱 데이터 폴더 안의 파일 ${spared.toLocaleString()}개는 지우면 그 프로그램이 동작하지 않을 수 있어서 고르지 않았어요. 휴지통으로 같이 보내려면 위의 "프로그램·앱 데이터 폴더 안 파일도 자동으로 고르기"를 켜세요.`,
       );
     }
     if (appPicked > 0) {
@@ -788,11 +819,10 @@ export function Duplicates({
     return { paths, bytes, groups: touched, app, windows, unseen };
   }, [groups, selected, limit]);
 
-  // Whether "하드 링크로 합치기" has anything to offer: with every box of its prompt ticked.
-  const linkAny = useMemo(
-    () => linkPlanOf(groups, selected, limit, { rule: autoRule, app: true, editable: true }).files > 0,
-    [groups, selected, limit, autoRule],
-  );
+  // "하드 링크로 합치기" takes the files chosen only (v0.10.3: not those auto-select spared in
+  // program folders), so it waits for a choice; its prompt says what of it may be merged and why
+  // the rest may not.
+  const linkAny = picked.paths.length > 0;
 
   const wasted = groups.reduce((s, g) => s + g.size * (g.files.length - 1), 0);
   const fileCount = groups.reduce((s, g) => s + g.files.length, 0);
@@ -867,7 +897,8 @@ export function Duplicates({
     setTrashStopping(true);
   };
 
-  const doLink = async (plan: LinkPlan) => {
+  /** `programs`: the prompt's opt-in (OPTIN_LABEL), which start_dup_link is told too. */
+  const doLink = async (plan: LinkPlan, programs: boolean) => {
     setLinkConfirm(null);
     if (trashing || linkRun.current || !plan.groups.length) return;
     linkRun.current = { search: job.current, groups: plan.groups };
@@ -878,7 +909,7 @@ export function Duplicates({
     setNotice(null);
     try {
       await jobListening.current;
-      const id = await v082.startDupLink(plan.groups, job.current);
+      const id = await v082.startDupLink(plan.groups, job.current, programs);
       if (!alive.current) return;
       linkId.current = id;
       // Events that came before the id did.
@@ -958,7 +989,7 @@ export function Duplicates({
     } else if (!known) {
       text = `하드 링크로 합쳤어요${freed}. 합치지 못한 파일이 많아서 다 보여 드릴 수 없어요. ${again}`;
     } else if (merged.size) {
-      text = `하드 링크로 ${merged.size.toLocaleString()}개를 합쳤어요${freed}`;
+      text = `하드 링크로 ${merged.size.toLocaleString()}개를 합쳤어요${freed}. 다시 따로 만들려면 ${UNLINK_AT}의 "fine-file이 합친 파일"에서 풀면 돼요`;
     } else {
       text = "하드 링크로 합친 파일이 없어요";
     }
@@ -1140,10 +1171,15 @@ export function Duplicates({
         {!report && noticeBox}
 
         {!progress && !error && (
-          <p className="muted v04-intro">
-            크기가 같은 파일을 먼저 고르고, 앞부분과 전체 내용을 차례로 비교해서 내용이 똑같은 파일만 보여 줘요. 스캔한
-            드라이브에서만 찾을 수 있어요.
-          </p>
+          <>
+            <p className="muted v04-intro">
+              크기가 같은 파일을 먼저 고르고, 앞부분과 전체 내용을 차례로 비교해서 내용이 똑같은 파일만 보여 줘요. 스캔한
+              드라이브에서만 찾을 수 있어요.
+            </p>
+            <p className="muted v04-intro">
+              하드 링크로 합치기는 {LINK_FITS}. {LINK_NOT}. 그런 파일은 목록에 "링크 안 됨"으로 보여요.
+            </p>
+          </>
         )}
 
         {progress && !report && (
@@ -1263,6 +1299,12 @@ export function Duplicates({
                             {inWindows(f) ? "Windows 폴더" : "프로그램 폴더"}
                           </span>
                         )}
+                        {/* The backend's reason it is not linked (with the opt-in: the prompt's box). */}
+                        {f.link_block !== null && (
+                          <span className={`v04-tag nolink${f.link_optin ? " optin" : ""}`} title={blockNote(f)}>
+                            링크 안 됨
+                          </span>
+                        )}
                         {on ? (
                           <span className="v04-tag del">고른 파일</span>
                         ) : (
@@ -1303,14 +1345,11 @@ export function Duplicates({
             title={
               !linkable
                 ? `하드 링크는 NTFS 드라이브에서만 만들 수 있어요 (이 드라이브: ${fs})`
-                : "고른 파일을 남기는 파일의 하드 링크로 바꿔요(고르지 않은 프로그램 폴더 안 파일도 합칠지 물어요). 두 위치 모두 그대로 쓸 수 있고 데이터는 한 번만 저장돼요"
+                : !linkAny
+                  ? "합칠 파일을 먼저 고르세요"
+                  : `고른 파일 중 합쳐도 되는 파일만 남기는 파일의 하드 링크로 바꿔요. 두 위치 모두 그대로 쓸 수 있고 데이터는 한 번만 저장돼요. ${LINK_FITS}`
             }
-            onClick={() =>
-              linkAny &&
-              // Auto-select spared the program files: merging is what they were spared for. With
-              // nothing chosen, they are all there is to merge.
-              setLinkConfirm({ rule: autoRule, app: autoRule !== null || selected.size === 0 })
-            }
+            onClick={() => linkAny && setLinkConfirm({ rule: autoRule })}
           >
             {linking ? "합치는 중…" : "하드 링크로 합치기"}
           </button>
@@ -1337,7 +1376,7 @@ export function Duplicates({
           drawn={limit}
           ask={linkConfirm}
           onCancel={() => setLinkConfirm(null)}
-          onConfirm={(plan) => doLink(plan)}
+          onConfirm={(plan, programs) => doLink(plan, programs)}
         />
       )}
     </Dialog>
@@ -1386,7 +1425,7 @@ function TrashConfirm({ c, onCancel, onConfirm }: { c: Picked; onCancel(): void;
               </p>
               <p>
                 지우면 그 프로그램이 실행되지 않거나, 설정·저장한 데이터·내려받은 모델 같은 파일을 다시 받아야 할 수 있어요.
-                두 프로그램이 각자 쓰는 같은 파일이면 휴지통 대신 "하드 링크로 합치기"를 쓰세요.
+                무엇인지 모르는 파일이면 고르지 마세요.
               </p>
             </>
           )}
@@ -1411,9 +1450,10 @@ function TrashConfirm({ c, onCancel, onConfirm }: { c: Picked; onCancel(): void;
 }
 
 /**
- * The "하드 링크로 합치기" prompt: what it does, in plain words, and what it frees. Its boxes add to
- * the files chosen those auto-select spared in program folders, and the documents and media
- * chosen (left out at first: merged, editing one copy changes the other).
+ * The "하드 링크로 합치기" prompt: what it does, in plain words, what it frees, and what of the files
+ * chosen it leaves out and why (the backend's rule). Its boxes add the big models and archives of
+ * program folders (the opt-in, off at first) and the documents and media chosen (left out at
+ * first: merged, editing one copy changes the other).
  */
 function LinkConfirm({
   groups,
@@ -1428,17 +1468,21 @@ function LinkConfirm({
   drawn: number;
   ask: LinkAsk;
   onCancel(): void;
-  onConfirm(plan: LinkPlan): void;
+  onConfirm(plan: LinkPlan, programs: boolean): void;
 }) {
-  const [app, setApp] = useState(ask.app);
+  const [programs, setPrograms] = useState(false);
   const [edit, setEdit] = useState(false);
   const plan = useMemo(
-    () => linkPlanOf(groups, selected, drawn, { rule: ask.rule, app, editable: edit }),
-    [groups, selected, drawn, ask.rule, app, edit],
+    () => linkPlanOf(groups, selected, drawn, { rule: ask.rule, programs, editable: edit }),
+    [groups, selected, drawn, ask.rule, programs, edit],
+  );
+  // What the opt-in would add: its box shows only when there is any.
+  const withPrograms = useMemo(
+    () => linkPlanOf(groups, selected, drawn, { rule: ask.rule, programs: true, editable: true }).programs,
+    [groups, selected, drawn, ask.rule],
   );
   const tooMany = plan.files > LINK_MAX;
   const ok = plan.files > 0 && !tooMany;
-  const keeps = ask.rule ? RULE_KEEPS[ask.rule] : "고르지 않은 파일 중 가장 최신 파일";
   return (
     <Dialog className="dup-confirm" title="하드 링크로 합칠까요?" onClose={onCancel} onBackdrop={onCancel}>
       <h3>하드 링크로 합칠까요?</h3>
@@ -1448,23 +1492,42 @@ function LinkConfirm({
           비우면 최대 <b>{formatSize(plan.bytes)}</b> 비어요(합치지 못한 파일은 빼고).
         </p>
       ) : (
-        <p>합칠 파일이 없어요. 아래 상자를 켜거나 다른 파일을 고르세요.</p>
+        <p>고른 파일 중 하드 링크로 합칠 수 있는 파일이 없어요.</p>
       )}
       {plan.kinds.length > 0 && (
         <p className="muted">합칠 파일: {plan.kinds.map(([k, n]) => `${k} ${n.toLocaleString()}개`).join(" · ")}</p>
       )}
-      {plan.appFiles > 0 && (
-        <div className="dup-confirm-opt">
-          <label className="dup-check">
-            <input type="checkbox" checked={app} onChange={(e) => setApp(e.target.checked)} />
-            고르지 않은 프로그램·앱 데이터 폴더 안 파일 {plan.appFiles.toLocaleString()}개(묶음{" "}
-            {plan.appGroups.toLocaleString()}개)도 합치기
-          </label>
-          <p className="muted">
-            자동 선택이 지우지 않으려고 빼 둔 파일이에요(두 프로그램이 각자 받은 모델·설치 파일 같은). 합쳐도 두 경로 모두
-            그대로 열려서, 읽기만 하는 파일이면 프로그램도 그대로 동작해요. 묶음마다 {keeps}이 남아요. 끄면 이 파일들은
-            그대로 둬요.
+      {plan.leftFiles > 0 && (
+        <div className="dup-caveat dup-confirm-left">
+          <p>
+            고른 파일 중 <b>{plan.leftFiles.toLocaleString()}개</b>는 합치지 않아요. 그대로 두거나, 필요 없는 사본이면
+            휴지통으로 보내세요.
           </p>
+          <ul>
+            {plan.left.slice(0, 6).map(([why, n]) => (
+              <li key={why}>
+                {n.toLocaleString()}개: {shown(why)}
+              </li>
+            ))}
+            {plan.left.length > 6 && <li>그 밖의 이유로 {plan.left.slice(6).reduce((s, [, n]) => s + n, 0).toLocaleString()}개</li>}
+          </ul>
+        </div>
+      )}
+      {withPrograms > 0 && (
+        <div className="v04-error dup-confirm-app">
+          <p>
+            고른 파일 중 <b>{withPrograms.toLocaleString()}개</b>는 프로그램·앱 데이터 폴더 안의 큰 모델·압축 파일이에요.{" "}
+            {programs ? "같이 합쳐요." : "켜지 않으면 합치지 않아요."}
+          </p>
+          <p>
+            합치면 두 프로그램이 한 파일을 같이 써요. 한 프로그램이 업데이트하면서 그 파일을 고치거나 바꾸면 다른 프로그램의
+            파일도 같이 바뀌고, 그 프로그램이 파일을 검사해서 다시 받을 수도 있어요. 모델·압축 파일 말고 다른 프로그램 파일은
+            켜도 합치지 않아요. 이상하면 {UNLINK_AT}로 다시 따로 만들 수 있어요.
+          </p>
+          <label className="dup-check">
+            <input type="checkbox" checked={programs} onChange={(e) => setPrograms(e.target.checked)} />
+            {OPTIN_LABEL} <span className="warn">(주의)</span>
+          </label>
         </div>
       )}
       {plan.editable > 0 && (
@@ -1483,10 +1546,12 @@ function LinkConfirm({
         <li>두 위치 모두 그대로 쓸 수 있고, 데이터는 한 번만 저장돼요.</li>
         <li>합치기 전에 두 파일의 내용을 처음부터 끝까지 다시 비교해요. 다르거나 찾은 뒤에 바뀐 파일은 건드리지 않아요.</li>
         <li>합친 파일 자리에 있던 사본은 휴지통으로 가요. 휴지통을 비우면 공간이 생겨요.</li>
-        <li>같은 드라이브(NTFS)에 있는 파일끼리만 돼요.</li>
+        <li>같은 드라이브(NTFS)에 있고 권한·속성이 같은 파일끼리만 돼요.</li>
         <li>
-          <b>합친 뒤에는 한쪽을 고치면 다른 쪽도 같이 바뀌어요.</b> 모델·설치 파일처럼 읽기만 하는 파일에 알맞아요.
+          <b>합친 뒤에는 한쪽을 고치면 다른 쪽도 같이 바뀌어요.</b> {LINK_FITS}.
         </li>
+        <li>{LINK_NOT}.</li>
+        <li>합친 파일은 기록해 두어서, {UNLINK_AT}의 "fine-file이 합친 파일"에서 언제든 다시 따로 만들 수 있어요.</li>
       </ul>
       <p className="muted">
         묶음마다 고르지 않은 파일이 남고, 합칠 파일은 그 파일을 가리키는 하드 링크가 돼요. 합친 파일의 날짜·속성은 남기는
@@ -1498,14 +1563,6 @@ function LinkConfirm({
           있어요.
         </p>
       )}
-      {plan.windows > 0 && (
-        <p className="dup-caveat">
-          Windows 폴더 안의 파일(또는 그런 파일과 합쳐야 하는 파일) {plan.windows.toLocaleString()}개는 합치지 않아요.
-        </p>
-      )}
-      {plan.otherDrive > 0 && (
-        <p className="dup-caveat">남기는 파일과 드라이브가 다른 {plan.otherDrive.toLocaleString()}개는 합치지 않아요.</p>
-      )}
       {tooMany && (
         <p className="v04-error">
           한 번에 합칠 수 있는 파일은 {LINK_MAX.toLocaleString()}개까지예요. 고른 파일을 줄인 뒤에 다시 눌러 주세요.
@@ -1515,7 +1572,7 @@ function LinkConfirm({
         <button onClick={onCancel} autoFocus={!ok}>
           취소
         </button>
-        <button className="primary" autoFocus={ok} disabled={!ok} onClick={() => onConfirm(plan)}>
+        <button className="primary" autoFocus={ok} disabled={!ok} onClick={() => onConfirm(plan, programs)}>
           합치기
         </button>
       </div>

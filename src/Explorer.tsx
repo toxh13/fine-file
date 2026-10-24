@@ -38,6 +38,7 @@ import { contentsNote, HelperPane, useHelper, type HelperTarget } from "./AiPane
 import { AiSettings } from "./AiSettings";
 import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
+import { Hardlinks } from "./Hardlinks";
 import { FileTable, type ChangeCell, type Column, type RiskCell, type ScoreCell, type SortKey } from "./FileTable";
 import { GridView, gridStep } from "./GridView";
 import { HELP_TIPS } from "./Help";
@@ -541,6 +542,8 @@ const riskKnown = (key: string) => {
 /** A dialog of this tab (the trash question has its own state). */
 type TabDialog =
   | { kind: "dups" }
+  // v0.10.3: files with more than one name, found on disk and made separate again.
+  | { kind: "hardlinks" }
   | { kind: "relocs" }
   | { kind: "relocate"; source: Entry }
   // v0.6: the AI settings, the plans, one plan (the AI panel is the side pane's 정리 도우미 now).
@@ -1945,8 +1948,8 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     if (mapShown) setMapNonce((n) => n + 1);
   };
 
-  // "위치 보기" in the duplicate finder: the file's folder opens here with the file selected, in a
-  // view that shows the selection.
+  // "위치 보기" in the duplicate finder (and the hard-link finder): the file's folder opens here
+  // with the file selected, in a view that shows the selection.
   const revealFile = (file: string) => {
     const dir = parentOf(file);
     setDialog(null);
@@ -2832,6 +2835,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       <button role="menuitem" disabled={!path} onClick={() => openDialog({ kind: "dups" })} {...tip("dups")}>
         <MenuRow check={false} icon={null} label="중복 파일 찾기…" />
       </button>
+      <button role="menuitem" onClick={() => openDialog({ kind: "hardlinks" })} {...tip("hardlinks")}>
+        <MenuRow check={false} icon={null} label="하드 링크 찾기·풀기…" />
+      </button>
       <button role="menuitem" onClick={() => openDialog({ kind: "programs" })} {...tip("programs")}>
         <MenuRow check={false} icon={null} label="프로그램 정리…" />
       </button>
@@ -3657,6 +3663,10 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
       {/* The search runs over the folder shown when it opened; closing it cancels a search that runs. */}
       {dialog?.kind === "dups" && (
         <Duplicates scope={path} drives={p.drives} onClose={() => setDialog(null)} onReveal={revealFile} />
+      )}
+      {/* v0.10.3. It starts in the folder shown; undoing runs as a job (the job list shows it). */}
+      {dialog?.kind === "hardlinks" && (
+        <Hardlinks scope={path} drives={p.drives} onClose={() => setDialog(null)} onReveal={revealFile} />
       )}
       {dialog?.kind === "relocs" && <Relocations onClose={() => setDialog(null)} />}
       {dialog?.kind === "relocate" && (

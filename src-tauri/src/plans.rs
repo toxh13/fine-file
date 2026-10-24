@@ -2553,11 +2553,12 @@ fn each_below(ix: &Index, top: u32, top_path: &str, mut visit: impl FnMut(u32, &
     }
 }
 
-/// ops' working names (`.x.ff-partial`, `x.ff-old`, ...): a copy or a
-/// relocation may be using them right now.
+/// ops' working names (`.x.ff-partial`, `x.ff-old`, ...): a copy, a
+/// relocation, a merge into hard links (`.x.ff-link`) or an unlink
+/// (`.x.ff-unlink`) may be using them right now.
 fn is_ops_name(name: &str) -> bool {
     let name = name.to_lowercase();
-    [".ff-partial", ".ff-relocating", ".ff-restoring", ".ff-old"].iter().any(|m| name.contains(m))
+    [".ff-partial", ".ff-relocating", ".ff-restoring", ".ff-old", ".ff-link", ".ff-unlink"].iter().any(|m| name.contains(m))
 }
 
 fn trash_step(path: String, size: u64, risk: &str, reason: String) -> PlanStep {
@@ -3653,6 +3654,9 @@ mod tests {
                 (r"Users\me\AppData\Local\Temp\old.tmp", false, 5 * MB, 5 * MB, 3),
                 (r"Users\me\AppData\Local\Temp\fresh\x.bin", false, 2 * MB, 2 * MB, 0),
                 (r"Users\me\AppData\Local\Temp\.a.ff-partial", false, MB, MB, 3),
+                // An unlink's and a merge's working copies, which the job may be using right now.
+                (r"Users\me\Downloads\.model.gguf.ff-unlink", false, 5 * GB, 5 * GB, 3),
+                (r"Users\me\Downloads\.clip.mkv.ff-link", false, GB, GB, 3),
                 (r"Users\me\AppData\Local\Google\Chrome\User Data\Default\Cache\data_1", false, 30 * MB, 30 * MB, 2),
                 (r"Users\me\AppData\Local\Package Cache\{guid}\setup.msi", false, 40 * MB, 40 * MB, 400),
                 (r"Users\me\Downloads\tool-setup.exe", false, 80 * MB, 80 * MB, 60),
@@ -3758,7 +3762,7 @@ mod tests {
 
     #[test]
     fn dedupe_keeps_the_newest_copy_that_is_no_programs() {
-        let file = |path: &str, modified: i64, category: &'static str| DupFile { path: path.into(), modified, category };
+        let file = |path: &str, modified: i64, category: &'static str| DupFile { path: path.into(), modified, category, link_block: None, link_optin: false };
         let groups = vec![
             DupGroup {
                 size: 10 * MB,

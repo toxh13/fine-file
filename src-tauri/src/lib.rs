@@ -5,6 +5,7 @@ mod diff;
 mod dups;
 mod index;
 mod judge;
+mod links;
 mod mapview;
 mod mcp;
 mod meaning;
@@ -1669,6 +1670,9 @@ pub fn run() {
             ops::relocations,
             ops::undo_relocate,
             ops::start_dup_link,
+            ops::start_unlink,
+            links::hardlinks_find,
+            links::link_ledger,
             admin::admin_session_start,
             admin::admin_session_status,
             admin::admin_session_stop,

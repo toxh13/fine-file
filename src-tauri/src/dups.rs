@@ -12,11 +12,17 @@
 //! of one file (hard links) are one file, not duplicates. What was left out
 //! is counted in the events' detail.
 //!
+//! Each file found says whether it may be merged with its copies into hard
+//! links (DupFile.link_block, link_optin: the rule of links.rs, which the
+//! merge keeps to): asked once a group is complete, from the paths and from
+//! what each file's attributes and permissions are, which opens no file for
+//! reading.
+//!
 //! Every std::fs call goes through `win::verbatim`, so a name ending in a dot
 //! or a space is that name and not its neighbour without the dot.
 
 use crate::index::{Index, FLAG_DELETED, FLAG_DIR, FLAG_HARDLINK, FLAG_NOT_LINK, FLAG_REPARSE};
-use crate::win;
+use crate::{links, win};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -82,10 +88,19 @@ pub struct DupFile {
     pub modified: i64,
     /// The file's category ("program", "game", "system", ...): "system",
     /// "program", "game" or "dev" whenever the folders it is in are such
-    /// (`classify::program_category`, app data counted as "program"), else
-    /// `classify::category`. The window keeps automatic picks away from
-    /// those four.
+    /// (`classify::program_category`, app data counted as "program"), and
+    /// "game" for a mod pack's or a server pack's folder outside a launcher's
+    /// too (`links::in_game`), else `classify::category`. The window keeps
+    /// automatic picks away from those four.
     pub category: &'static str,
+    /// Why it may not be merged into a hard link (links.rs, as the merge
+    /// asks it): where it is, what it is, or that its attributes, owner,
+    /// permissions or volume go with none of the others that may be. None:
+    /// it may.
+    pub link_block: Option<&'static str>,
+    /// `link_block` is that of a big model or archive in a program's folder,
+    /// which the user may ask to merge (`start_dup_link`'s `allow_programs`).
+    pub link_optin: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -330,6 +345,7 @@ fn new_run(events: impl Events, scanned: usize, settings: Settings) -> (u64, Arc
         wasted: AtomicU64::new(0),
         skipped: Default::default(),
         last_event: Mutex::new(None),
+        markers: links::Markers::default(),
     });
     (id, run)
 }
@@ -391,6 +407,8 @@ struct Run {
     /// Files left out, by `Skip::slot`.
     skipped: [AtomicU64; 3],
     last_event: Mutex<Option<Instant>>,
+    /// What folders hold, for the link rule (`links::judge_group`).
+    markers: links::Markers,
 }
 
 impl Run {
@@ -454,7 +472,7 @@ impl Run {
             }
             // The quick hash read all of a small file: that match is final.
             if size <= WHOLE {
-                small.push(group(&cands, size, hash, files));
+                small.push(group(&cands, size, hash, files, &self.markers));
             } else {
                 big.push((size, files));
             }
@@ -522,7 +540,7 @@ impl Run {
         let found = by_hash
             .into_iter()
             .filter(|(_, f)| f.len() >= 2)
-            .map(|(hash, f)| group(cands, size, hash, f))
+            .map(|(hash, f)| group(cands, size, hash, f, &self.markers))
             .collect();
         self.add(found);
         Ok(())
@@ -809,13 +827,23 @@ fn category_of(path: &str, name: &str) -> &'static str {
     crate::classify::program_category(path, name, false).unwrap_or_else(|| crate::classify::category(path, name, false))
 }
 
-fn group(cands: &[Candidate], size: u64, hash: [u8; 32], files: Vec<usize>) -> DupGroup {
+fn group(cands: &[Candidate], size: u64, hash: [u8; 32], files: Vec<usize>, markers: &links::Markers) -> DupGroup {
     let file = |c: &Candidate| {
         let name = c.path.rsplit('\\').next().unwrap_or(&c.path);
-        DupFile { path: c.path.clone(), modified: c.modified, category: category_of(&c.path, name) }
+        DupFile { path: c.path.clone(), modified: c.modified, category: category_of(&c.path, name), link_block: None, link_optin: false }
     };
     let mut files: Vec<DupFile> = files.into_iter().map(|i| file(&cands[i])).collect();
     files.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let judged = links::judge_group(&paths, size, markers);
+    for (f, (block, optin)) in files.iter_mut().zip(judged) {
+        (f.link_block, f.link_optin) = (block, optin);
+        // A mod pack or a server pack outside a launcher's folder (one unpacked in Downloads) is a
+        // game's too: automatic picks leave it alone, as they do a launcher's.
+        if !matches!(f.category, "system" | "program" | "game" | "dev") && links::in_game(Path::new(&f.path), markers) {
+            f.category = "game";
+        }
+    }
     DupGroup { size, hash: blake3::Hash::from(hash).to_hex().to_string(), files }
 }
 
@@ -969,6 +997,8 @@ mod tests {
         assert_eq!(report.detail.as_deref(), Some(detail));
         let named = |f: &DupFile| category_of(&f.path, f.path.rsplit('\\').next().unwrap());
         assert!(report.groups.iter().flat_map(|g| &g.files).all(|f| f.category == named(f)));
+        // The link rule's say on each (links.rs): the temp folder is app data and a cache.
+        assert!(report.groups.iter().flat_map(|g| &g.files).all(|f| f.link_block == Some(links::LB_CACHE) && !f.link_optin));
     }
 
     #[test]

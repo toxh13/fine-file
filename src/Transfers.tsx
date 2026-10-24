@@ -12,6 +12,7 @@ const OP_LABEL: Record<JobInfo["op"], string> = {
   relocate: "다른 드라이브로 옮기기",
   restore: "되돌리기",
   link: "하드 링크로 합치기",
+  unlink: "하드 링크 풀기",
 };
 
 const STATE_LABEL: Record<JobInfo["state"], string> = {
@@ -146,9 +147,28 @@ function announceLink(j: JobInfo, toast: Toast) {
   }
 }
 
+/** v0.10.3: names a hard-link undo made into files of their own (those it went through, less those that went wrong). */
+const unlinked = (j: JobInfo) => Math.max(0, j.done_items - errorCount(j));
+
+/** A hard-link undo's end. */
+function announceUnlink(j: JobInfo, toast: Toast) {
+  const errors = errorCount(j);
+  if (j.state === "done" && errors === 0) {
+    toast(`하드 링크를 풀었어요: 파일 ${unlinked(j).toLocaleString()}개가 독립된 파일이 됐어요`);
+  } else if (j.state === "done") {
+    toast(
+      `하드 링크를 풀었어요: 파일 ${unlinked(j).toLocaleString()}개. ${errors.toLocaleString()}개는 풀지 못했어요. 이유는 작업 목록에 있어요`,
+      "error",
+    );
+  } else if (j.state === "failed") {
+    toast(`하드 링크 풀기 실패: ${j.errors[0]?.[1] ?? "알 수 없는 오류"}`, "error");
+  }
+}
+
 /** One toast when a job ends; a cancel is the user's own doing and needs none. */
 function announce(j: JobInfo, toast: Toast) {
   if (j.op === "link") return announceLink(j, toast);
+  if (j.op === "unlink") return announceUnlink(j, toast);
   const op = OP_LABEL[j.op];
   const errors = errorCount(j);
   if (j.state === "done" && errors === 0) {
@@ -409,18 +429,23 @@ function JobRow({ j, cancelling, errorsOpen, lost, onLostAnswer, onCancel, onDis
   const active = isActive(j.state);
   const items = `${j.done_items.toLocaleString()} / ${j.total_items.toLocaleString()} 항목`;
   let meta: string;
+  // An unlink counts each name's size three times (copied once, read twice), also for names it
+  // turns down: its bytes and speed are not what it copies, only its fraction and time left hold.
+  const bytes = j.op !== "unlink";
   if (active) {
     const eta = etaOf(j);
     meta = [
       items,
-      j.total_bytes > 0 ? `${formatSize(j.done_bytes)} / ${formatSize(j.total_bytes)}` : null,
-      j.state === "running" && j.speed_bps > 0 ? `${formatSize(j.speed_bps)}/s` : null,
+      bytes && j.total_bytes > 0 ? `${formatSize(j.done_bytes)} / ${formatSize(j.total_bytes)}` : null,
+      bytes && j.state === "running" && j.speed_bps > 0 ? `${formatSize(j.speed_bps)}/s` : null,
       eta !== null ? `약 ${formatEta(eta)} 남음` : null,
     ]
       .filter(Boolean)
       .join(" · ");
   } else if (j.state === "done" && j.op === "link") {
     meta = `파일 ${linkMerged(j).toLocaleString()}개 합침 · ${linkFreed(j)}`;
+  } else if (j.state === "done" && j.op === "unlink") {
+    meta = `파일 ${unlinked(j).toLocaleString()}개를 따로 만듦`;
   } else if (j.state === "done") {
     meta = `${j.done_items.toLocaleString()}개 항목 · ${formatSize(j.done_bytes)}`;
   } else if (j.op === "link" && (j.freed_bytes ?? 0) > 0) {
@@ -433,8 +458,8 @@ function JobRow({ j, cancelling, errorsOpen, lost, onLostAnswer, onCancel, onDis
     <div className={`job ${j.state}`}>
       <div className="job-top">
         <span className="job-title" title={j.dest ? shown(j.dest) : undefined}>
-          {/* A hard-link job has no destination; its folder, when it names one, is where it works. */}
-          {j.op === "link"
+          {/* A hard-link job (and its undo) has no destination; its folder, when it names one, is where it works. */}
+          {j.op === "link" || j.op === "unlink"
             ? j.dest
               ? `${OP_LABEL[j.op]} · ${shown(baseName(j.dest) || j.dest)}`
               : OP_LABEL[j.op]

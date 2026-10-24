@@ -1,0 +1,85 @@
+/* v0.10.3: the duplicate finder's "링크 안 됨", hard links found and undone (Hardlinks.tsx). */
+
+/* Not made into a hard link by the backend's rule; with the opt-in, it may (a warning colour). */
+.v04-tag.nolink {
+  background: var(--hover);
+  color: var(--muted);
+}
+
+.v04-tag.nolink.optin,
+.v04-tag.outside {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+/* What the link prompt leaves out, by reason. */
+.dup-confirm-left p {
+  margin: 0;
+}
+
+.dup-confirm-left ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.dup-confirm-app .warn {
+  font-weight: 400;
+}
+
+.modal.v04-dialog.hardlinks {
+  width: 900px;
+  height: calc(100vh - 48px);
+  max-height: 760px;
+}
+
+/* Windows' own links: shown, never offered. */
+.hl-group.protected .dup-file {
+  opacity: 0.6;
+}
+
+.hl-group-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.hl-note {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* The ledger: one merge a row. */
+.hl-rec {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px 6px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.hl-rec:first-child {
+  border-top: none;
+}
+
+.hl-rec .dup-file-name {
+  flex: 1;
+}
+
+.hl-rec-meta {
+  flex: none;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.hl-list {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}

@@ -117,8 +117,11 @@ export const events = {
 
 export interface JobInfo {
   id: number;
-  /** "link": duplicates made into hard links (v082.startDupLink). */
-  op: "copy" | "move" | "relocate" | "restore" | "link";
+  /**
+   * "link": duplicates made into hard links (v082.startDupLink). "unlink" (v0.10.3): names of a
+   * hard-linked file made into files of their own (links.unlink).
+   */
+  op: "copy" | "move" | "relocate" | "restore" | "link" | "unlink";
   state: "running" | "waiting" | "done" | "failed" | "cancelled";
   dest: string;
   total_bytes: number;
@@ -239,6 +242,17 @@ export interface DupFile {
   modified: number;
   /** classify.rs's category of the file, so automatic picks keep away from what programs need. */
   category: Category;
+  /**
+   * v0.10.3: why this file may not be made into a hard link, a short Korean sentence ("게임·모드팩
+   * 폴더 안 파일이라 합치지 않아요 …"); null: it may. The same rule start_dup_link enforces, which
+   * also turns down a pair whose owners, permissions or attributes differ (said per file then).
+   */
+  link_block: string | null;
+  /**
+   * v0.10.3: blocked (`link_block`) unless start_dup_link is sent `allowPrograms`: a big model or
+   * archive in a program or app-data folder ("프로그램 폴더 안의 큰 모델·압축 파일도 합치기").
+   */
+  link_optin: boolean;
 }
 
 export interface DupGroup {
@@ -711,8 +725,78 @@ export const v082 = {
    * `dup`: the search the groups come from (DupReport.id); null, the newest that has them. Every
    * path must be in that search's result, each group's in one of its groups, at most
    * LINK_MAX copies: else it rejects (Korean) and nothing starts. Resolves with the job id.
+   * v0.10.3: a file whose DupFile.link_block applies (the file that stays, too) is turned down in
+   * the job, with that reason, unless it is `link_optin` and `allowPrograms` is true. Each merge
+   * done goes in the ledger (links.ledger).
    */
-  startDupLink: (groups: DupLinkGroup[], dup: number | null) => invoke<number>("start_dup_link", { groups, dup }),
+  startDupLink: (groups: DupLinkGroup[], dup: number | null, allowPrograms = false) =>
+    invoke<number>("start_dup_link", { groups, dup, allowPrograms }),
+};
+
+// ---- v0.10.3: hard links found on disk and undone (Hardlinks.tsx), the record of merges -------
+
+/** One file with more than one name (hard link), as hardlinks_find found it. */
+export interface HardlinkGroup {
+  /** Stands for the file within one result. */
+  id: string;
+  size: number;
+  /** FILETIME. */
+  modified: number;
+  /** Every name of the file, the drive in front, also those outside the folder searched. */
+  paths: string[];
+  /** Per name of `paths`: under the folder searched. */
+  inside: boolean[];
+  /** fine-file merged it (the ledger has it). Merges before 0.10.3 were not recorded. */
+  by_fine_file: boolean;
+  /** A name is in a Windows system place (WinSxS and the like): never offered for unlinking. */
+  protected: boolean;
+}
+
+export interface HardlinkScan {
+  root: string;
+  /** Files looked at. */
+  scanned: number;
+  /** It stopped at its cap (some 300,000 files): there may be more. */
+  truncated: boolean;
+  groups: HardlinkGroup[];
+}
+
+/** A merge fine-file made ("하드 링크로 합치기"), from 0.10.3 on. */
+export interface LinkRecord {
+  /** The file that stayed. */
+  kept: string;
+  /** The copy that became a name of it. */
+  linked: string;
+  size: number;
+  /** When (FILETIME). */
+  at: number;
+  /** The two names are still one file. */
+  still_linked: boolean;
+}
+
+/** Names one start_unlink takes at most (ops.rs MAX_LINKS, as for LINK_MAX). */
+export const UNLINK_MAX = LINK_MAX;
+
+/** Room an unlink leaves free on a drive besides its copies (ops.rs SPACE_MARGIN, 1 GiB). */
+export const UNLINK_SPARE = 1024 ** 3;
+
+export const links = {
+  /**
+   * Walks `root` on disk (not the index) for files with more than one name, and lists all their
+   * names. Rejects (Korean) when the folder cannot be read.
+   */
+  find: (root: string) => invoke<HardlinkScan>("hardlinks_find", { root }),
+  /**
+   * Makes each of `paths` a file of its own: its data copied beside it, compared, then put in its
+   * place; the file's other names keep the original. Nothing is deleted. A job of ops.rs (op
+   * "unlink", "job-progress" events); a name it may not touch (Windows' own, the file's last name,
+   * not on a local NTFS drive, no room for its copy and UNLINK_SPARE) is turned down in the job with
+   * the reason. More than UNLINK_MAX names: it rejects (Korean) and nothing starts. Resolves with
+   * the job id.
+   */
+  unlink: (paths: string[]) => invoke<number>("start_unlink", { paths }),
+  /** Every merge recorded, as it is on disk now (`still_linked`). */
+  ledger: () => invoke<LinkRecord[]>("link_ledger"),
 };
 
 // ---- v0.9: AI 검색 — search by meaning (Explorer.tsx's search box, ai.jevFind) ----------

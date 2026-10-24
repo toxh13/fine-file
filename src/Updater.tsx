@@ -231,6 +231,8 @@ interface Busy {
   relocations: number;
   /** This window's merges of duplicates into hard links (Duplicates.tsx) not over yet. */
   links: number;
+  /** v0.10.3: this window's hard-link undos (Hardlinks.tsx) not over yet. */
+  unlinks: number;
   /** The ids of those jobs: the ones the user is told about (lib.rs update_prepare stops only these). */
   jobIds: number[];
   /** A plan is run or undone (by this window, unless others.plan)... */
@@ -252,6 +254,7 @@ async function busyNow(): Promise<Busy> {
     transfers: going.filter((j) => j.op === "copy" || j.op === "move").length,
     relocations: going.filter((j) => j.op === "relocate" || j.op === "restore").length,
     links: going.filter((j) => j.op === "link").length,
+    unlinks: going.filter((j) => j.op === "unlink").length,
     jobIds: going.map((j) => j.id),
     plan: running !== undefined,
     planId: running?.id ?? null,
@@ -260,7 +263,8 @@ async function busyNow(): Promise<Busy> {
 }
 
 /** Work of this window the update stops (as closing the window does) once the user agrees. */
-const stopsWork = (b: Busy) => b.transfers > 0 || b.relocations > 0 || b.links > 0 || (b.plan && !b.others.plan);
+const stopsWork = (b: Busy) =>
+  b.transfers > 0 || b.relocations > 0 || b.links > 0 || b.unlinks > 0 || (b.plan && !b.others.plan);
 
 /** Why the update cannot be installed now: work in another window the installer would cut short. */
 const blockedBy = (b: Busy) => (b.others.plan ? PLAN_ELSEWHERE : b.others.relocation ? RELOCATION_ELSEWHERE : null);
@@ -553,6 +557,11 @@ function InstallConfirm({ version, busy, onCancel, onGo }: { version: string; bu
   if (busy.links > 0) {
     warns.push(
       `중복 파일을 하드 링크로 합치는 중이에요${busy.links > 1 ? ` (${busy.links}개)` : ""}. 업데이트하면 취소해요. 이미 합친 파일은 합친 채로 남고, 합치던 파일은 마저 합치거나 손대지 않은 채로 멈춰요.`,
+    );
+  }
+  if (busy.unlinks > 0) {
+    warns.push(
+      "하드 링크를 풀어 독립된 파일로 만드는 중이에요. 업데이트하면 취소해요. 이미 푼 파일은 따로인 채로 남고, 풀던 파일은 마저 풀거나 링크인 채로 두고 멈춰요.",
     );
   }
   if (busy.plan && !busy.others.plan) {

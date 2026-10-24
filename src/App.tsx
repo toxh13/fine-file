@@ -192,6 +192,9 @@ function jobDirs(op: JobInfo["op"], dest: string, sources: string[]): (string | 
 
 const movesDrives = (op: JobInfo["op"]) => op === "relocate" || op === "restore";
 
+/** A job that changes how much room drives have: a move between drives, or a hard-link undo (v0.10.3), which copies. */
+const changesRoom = (op: JobInfo["op"]) => movesDrives(op) || op === "unlink";
+
 /** Plans proposed over MCP (by the Claude app, from another process) waiting to be looked at. */
 const mcpDrafts = (list: Plan[]) => list.filter((p) => p.source === "mcp" && p.state === "draft").length;
 
@@ -636,8 +639,8 @@ export default function App() {
             ended.current.set(j.id, j);
             if (ended.current.size > 20) ended.current.delete(ended.current.keys().next().value!);
             broadcast(changesOf([j.dest]));
-            // A move between drives changes how much room both have.
-            if (movesDrives(j.op)) refreshDrives().catch(() => {});
+            // A move between drives changes how much room both have; a hard-link undo takes some.
+            if (changesRoom(j.op)) refreshDrives().catch(() => {});
           }
           return;
         }
