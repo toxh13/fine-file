@@ -3672,6 +3672,13 @@ mod tests {
             let shut = "D:P(D;;RC;;;OW)(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
             let shut_one = if unreadable.is_empty() { folder.clone() } else { folder.join(unreadable) };
             put_sddl(&shut_one, shut);
+            // An account the deny does not stop (an elevated CI runner whose token owns or may
+            // back up the folder) still reads its permissions: nothing to test there.
+            if open_itself(&shut_one, READ_CONTROL, false).and_then(|f| Security::of(&f, true)).is_ok() {
+                eprintln!("{name}: this account reads permissions denied to the owner; skipped");
+                put_sddl(&shut_one, KEPT_TO_ITSELF);
+                continue;
+            }
             let job = relocate_in(&t, &folder, &other, ACROSS).unwrap();
             assert_eq!(job.state, "failed", "{name}: {:?}", job.errors);
             let why = &job.errors.last().unwrap().1;

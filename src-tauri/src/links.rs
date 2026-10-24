@@ -598,7 +598,15 @@ fn find_links(root: &Path, most: usize, ledger: &Ledger) -> Result<HardlinkScan,
     let root_text = |p: &Path| format!("{}\\", ops::shown(p).trim_end_matches('\\').to_lowercase());
     let roots = [Some(root_text(root)), std::fs::canonicalize(win::verbatim(root)).ok().map(|r| root_text(&r))];
     let windows = win::known_folder_path(&windows_sys::Win32::UI::Shell::FOLDERID_Windows);
-    let made: HashSet<String> = ledger.read().iter().map(|m| text_of(&m.linked)).collect();
+    // The names found are long ones; a merge recorded under a short (8.3) name is made long first.
+    let made: HashSet<String> = ledger
+        .read()
+        .iter()
+        .map(|m| match m.linked.contains('~') {
+            true => text_of(&win::try_long_path(&m.linked).unwrap_or_else(|| m.linked.clone())),
+            false => text_of(&m.linked),
+        })
+        .collect();
     let mut seen = HashSet::new();
     let mut groups = Vec::new();
     for (path, facts) in files.iter().zip(looked) {
