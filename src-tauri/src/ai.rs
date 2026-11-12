@@ -1,7 +1,7 @@
 //! Optional AI connection. Everything in the app works without it.
 //!
-//! Providers: Claude API, OpenAI API, any OpenAI-compatible API and Gemini
-//! API (user's own keys), Ollama (local), the user's installed Claude Code
+//! Providers: Claude API, OpenAI API, an OpenAI-compatible API at an address
+//! the user gives (key kept per address), Gemini API (user's own keys), Ollama (local), the user's installed Claude Code
 //! CLI, Codex CLI or OpenCode CLI; and a judge for risk
 //! scores and AI 검색 (judge.rs): TypeSafe jev, or a model in the user's
 //! own Ollama for those without a paid AI. Keys live in the Windows
@@ -72,19 +72,19 @@ const RISKS: [&str; 3] = ["safe", "caution", "danger"];
 const AI_OFF: &str = "AI가 꺼져 있어요. 설정에서 AI 제공자를 먼저 골라 주세요";
 const UNKNOWN_PROVIDER: &str = "알 수 없는 AI 제공자예요";
 const BAD_PATH: &str = "경로가 올바르지 않아요 (C:\\... 처럼 드라이브 문자로 시작하는 경로만 써요)";
-const CUT_OFF: &str = "AI의 답이 너무 길어 중간에 끊겼어요. 더 작은 폴더에서 다시 해 보세요";
-const EMPTY_ANSWER: &str = "AI의 답이 비어 있어요";
+pub(crate) const CUT_OFF: &str = "AI의 답이 너무 길어 중간에 끊겼어요. 더 작은 폴더에서 다시 해 보세요";
+pub(crate) const EMPTY_ANSWER: &str = "AI의 답이 비어 있어요";
 const NOT_A_PLAN: &str = "AI의 답을 계획으로 읽을 수 없어요";
 const BAD_OLLAMA_URL: &str = "Ollama 주소는 http:// 나 https:// 로 시작해야 해요 (예: http://localhost:11434)";
 const JUDGE_OFF: &str = "AI 판정(위험도 배지)이 꺼져 있어요. 설정에서 켜 주세요";
 
 /// Longest answer, plan and request a model gets or gives.
-const MAX_TOKENS: u32 = 16_000;
+pub(crate) const MAX_TOKENS: u32 = 16_000;
 /// Waits for an answer: a long plan can take minutes; Ollama runs on this PC and may be slower.
-const ASK_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 const OLLAMA_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const JEV_TIMEOUT: Duration = Duration::from_secs(90);
-const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 /// Tries after the first for 429 and 5xx answers (and dropped connections).
 const RETRIES: u32 = 3;
@@ -265,7 +265,7 @@ pub fn ai_providers() -> Vec<String> {
 }
 
 /// Model names as the providers write them: `gpt-5.6-luna`, `qwen3:8b`, `hf.co/user/model:Q4_K_M`.
-fn model_name_ok(m: &str) -> bool {
+pub(crate) fn model_name_ok(m: &str) -> bool {
     (1..=128).contains(&m.len()) && m.chars().all(|c| c.is_ascii_alphanumeric() || "._:-/@+".contains(c))
 }
 
@@ -371,7 +371,7 @@ pub(crate) fn scrub(message: String, key: &str) -> String {
 // ---- text helpers ------------------------------------------------------------------
 
 /// One line of at most `max` characters, control characters made spaces.
-fn clean_text(s: &str, max: usize) -> String {
+pub(crate) fn clean_text(s: &str, max: usize) -> String {
     let flat: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -956,7 +956,7 @@ fn plan_schema() -> Value {
 }
 
 /// task: "explain" | "structure" | "rename"
-fn request_for(task: &str, summary: &str) -> Result<Request, String> {
+pub(crate) fn request_for(task: &str, summary: &str) -> Result<Request, String> {
     let (head, schema) = match task {
         "explain" => (EXPLAIN_TASK.to_string(), None),
         "structure" => (format!("{STRUCTURE_TASK}\n{PLAN_RULES}"), Some(plan_schema())),
@@ -973,6 +973,8 @@ struct Reply {
     status: u16,
     body: String,
     retry_after: Option<u64>,
+    /// The `location` header: where a 3xx answer sends the request.
+    location: Option<String>,
 }
 
 /// An agent for a request to `url`. One to this PC (a local Ollama) goes
@@ -985,14 +987,23 @@ fn agent(url: &str, timeout: Duration) -> ureq::Agent {
 
 /// `agent` with the proxy the environment names (if it names one).
 fn agent_through(url: &str, timeout: Duration, proxy: Option<ureq::Proxy>) -> ureq::Agent {
+    agent_builder(url, timeout, proxy).build().into()
+}
+
+fn agent_builder(url: &str, timeout: Duration, proxy: Option<ureq::Proxy>) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_connect(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .user_agent(concat!("fine-file/", env!("CARGO_PKG_VERSION")))
         .proxy(proxy.filter(|_| !on_this_pc(url)))
-        .build()
-        .into()
+}
+
+/// `agent` that follows no redirect (a 3xx comes back as the answer): for an
+/// address the user typed, which must not pass a key or a request on to a
+/// place the user never named.
+pub(crate) fn strict_agent(url: &str, timeout: Duration) -> ureq::Agent {
+    agent_builder(url, timeout, ureq::Proxy::try_from_env()).max_redirects(0).build().into()
 }
 
 /// Whether `url` names this PC: `localhost` (and `*.localhost`), any
@@ -1047,8 +1058,9 @@ fn reply(sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<
     let mut resp = sent?;
     let status = resp.status().as_u16();
     let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+    let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(String::from);
     let body = resp.body_mut().with_config().limit(16 << 20).read_to_string()?;
-    Ok(Reply { status, body, retry_after })
+    Ok(Reply { status, body, retry_after, location })
 }
 
 /// The message in a provider's error body, if it has one, with the request's
@@ -1069,7 +1081,7 @@ fn api_message(body: &str, secrets: &[&str]) -> Option<String> {
 fn secrets_of<'a>(headers: &[(&str, &'a str)]) -> Vec<&'a str> {
     headers
         .iter()
-        .filter(|(k, _)| matches!(*k, "x-api-key" | "authorization"))
+        .filter(|(k, _)| matches!(*k, "x-api-key" | "authorization" | "x-goog-api-key"))
         .map(|(_, v)| v.strip_prefix("Bearer ").unwrap_or(v))
         .collect()
 }
@@ -1109,6 +1121,18 @@ fn status_error(label: &str, status: u16, body: &str, secrets: &[&str]) -> Strin
     }
 }
 
+/// Where a redirect points: the host of an absolute address, the (short) text of any other.
+fn redirect_error(label: &str, location: Option<&str>) -> String {
+    let to = match location {
+        Some(l) => match tauri::Url::parse(l.trim()).ok().and_then(|u| u.host_str().map(String::from)) {
+            Some(host) => host,
+            None => clean_text(l, 80),
+        },
+        None => "알 수 없는 곳".to_string(),
+    };
+    format!("{label}: 주소가 다른 곳으로 넘겨요: {to}. 따라가지 않고 멈췄어요. 설정에서 주소를 확인해 주세요")
+}
+
 fn transport_error(label: &str, e: &ureq::Error) -> String {
     let hint = if label == "Ollama" { " Ollama가 켜져 있는지, 주소가 맞는지 확인해 주세요." } else { "" };
     match e {
@@ -1136,6 +1160,8 @@ fn exchange(label: &str, secrets: &[&str], send: &mut dyn FnMut() -> Result<Repl
         let again = attempt < RETRIES;
         match send() {
             Ok(r) if (200..300).contains(&r.status) => return Ok(r.body),
+            // Only a strict agent gets one: it is never followed, nor waited for.
+            Ok(r) if (300..400).contains(&r.status) => return Err(redirect_error(label, r.location.as_deref())),
             Ok(r) if again && (r.status == 429 || r.status >= 500) => {
                 sleep(r.retry_after.map_or(wait, |s| Duration::from_secs(s.min(30))));
             }
@@ -1179,6 +1205,41 @@ pub(crate) fn post_json_counted(label: &str, url: &str, headers: &[(&str, &str)]
     (value, sent)
 }
 
+/// Why a strict request failed: the last non-2xx answer's status and body
+/// (None and empty when it never got one) and the Korean message for it.
+pub(crate) struct Failed {
+    pub status: Option<u16>,
+    pub body: String,
+    pub message: String,
+}
+
+/// `post_json` through `strict_agent`, and a failure that keeps the
+/// provider's status and body (to see what it refused).
+pub(crate) fn post_json_strict(label: &str, url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration) -> Result<Value, Failed> {
+    let bytes = serde_json::to_vec(body).map_err(|e| Failed { status: None, body: String::new(), message: e.to_string() })?;
+    let agent = strict_agent(url, timeout);
+    let mut last: (Option<u16>, String) = (None, String::new());
+    let sent = exchange(
+        label,
+        &secrets_of(headers),
+        &mut || {
+            last = (None, String::new());
+            let mut rq = agent.post(url).header("content-type", "application/json");
+            for &(k, v) in headers {
+                rq = rq.header(k, v);
+            }
+            let r = reply(rq.send(&bytes[..]))?;
+            if !(200..300).contains(&r.status) {
+                last = (Some(r.status), r.body.clone());
+            }
+            Ok(r)
+        },
+        &std::thread::sleep,
+    );
+    let text = sent.map_err(|message| Failed { status: last.0, body: std::mem::take(&mut last.1), message })?;
+    serde_json::from_str(&text).map_err(|_| Failed { status: None, body: String::new(), message: format!("{label}: 답을 읽을 수 없어요") })
+}
+
 /// One POST of a JSON body, not tried again (a server on this PC that is
 /// off stays off for a while): its status and body, or how it failed on
 /// the way. The caller words the error (judge.rs, for a local model).
@@ -1194,7 +1255,15 @@ fn get_once(url: &str, timeout: Duration) -> Result<(u16, String), ureq::Error> 
 }
 
 fn get_json(label: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
-    let agent = agent(url, TEST_TIMEOUT);
+    get_json_with(agent(url, TEST_TIMEOUT), label, url, headers)
+}
+
+/// `get_json` that follows no redirect (`strict_agent`).
+pub(crate) fn get_json_strict(label: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
+    get_json_with(strict_agent(url, TEST_TIMEOUT), label, url, headers)
+}
+
+fn get_json_with(agent: ureq::Agent, label: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
     let text = exchange(
         label,
         &secrets_of(headers),
@@ -1665,6 +1734,11 @@ fn ask(s: &AiSettings, req: &Request) -> Result<String, String> {
         "ollama" => ollama_ask(s, req),
         "claude_cli" => claude_cli_ask(s, req),
         "codex_cli" => codex_cli_ask(s, req),
+        "compat" => providers::compat_ask(s, req),
+        "gemini" => {
+            let key = need_key("gemini", "Gemini API")?;
+            providers::gemini_ask(s, &key, req).map_err(|e| scrub(e, &key))
+        }
         _ => Err(UNKNOWN_PROVIDER.into()),
     }
 }
@@ -1765,6 +1839,11 @@ fn test_provider(provider: &str, s: &AiSettings) -> Result<String, String> {
             } else {
                 Err("Codex CLI에 로그인돼 있지 않아요. 터미널에서 codex login을 해 주세요".into())
             }
+        }
+        "compat" => providers::compat_test(s),
+        "gemini" => {
+            let key = need_key("gemini", "Gemini API")?;
+            providers::gemini_test(s, &key).map_err(|e| scrub(e, &key))
         }
         "jev" => {
             let key = need_key("jev", "jev")?;
@@ -2448,6 +2527,22 @@ pub async fn ai_ollama_models(url: Option<String>) -> Result<Vec<String>, String
         return Err(BAD_OLLAMA_URL.into());
     }
     crate::blocking(move || ollama_models(&url)).await?
+}
+
+/// The models a connection offers, for the settings' list: "compat" (`url`:
+/// the address as typed, not saved yet; None: the saved one) and "gemini".
+#[tauri::command]
+pub async fn ai_models(provider: String, url: Option<String>) -> Result<Vec<String>, String> {
+    let saved = settings();
+    crate::blocking(move || match provider.as_str() {
+        "compat" => providers::compat_models(&url.unwrap_or(saved.compat_url)),
+        "gemini" => {
+            let key = need_key("gemini", "Gemini API")?;
+            providers::gemini_models(&key).map_err(|e| scrub(e, &key))
+        }
+        _ => Err("모델 목록을 읽을 수 없는 연결이에요".to_string()),
+    })
+    .await?
 }
 
 /// task: "explain" | "structure" | "rename"
@@ -3147,7 +3242,7 @@ mod tests {
 
     #[test]
     fn retries_429_and_5xx_but_not_4xx() {
-        let r = |status: u16, body: &str| Reply { status, body: body.into(), retry_after: None };
+        let r = |status: u16, body: &str| Reply { status, body: body.into(), retry_after: None, location: None };
         let slept = RefCell::new(Vec::new());
         let sleep = |d: Duration| slept.borrow_mut().push(d);
         let mut answers = vec![
@@ -3428,5 +3523,34 @@ mod tests {
         };
         let safe = json!({ "answers": { "risk_0": { "type": "score", "score": 0.0, "confidence": 0.9, "legend": { "0": "safe" }, "probabilities": { "0": 1.0 } } } });
         assert_eq!(jev_risks(&[(sys, true)], &safe, judge::JEV)[0].level, "danger");
+    }
+
+    #[test]
+    fn addresses_the_user_typed_never_follow_redirects() {
+        assert_eq!(strict_agent("https://api.deepseek.com/chat/completions", ASK_TIMEOUT).config().max_redirects(), 0);
+        assert!(agent(CLAUDE_URL, ASK_TIMEOUT).config().max_redirects() > 0);
+        let mut calls = 0;
+        let e = exchange(
+            "OpenAI 호환 API (api.deepseek.com)",
+            &[],
+            &mut || {
+                calls += 1;
+                Ok(Reply { status: 307, body: String::new(), retry_after: None, location: Some("https://evil.example/collect".into()) })
+            },
+            &|_| panic!("a redirect is not waited for"),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(e.contains("주소가 다른 곳으로 넘겨요") && e.contains("evil.example"), "{e}");
+        assert!(redirect_error("X", None).contains("알 수 없는 곳"));
+        assert!(redirect_error("X", Some("/v2/chat")).contains("/v2/chat"));
+    }
+
+    #[test]
+    fn gemini_keys_are_blanked_in_errors() {
+        let key = "AIzaSyD-SECRETSECRETSECRET";
+        assert_eq!(secrets_of(&[("x-goog-api-key", key)]), [key]);
+        let body = json!({ "error": { "code": 400, "message": format!("API key not valid: {key}"), "status": "INVALID_ARGUMENT" } }).to_string();
+        assert!(!status_error("Gemini API", 400, &body, &secrets_of(&[("x-goog-api-key", key)])).contains("SECRET"));
     }
 }

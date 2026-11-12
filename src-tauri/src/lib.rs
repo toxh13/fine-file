@@ -1691,6 +1691,7 @@ pub fn run() {
             ai::ai_test,
             ai::ai_judge_test,
             ai::ai_ollama_models,
+            ai::ai_models,
             ai::ai_preview,
             ai::ai_explain,
             ai::ai_plan,
