@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ai,
   places,
@@ -750,9 +750,13 @@ export function HelperPane(p: HelperPaneProps) {
             </button>
           ))}
         </div>
-        {rm.error?.where === "rules" && <div className="v04-error">{shown(rm.error.text)}</div>}
+        {rm.error?.where === "rules" && (
+          <InSight of={rm.error} className="v04-error">
+            {shown(rm.error.text)}
+          </InSight>
+        )}
         {rm.nothing !== null && (
-          <div className="helper-nothing" role="status">
+          <InSight of={rm.nothing} className="helper-nothing" role="status">
             <p>{shown(rm.nothing)}</p>
             {scope !== "all" && rm.ruleKind !== "relocate" && (
               <button
@@ -765,7 +769,7 @@ export function HelperPane(p: HelperPaneProps) {
                 범위를 컴퓨터 전체로
               </button>
             )}
-          </div>
+          </InSight>
         )}
         {rm.runs && <RuleRuns runs={rm.runs} kind={rm.ruleKind} onOpenPlan={p.onOpenPlan} />}
         {made(rm, "rules")}
@@ -864,7 +868,7 @@ function ScopeChips(p: {
 function RuleRuns(p: { runs: RuleRun[]; kind: RuleKind | null; onOpenPlan: (planId: string) => void }) {
   if (!p.runs.length) return null;
   return (
-    <>
+    <InSight of={p.runs}>
       {p.runs.some((r) => r.plan) && (
         <p className="helper-made">
           {p.kind ? `"${labelOf(p.kind)}" ` : ""}계획을 드라이브마다 따로 만들었어요. 계획 창에서 확인하고 실행해야 바뀌어요.
@@ -883,7 +887,24 @@ function RuleRuns(p: { runs: RuleRun[]; kind: RuleKind | null; onOpenPlan: (plan
           </li>
         ))}
       </ul>
-    </>
+    </InSight>
+  );
+}
+
+/**
+ * What a rule button gave (why it made nothing, each drive's line, what went wrong): it shows
+ * under the buttons, often below the pane's edge, so it comes into sight when it shows or `of`
+ * changes. Without that, pressing a button looked like nothing happened.
+ */
+function InSight(p: { of: unknown; className?: string; role?: string; children: ReactNode }) {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    box.current?.scrollIntoView({ block: "nearest" });
+  }, [p.of]);
+  return (
+    <div ref={box} className={p.className} role={p.role}>
+      {p.children}
+    </div>
   );
 }
 
