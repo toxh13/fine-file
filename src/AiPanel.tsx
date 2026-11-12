@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ai, plans, type AiPayloadPreview, type RulesResult, type AiSettings as Settings, type KeyStatus } from "./api";
+import {
+  ai,
+  places,
+  plans,
+  type AiPayloadPreview,
+  type DriveInfo,
+  type Plan,
+  type RulesResult,
+  type AiSettings as Settings,
+  type KeyStatus,
+} from "./api";
 import { tip } from "./Explorer";
-import { formatSize, pathKey, shown } from "./format";
+import { formatSize, normalizePath, pathKey, shown } from "./format";
 import { Markdown } from "./markdown";
 import "./components.css";
 import "./v04.css";
@@ -20,14 +30,32 @@ export interface HelperTarget {
 }
 
 /**
- * The request out (one at a time in a tab) and whose it is (`key`: the item's pathKey): a rule
- * plan, or an AI task getting its preview ready, making it again on "보내기", or waiting for the answer.
+ * Where the rule plans look ("정리할 곳"): what the helper looks at, the profile folder, one
+ * drive (`drive:C:`), or every indexed local drive (one plan per drive).
+ */
+export type ScopeId = "here" | "home" | "all" | `drive:${string}`;
+
+/** One drive's part of a "컴퓨터 전체" run: its plan, or why there is none. */
+interface RuleRun {
+  /** The drive ("C:"). */
+  label: string;
+  plan: Plan | null;
+  text: string;
+  error: boolean;
+}
+
+/**
+ * The request out (one at a time in a tab) and whose it is (`key`: the item's pathKey, or
+ * `scope:<id>` for a rule plan made for a 정리할 곳 other than "지금 보는 곳"): a rule plan, or an
+ * AI task getting its preview ready, making it again on "보내기", or waiting for the answer.
  */
 interface Busy {
   key: string;
   name: string;
   id: AiTask | RuleKind;
   stage: "preview" | "check" | "send";
+  /** "컴퓨터 전체": the drive it is on now. */
+  at?: string;
 }
 
 /** What would go ("보내기 전에 미리 보기"). `changed`: made again on "보내기", it was not what had been shown (shown again, nothing sent). */
@@ -47,9 +75,15 @@ interface Memo {
    * shows this item and nothing is being typed (see Explorer); else it waits here under "계획 열기".
    */
   made: { id: string; label: string; where: "ai" | "rules" } | null;
+  /** "컴퓨터 전체": each local drive's result, in the drives' order (filled in as it goes). */
+  runs: RuleRun[] | null;
+  /** A rule plan found nothing (none was saved): why, one reason a line. */
+  nothing: string | null;
+  /** The rule `runs` and `nothing` are for. */
+  ruleKind: RuleKind | null;
 }
 
-const NO_MEMO: Memo = { answer: null, error: null, preview: null, made: null };
+const NO_MEMO: Memo = { answer: null, error: null, preview: null, made: null, runs: null, nothing: null, ruleKind: null };
 
 const AI_ACTIONS: { id: AiTask; label: string; desc: string }[] = [
   { id: "explain", label: "이 폴더 설명", desc: "무엇이 든 폴더인지, 어디가 큰지 설명해 줘요" },
@@ -96,6 +130,59 @@ function errText(err: unknown): string {
 export function rulesNothingText(r: RulesResult): string {
   return [r.summary, ...r.dropped.slice(0, 3).map((d) => `후보 ${d.count.toLocaleString()}개: ${d.why}`)].join("\n");
 }
+
+// ---- 정리할 곳: where the rule plans look ----
+
+const SCOPE_KEY = "fine-file.helperScope";
+
+const isScope = (v: unknown): v is ScopeId =>
+  v === "here" || v === "home" || v === "all" || (typeof v === "string" && /^drive:[A-Z]:$/.test(v));
+
+/** The 정리할 곳 chosen last on this PC; "지금 보는 곳" when none was, or it cannot be read. */
+function savedScope(): ScopeId {
+  try {
+    const v = localStorage.getItem(SCOPE_KEY);
+    return isScope(v) ? v : "here";
+  } catch {
+    return "here";
+  }
+}
+
+/**
+ * The drives a rule plan may cover: this PC's own disks. A SUBST drive is left out: it is a folder
+ * of another drive (its files would be in two plans), and the shell never recycles on it.
+ */
+const localDrives = (drives: DriveInfo[]) =>
+  drives.filter((d) => (d.kind === "fixed" || d.kind === "removable") && !d.subst);
+
+/**
+ * The 정리할 곳 used now: the one chosen, or "지금 보는 곳" while it cannot be used (the profile
+ * folder not known yet, the drive gone or not indexed, no local drive indexed). The choice itself
+ * is kept: it is used again once it can be.
+ */
+function liveScope(scope: ScopeId, drives: DriveInfo[], home: string | null): ScopeId {
+  if (scope === "home") return home ? scope : "here";
+  if (scope === "all") return localDrives(drives).some((d) => d.indexed) ? scope : "here";
+  if (scope.startsWith("drive:")) {
+    const letter = scope.slice("drive:".length);
+    return localDrives(drives).some((d) => d.letter.toUpperCase() === letter && d.indexed) ? scope : "here";
+  }
+  return "here";
+}
+
+/** Where a 정리할 곳's results are kept: under the item for "지금 보는 곳", else under the scope (they stay while you go elsewhere). */
+const ruleKey = (scope: ScopeId, t: HelperTarget | null) =>
+  scope === "here" ? (t ? pathKey(t.path) : "") : `scope:${scope}`;
+
+/** A 정리할 곳 in a few words (as Busy.name: shown() when drawn). */
+function scopeName(scope: ScopeId, t: HelperTarget | null): string {
+  if (scope === "here") return t ? t.name : "지금 보는 곳";
+  if (scope === "home") return "홈 폴더";
+  if (scope === "all") return "컴퓨터 전체";
+  return scope.slice("drive:".length);
+}
+
+const stepsSize = (plan: Plan) => plan.steps.reduce((sum, s) => sum + s.size, 0);
 
 /**
  * What a preview says about file contents. The app sends none; Codex CLI is an agent with tools of
@@ -152,10 +239,18 @@ export interface Helper {
   busy: Busy | null;
   /** What it got for the item at `path` (nothing yet: all empty). */
   memo: (path: string) => Memo;
+  /** What the rule plans got for the 정리할 곳 `scope`: for "지금 보는 곳", the item `t`'s memo. */
+  rulesMemo: (scope: ScopeId, t: HelperTarget) => Memo;
   ask: (t: HelperTarget, task: AiTask) => void;
   confirmSend: (t: HelperTarget, shown: SendPreview) => void;
   dropPreview: (t: HelperTarget) => void;
-  rule: (t: HelperTarget, kind: RuleKind) => void;
+  /** "정리할 곳", as chosen (remembered on this PC); see liveScope for the one used now. */
+  scope: ScopeId;
+  setScope: (id: ScopeId) => void;
+  /** The profile folder ("홈 폴더"), once known_places answered. */
+  home: string | null;
+  /** A rule plan for the 정리할 곳 chosen: `t` for "지금 보는 곳", `drives` for a drive or "컴퓨터 전체". */
+  rule: (t: HelperTarget | null, kind: RuleKind, drives: DriveInfo[]) => void;
 }
 
 /**
@@ -163,19 +258,27 @@ export interface Helper {
  * have out. It lives with the tab, not with the pane: the pane closed or the tab hidden, a request
  * goes on, and its answer is kept under its own item. `shown`: the pane shows the helper; the
  * settings are read then, and again when `stamp` changes (App read them again). `onPlan`: a plan
- * was made (rules, or an AI's) for `t`, maybe long after it was asked for.
+ * was made (rules, or an AI's) for `t` in `scope` ("here" for an AI's), maybe long after it was
+ * asked for.
  */
-export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: string, t: HelperTarget) => void): Helper {
+export function useHelper(
+  shown: boolean,
+  stamp: unknown,
+  onPlan: (planId: string, t: HelperTarget | null, scope: ScopeId) => void,
+): Helper {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [keys, setKeys] = useState<KeyStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Busy | null>(null);
+  const [scope, setScopeNow] = useState<ScopeId>(savedScope);
+  const [home, setHome] = useState<string | null>(null);
   // The requests read and write these as they go, past many renders; `tick` draws what they wrote.
   const busyRef = useRef<Busy | null>(null);
   const memos = useRef(new Map<string, Memo>());
   const [, setTick] = useState(0);
   const alive = useRef(true);
   const planRef = useRef(onPlan);
+  const homeAsked = useRef(false);
   useLayoutEffect(() => {
     planRef.current = onPlan;
   });
@@ -187,7 +290,29 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
     };
   }, []);
 
+  const setScope = useCallback((id: ScopeId) => {
+    setScopeNow(id);
+    try {
+      localStorage.setItem(SCOPE_KEY, id);
+    } catch {
+      /* storage blocked: the choice lasts until the tab closes */
+    }
+  }, []);
+
   const load = useCallback(() => {
+    // The profile folder is asked for once (again after a failure).
+    if (!homeAsked.current) {
+      homeAsked.current = true;
+      places.known().then(
+        (list) => {
+          const h = list.find((p) => p.id === "home");
+          if (alive.current && h && typeof h.path === "string") setHome(normalizePath(h.path));
+        },
+        () => {
+          homeAsked.current = false;
+        },
+      );
+    }
     ai.getSettings().then(
       (s) => {
         if (!alive.current) return;
@@ -211,11 +336,12 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
     memos.current.set(key, { ...memoOf(key), ...m });
     if (alive.current) setTick((n) => n + 1);
   };
-  const begin = (t: HelperTarget, id: Busy["id"], stage: Busy["stage"]) => {
-    const b = { key: pathKey(t.path), name: t.name, id, stage };
+  const start = (b: Busy) => {
     busyRef.current = b;
     if (alive.current) setBusy(b);
   };
+  const begin = (t: HelperTarget, id: Busy["id"], stage: Busy["stage"]) =>
+    start({ key: pathKey(t.path), name: t.name, id, stage });
   const end = () => {
     busyRef.current = null;
     if (alive.current) setBusy(null);
@@ -232,7 +358,7 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
       } else {
         const plan = await ai.plan(task, t.path);
         patch(key, { made: { id: plan.id, label: labelOf(task), where: "ai" } });
-        if (alive.current) planRef.current(plan.id, t);
+        if (alive.current) planRef.current(plan.id, t, "here");
       }
     } catch (err) {
       patch(key, { error: { where: "ai", text: `${task === "explain" ? "설명을" : "계획을"} 받지 못했어요: ${errText(err)}` } });
@@ -308,18 +434,68 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
     }
   };
 
-  const rule = async (t: HelperTarget, kind: RuleKind) => {
+  /**
+   * A rule plan for the 정리할 곳 used now (liveScope). One folder: its plan opens, or why there is
+   * none is said. "컴퓨터 전체": one plan per indexed local drive, one drive after another (each reads
+   * that drive's index, some kinds its files), the largest of them opened at the end; the whole run
+   * is one request.
+   */
+  const rule = async (t: HelperTarget | null, kind: RuleKind, drives: DriveInfo[]) => {
     if (busyRef.current) return;
-    const key = pathKey(t.path);
-    patch(key, { error: null, made: null });
-    begin(t, kind, "send");
+    const s = liveScope(scope, drives, home);
+    const key = ruleKey(s, t);
+    const name = scopeName(s, t);
+    if (s === "all") {
+      // Moving to "another drive" means nothing for every drive at once (the buttons say so).
+      if (kind === "relocate") return;
+      const runs: RuleRun[] = [];
+      patch(key, { error: null, made: null, nothing: null, runs: [], ruleKind: kind });
+      try {
+        for (const d of localDrives(drives)) {
+          if (!d.indexed) {
+            runs.push({ label: d.letter, plan: null, text: "검사 안 함 (먼저 검사해 주세요)", error: false });
+            continue;
+          }
+          // The tab closed meanwhile: no other drive is started (no plan would be opened).
+          if (!alive.current) break;
+          start({ key, name, id: kind, stage: "send", at: d.letter });
+          try {
+            const r = await plans.rules(kind, `${d.letter}\\`);
+            runs.push(
+              r.plan
+                ? {
+                    label: d.letter,
+                    plan: r.plan,
+                    text: `${r.plan.steps.length.toLocaleString()}개 · ${formatSize(stepsSize(r.plan))}`,
+                    error: false,
+                  }
+                : { label: d.letter, plan: null, text: rulesNothingText(r).split("\n")[0], error: false },
+            );
+          } catch (err) {
+            runs.push({ label: d.letter, plan: null, text: `만들지 못했어요: ${errText(err)}`, error: true });
+          }
+          patch(key, { runs: [...runs] });
+        }
+        patch(key, { runs: [...runs] });
+        let best: Plan | null = null;
+        for (const r of runs) if (r.plan && (!best || stepsSize(r.plan) > stepsSize(best))) best = r.plan;
+        if (best && alive.current) planRef.current(best.id, t, s);
+      } finally {
+        end();
+      }
+      return;
+    }
+    const at = s === "here" ? (t?.is_dir ? t.path : null) : s === "home" ? home : `${s.slice("drive:".length)}\\`;
+    if (!at) return;
+    patch(key, { error: null, made: null, nothing: null, runs: null, ruleKind: kind });
+    start({ key, name, id: kind, stage: "send" });
     try {
-      const r = await plans.rules(kind, t.path);
+      const r = await plans.rules(kind, at);
       if (!r.plan) {
-        patch(key, { error: { where: "rules", text: rulesNothingText(r) } });
+        patch(key, { nothing: rulesNothingText(r) });
       } else {
         patch(key, { made: { id: r.plan.id, label: labelOf(kind), where: "rules" } });
-        if (alive.current) planRef.current(r.plan.id, t);
+        if (alive.current) planRef.current(r.plan.id, t, s);
       }
     } catch (err) {
       patch(key, { error: { where: "rules", text: `계획을 만들지 못했어요: ${errText(err)}` } });
@@ -335,10 +511,14 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
     load,
     busy,
     memo: (path) => memoOf(pathKey(path)),
+    rulesMemo: (s, t) => memoOf(ruleKey(s, t)),
     ask: (t, task) => void ask(t, task),
     confirmSend: (t, shownNow) => void confirmSend(t, shownNow),
     dropPreview: (t) => patch(pathKey(t.path), { preview: null }),
-    rule: (t, kind) => void rule(t, kind),
+    scope,
+    setScope,
+    home,
+    rule: (t, kind, drives) => void rule(t, kind, drives),
   };
 }
 
@@ -355,6 +535,8 @@ export interface HelperPaneProps {
   onSettings: () => void;
   /** "계획 열기": a plan made here, in its window. */
   onOpenPlan: (planId: string) => void;
+  /** This PC's drives: the 정리할 곳 chips, and what "컴퓨터 전체" covers. */
+  drives: DriveInfo[];
 }
 
 /** The 정리 도우미 tab of the side pane: AI explanations, plans from an AI or from rules, for its target. */
@@ -366,9 +548,15 @@ export function HelperPane(p: HelperPaneProps) {
   const key = pathKey(t.path);
   const m = h.memo(t.path);
   const file = !t.is_dir;
-  // The request out is this item's, or another's (whose answer is kept under it).
+  // The 정리할 곳 used now, and what the rule plans got there (for "지금 보는 곳": this item's).
+  const scope = liveScope(h.scope, p.drives, h.home);
+  const rm = h.rulesMemo(scope, t);
+  // A file has no plans of its own: "지금 보는 곳" makes none for it, another 정리할 곳 does.
+  const rulesOff = file && scope === "here";
+  // The request out is this item's (or this 정리할 곳's), or another's (whose answer is kept under it).
   const here = h.busy?.key === key ? h.busy : null;
-  const other = h.busy && !here ? h.busy : null;
+  const hereRule = h.busy?.key === ruleKey(scope, t) ? h.busy : null;
+  const other = h.busy && !here && !hereRule ? h.busy : null;
   const waiting = h.busy !== null;
   const problem = h.settings ? aiProblem(h.settings, h.keys, file) : null;
   const actions = file ? FILE_ACTIONS : AI_ACTIONS;
@@ -378,15 +566,16 @@ export function HelperPane(p: HelperPaneProps) {
       AI 설정 열기
     </button>
   );
-  const made = (where: "ai" | "rules") =>
-    m.made?.where === where && (
+  const made = (of: Memo, where: "ai" | "rules") =>
+    of.made?.where === where && (
       <p className="helper-made">
-        "{m.made.label}" 계획을 만들었어요. 계획 창에서 확인하고 실행해야 바뀌어요.{" "}
-        <button className="v06-link" onClick={() => m.made && p.onOpenPlan(m.made.id)}>
+        "{of.made.label}" 계획을 만들었어요. 계획 창에서 확인하고 실행해야 바뀌어요.{" "}
+        <button className="v06-link" onClick={() => of.made && p.onOpenPlan(of.made.id)}>
           계획 열기
         </button>
       </p>
     );
+  const canAll = liveScope("all", p.drives, h.home) === "all";
 
   return (
     <div className="details-scroll helper">
@@ -499,7 +688,7 @@ export function HelperPane(p: HelperPaneProps) {
             onSend={(shownNow) => h.confirmSend(t, shownNow)}
           />
         )}
-        {made("ai")}
+        {made(m, "ai")}
         {m.answer !== null && (
           <>
             <Markdown className="ai-answer" text={m.answer} />
@@ -510,32 +699,48 @@ export function HelperPane(p: HelperPaneProps) {
         )}
       </section>
 
-      {!file && (
-        <section className="v06-section">
-          <div className="v06-section-head">
-            <h4>규칙으로 계획 만들기</h4>
-            <span className="muted">AI 없이 이 컴퓨터에서 만들어요</span>
-          </div>
-          <div className="ai-actions">
-            {RULE_ACTIONS.map((a) => (
+      <section className="v06-section">
+        <div className="v06-section-head">
+          <h4>규칙으로 계획 만들기</h4>
+          <span className="muted">AI 없이 이 컴퓨터에서 만들어요</span>
+        </div>
+        <ScopeChips target={t} scope={scope} home={h.home} drives={p.drives} onScope={h.setScope} />
+        <div className="ai-actions">
+          {RULE_ACTIONS.map((a) => (
+            <button
+              key={a.id}
+              className={`ai-action${hereRule?.id === a.id ? " busy" : ""}`}
+              disabled={waiting || rulesOff || (a.id === "relocate" && scope === "all")}
+              onClick={() => h.rule(t, a.id, p.drives)}
+            >
+              <b>{a.label}</b>
+              <span className="muted">{ruleDesc(a, scope, hereRule)}</span>
+            </button>
+          ))}
+        </div>
+        {rm.error?.where === "rules" && <div className="v04-error">{shown(rm.error.text)}</div>}
+        {rm.nothing !== null && (
+          <div className="helper-nothing" role="status">
+            <p>{shown(rm.nothing)}</p>
+            {scope !== "all" && rm.ruleKind !== "relocate" && (
               <button
-                key={a.id}
-                className={`ai-action${here?.id === a.id ? " busy" : ""}`}
-                disabled={waiting}
-                onClick={() => h.rule(t, a.id)}
+                type="button"
+                className="btn small"
+                disabled={!canAll}
+                title={canAll ? undefined : "먼저 드라이브를 검사해 주세요"}
+                onClick={() => h.setScope("all")}
               >
-                <b>{a.label}</b>
-                <span className="muted">{here?.id === a.id ? "만드는 중…" : a.desc}</span>
+                범위를 컴퓨터 전체로
               </button>
-            ))}
+            )}
           </div>
-          {m.error?.where === "rules" && <div className="v04-error">{shown(m.error.text)}</div>}
-          {made("rules")}
-        </section>
-      )}
+        )}
+        {rm.runs && <RuleRuns runs={rm.runs} kind={rm.ruleKind} onOpenPlan={p.onOpenPlan} />}
+        {made(rm, "rules")}
+      </section>
 
       <p className="v06-note">
-        {file
+        {rulesOff
           ? '정리 계획은 폴더에서 만들어요. 이 파일이 든 폴더의 메뉴에서 "정리 계획 만들기"를 골라 주세요.'
           : '여기서는 계획을 만들기만 해요. 계획 창에서 단계를 확인하고 "실행"을 눌러야 파일이 바뀌고, 실행한 뒤에도 되돌릴 수 있어요.'}
       </p>
@@ -545,6 +750,101 @@ export function HelperPane(p: HelperPaneProps) {
         </button>
       </div>
     </div>
+  );
+}
+
+/** A rule button's second line: what it does here, or how far its request got. */
+function ruleDesc(a: (typeof RULE_ACTIONS)[number], scope: ScopeId, busy: Busy | null): string {
+  if (busy?.id === a.id) return busy.at ? `${busy.at} ${a.label} 계획을 만드는 중…` : "만드는 중…";
+  if (a.id === "relocate" && scope === "all") return "컴퓨터 전체에서는 쓸 수 없어요. 드라이브를 골라 주세요";
+  // Files of the same size are read to compare: on a whole drive that takes a while, and it cannot be stopped.
+  if (a.id === "dedupe" && (scope === "all" || scope.startsWith("drive:"))) return `${a.desc}. 드라이브 전체는 몇 분 걸릴 수 있어요.`;
+  return a.desc;
+}
+
+/**
+ * "정리할 곳": the chips over the rule buttons (what the helper looks at, the profile folder, each
+ * local drive, the whole computer), and the folders the one used now covers. A drive not indexed
+ * cannot be chosen; nor can "컴퓨터 전체" while no local drive is.
+ */
+function ScopeChips(p: {
+  target: HelperTarget;
+  /** The one used now (liveScope). */
+  scope: ScopeId;
+  home: string | null;
+  drives: DriveInfo[];
+  onScope: (id: ScopeId) => void;
+}) {
+  const local = localDrives(p.drives);
+  const ready = local.filter((d) => d.indexed).map((d) => d.letter);
+  const unscanned = local.filter((d) => !d.indexed).map((d) => d.letter);
+  const chips: { id: ScopeId; label: string; title?: string; off: boolean }[] = [
+    { id: "here", label: `지금 보는 곳 · ${shown(p.target.name)}`, title: shown(p.target.path), off: false },
+    { id: "home", label: "홈 폴더", title: p.home ? shown(p.home) : undefined, off: !p.home },
+    ...local.map((d) => ({
+      id: `drive:${d.letter.toUpperCase()}` as const,
+      label: d.letter,
+      title: !d.indexed ? "먼저 이 드라이브를 검사해 주세요" : d.label ? `${shown(d.label)} (${d.letter})` : undefined,
+      off: !d.indexed,
+    })),
+    { id: "all", label: "컴퓨터 전체", title: ready.length ? undefined : "먼저 드라이브를 검사해 주세요", off: !ready.length },
+  ];
+  const where =
+    p.scope === "here"
+      ? shown(p.target.path)
+      : p.scope === "home"
+        ? shown(p.home ?? "")
+        : p.scope === "all"
+          ? `${ready.join(", ")} 드라이브${unscanned.length ? ` (${unscanned.join(", ")} 검사 안 함)` : ""}`
+          : `${p.scope.slice("drive:".length)}\\`;
+  return (
+    <>
+      <div className="helper-scope" role="radiogroup" aria-label="정리할 곳">
+        <span className="muted">정리할 곳:</span>
+        {chips.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            role="radio"
+            aria-checked={p.scope === c.id}
+            className={`btn small helper-chip${p.scope === c.id ? " on" : ""}`}
+            disabled={c.off}
+            title={c.title}
+            onClick={() => p.onScope(c.id)}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <span className="muted helper-scope-where">{where}</span>
+    </>
+  );
+}
+
+/** "컴퓨터 전체": each local drive's line (its plan's size, or why there is none) and its plan to open. */
+function RuleRuns(p: { runs: RuleRun[]; kind: RuleKind | null; onOpenPlan: (planId: string) => void }) {
+  if (!p.runs.length) return null;
+  return (
+    <>
+      {p.runs.some((r) => r.plan) && (
+        <p className="helper-made">
+          {p.kind ? `"${labelOf(p.kind)}" ` : ""}계획을 드라이브마다 따로 만들었어요. 계획 창에서 확인하고 실행해야 바뀌어요.
+        </p>
+      )}
+      <ul className="helper-runs">
+        {p.runs.map((r) => (
+          <li key={r.label} className={r.error ? "error" : undefined}>
+            <b>{r.label}</b>
+            <span>{shown(r.text)}</span>
+            {r.plan && (
+              <button className="v06-link" onClick={() => r.plan && p.onOpenPlan(r.plan.id)}>
+                계획 열기
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
 

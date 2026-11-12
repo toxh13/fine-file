@@ -34,7 +34,7 @@ import {
   type Risk,
 } from "./api";
 import { AdminBar, adminCanRead, adminError, ensureAdmin } from "./AdminSession";
-import { contentsNote, HelperPane, rulesNothingText, useHelper, type HelperTarget } from "./AiPanel";
+import { contentsNote, HelperPane, rulesNothingText, useHelper, type Helper, type HelperTarget } from "./AiPanel";
 import { AiSettings } from "./AiSettings";
 import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
@@ -2570,13 +2570,21 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   // answers may come long after they were asked for: a plan opens (as a dialog that takes the focus)
   // only while the pane still shows the helper on that item and nothing is being typed (a rename
   // box, the search box, the address); else it waits under the item's "계획 열기" and in the list.
-  const helper = useHelper(active && helperOn, p.ai, (planId, t) => {
+  // A plan made for another 정리할 곳 (홈 폴더, a drive, 컴퓨터 전체) opens while the pane shows
+  // the helper with that 정리할 곳 still chosen, wherever it looks.
+  const helper: Helper = useHelper(active && helperOn, p.ai, (planId, t, scope) => {
     p.onAiChanged();
-    const there = helperOn && helperTarget !== null && pathKey(helperTarget.path) === pathKey(t.path);
+    const there =
+      helperOn &&
+      (scope === "here"
+        ? helperTarget !== null && t !== null && pathKey(helperTarget.path) === pathKey(t.path)
+        : helper.scope === scope);
     showPlan(
       planId,
       there && renaming === null && !typingNow(),
-      `"${t.name}"의 정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`,
+      scope === "here" && t
+        ? `"${t.name}"의 정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`
+        : `정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`,
     );
   });
 
@@ -3406,6 +3414,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
                   onPin={(on) => setHelperPin(on ? helperTarget : null)}
                   onSettings={() => openDialog({ kind: "aiSettings" })}
                   onOpenPlan={(planId) => openDialog({ kind: "plan", id: planId })}
+                  drives={p.drives}
                 />
               )}
             </SidePane>

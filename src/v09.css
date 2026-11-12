@@ -372,6 +372,89 @@
   color: var(--text);
 }
 
+/* 정리할 곳: chips over the rule buttons; they wrap in a narrow pane. */
+.helper-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  min-width: 0;
+  margin-bottom: 4px;
+}
+
+.helper-scope > .muted {
+  flex: none;
+  font-size: 12px;
+}
+
+.btn.helper-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn.helper-chip.on {
+  border-color: var(--sel-line);
+  background: var(--sel);
+  color: var(--text);
+}
+
+.helper-scope-where {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* A rule plan found nothing: why, a reason a line. */
+.helper-nothing {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.helper-nothing p {
+  margin: 0;
+  white-space: pre-line;
+  line-height: 1.55;
+  user-select: text;
+}
+
+.helper-nothing .btn {
+  margin-top: 8px;
+}
+
+/* 컴퓨터 전체: a line per drive. */
+.helper-runs {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.helper-runs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 6px;
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.helper-runs li > span {
+  min-width: 0;
+}
+
+.helper-runs li.error > span {
+  color: var(--danger);
+}
+
 /* Another item's request is out: the buttons wait for it. */
 .helper-busy {
   flex: none;
