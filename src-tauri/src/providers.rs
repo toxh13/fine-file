@@ -4,9 +4,12 @@
 //! (scheme, host and port), and a name is held to what fits where it goes
 //! (a URL path, a command-line value).
 
-use crate::ai::{self, AiSettings, Request, ASK_TIMEOUT, CUT_OFF, EMPTY_ANSWER, MAX_TOKENS};
+use crate::ai::{self, AiSettings, Cli, CliOut, Request, ScratchDir, Stream, ASK_TIMEOUT, CLI_TIMEOUT, CUT_OFF, EMPTY_ANSWER, MAX_TOKENS};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tauri::Url;
 
 /// Whether the OpenCode connection may be switched on. It stays off until
@@ -352,6 +355,247 @@ pub(crate) fn gemini_test(s: &AiSettings, key: &str) -> Result<String, String> {
     }
 }
 
+// ---- OpenCode CLI -----------------------------------------------------------------------------------
+
+/// Our own agent (`--agent`), defined in the config each run gets.
+const OPENCODE_AGENT: &str = "fine-file";
+/// OpenCode's tools by name, and `*` for any other (an MCP server's, one it
+/// adds later): each one removed from our agent.
+const OPENCODE_TOOLS: &[&str] = &[
+    "*", "bash", "edit", "write", "read", "grep", "glob", "list", "patch", "multiedit", "todowrite", "todoread", "webfetch", "websearch", "codesearch", "task", "skill", "lsp",
+];
+
+pub(crate) const NO_OPENCODE: &str = "OpenCode(opencode)를 찾을 수 없어요. 설치하고 터미널에서 opencode auth login을 해 주세요";
+pub(crate) const BAD_OPENCODE_MODEL: &str = "OpenCode 모델은 제공자/모델 모양으로 적어 주세요 (예: opencode/모델이름)";
+const TOOL_STOP: &str = "OpenCode가 도구를 쓰려고 해서 멈췄어요. 받은 답은 쓰지 않았어요";
+const FREE_LIMIT: &str = "OpenCode 무료 사용 한도에 걸렸어요. 잠시 뒤에 다시 하거나 다른 모델을 골라 주세요";
+const OPENCODE_LOGIN: &str = "OpenCode에서 이 모델의 제공자에 로그인돼 있지 않아요. 터미널에서 opencode auth login을 해 주세요";
+const OPENCODE_BUSY: &str = "OpenCode: 요청이 너무 많아요. 잠시 뒤에 다시 해 주세요";
+/// What in an ERROR line of OpenCode's log means the run cannot answer (it
+/// would wait instead of ending): the model request, the login, the start.
+const OPENCODE_FATAL: [&str; 6] = ["stream error", "APICallError", "ModelNotFound", "AuthError", "LoadAPIKeyError", "InitError"];
+/// How long `opencode models` may take.
+const OPENCODE_LIST_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn opencode_no_model(model: &str) -> String {
+    format!("OpenCode에 이 모델이 없어요 ({model}). 설정에서 목록을 다시 불러와 골라 주세요")
+}
+
+/// The first word ending in `Error` in `text` (letters and `_` before it),
+/// as `[A-Za-z_]+Error` would find it.
+fn error_kind(text: &str) -> Option<&str> {
+    text.split(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
+        .find_map(|word| word.rfind("Error").filter(|&at| at > 0).map(|at| &word[..at + "Error".len()]))
+}
+
+/// A Korean message for an error OpenCode reported. Known ones in words of
+/// our own; any other by its kind alone, never its text (which may hold an
+/// address, a key or a file name).
+fn opencode_error_text(raw: &str, model: &str) -> String {
+    let low = raw.to_lowercase();
+    let says = |words: &[&str]| words.iter().any(|w| low.contains(w));
+    if says(&["free usage limit"]) {
+        FREE_LIMIT.into()
+    } else if says(&["rate limit", "too many requests"]) {
+        OPENCODE_BUSY.into()
+    } else if says(&["unauthorized", "api key", "authentication", "401", "autherror", "loadapikeyerror"]) {
+        OPENCODE_LOGIN.into()
+    } else if says(&["modelnotfound", "model not found"]) {
+        opencode_no_model(model)
+    } else {
+        let kind: String = error_kind(raw).unwrap_or("알 수 없는 오류").chars().take(60).collect();
+        format!("OpenCode 오류예요 ({kind})")
+    }
+}
+
+/// A line of OpenCode's log (stderr) after which it cannot answer, as its
+/// error; other ERROR lines (a plugin that failed to load) let it go on.
+fn opencode_log_error(line: &str, model: &str) -> Option<String> {
+    (line.contains("level=ERROR") && OPENCODE_FATAL.iter().any(|w| line.contains(w))).then(|| opencode_error_text(line, model))
+}
+
+/// Whether an event OpenCode printed (stdout, one JSON object a line) ends
+/// the run: a step and its text go on; an error ends it with its message,
+/// and anything else (a tool, a permission request, a kind not known here)
+/// as a tool. A line that is no JSON object is no event.
+fn opencode_event_stop(line: &str, model: &str) -> Option<String> {
+    let Ok(event @ Value::Object(_)) = serde_json::from_str::<Value>(line) else {
+        return None;
+    };
+    match event["type"].as_str() {
+        Some("step_start" | "step_finish" | "text" | "reasoning") => None,
+        Some("error") => Some(opencode_error_text(&event["error"].to_string(), model)),
+        _ => Some(TOOL_STOP.into()),
+    }
+}
+
+/// The answer in OpenCode's events, only from a run that ended well (exit
+/// code 0) whose last step finished with "stop": the text of that step's
+/// message, none of the steps before it.
+fn opencode_answer(stdout: &str, code: Option<i32>) -> Result<String, String> {
+    if code != Some(0) {
+        return Err(format!("OpenCode가 답하지 못했어요 (종료 코드 {})", code.map_or("-".into(), |c| c.to_string())));
+    }
+    let unread = || "OpenCode의 답을 읽을 수 없어요".to_string();
+    let events: Vec<Value> = stdout.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let last = events.iter().rev().find(|e| e["type"] == "step_finish").ok_or_else(unread)?;
+    let part = &last["part"];
+    match part["reason"].as_str() {
+        Some("stop") => {
+            let id = part["messageID"].as_str().ok_or_else(unread)?;
+            let text: String = events
+                .iter()
+                .filter(|e| e["type"] == "text" && e["part"]["messageID"] == id)
+                .filter_map(|e| e["part"]["text"].as_str())
+                .collect();
+            if text.trim().is_empty() { Err(EMPTY_ANSWER.into()) } else { Ok(text) }
+        }
+        Some("length") => Err(CUT_OFF.into()),
+        other => {
+            let reason = other.map(|r| ai::clean_text(r, 40)).filter(|r| !r.is_empty()).unwrap_or_else(|| "이유 모름".into());
+            Err(format!("OpenCode의 답이 끝나지 않았어요 ({reason})"))
+        }
+    }
+}
+
+/// The `provider/model` lines of `opencode models`, sorted, each once.
+fn opencode_models_of(stdout: &str) -> Vec<String> {
+    let mut names: Vec<String> = stdout.lines().map(str::trim).filter(|l| opencode_model_ok(l)).map(String::from).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// OpenCode's config for one run (`OPENCODE_CONFIG_CONTENT`): our agent,
+/// whose prompt is `system`, with every tool removed (not only refused: the
+/// model is not told of any) and every permission denied; nothing shared,
+/// no auto-update, no MCP servers of ours.
+fn opencode_config(system: &str) -> Value {
+    let tools: serde_json::Map<String, Value> = OPENCODE_TOOLS.iter().map(|t| (t.to_string(), Value::Bool(false))).collect();
+    let mut config = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "permission": { "*": "deny", "edit": "deny", "bash": "deny", "webfetch": "deny", "external_directory": "deny" },
+        "share": "disabled",
+        "autoupdate": false,
+        "mcp": {},
+        "agent": {},
+    });
+    config["agent"][OPENCODE_AGENT] = json!({
+        "mode": "primary",
+        "description": "fine-file: answers from folder metadata only",
+        "prompt": system,
+        "tools": tools,
+        "permission": { "*": "deny" },
+    });
+    config
+}
+
+/// What a run adds to OpenCode's environment: our config, and neither the
+/// project's config nor an update.
+fn opencode_env(system: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("OPENCODE_CONFIG_CONTENT", opencode_config(system).to_string()),
+        ("OPENCODE_DISABLE_PROJECT_CONFIG", "1".into()),
+        ("OPENCODE_DISABLE_AUTOUPDATE", "1".into()),
+    ]
+}
+
+/// `opencode run` with our agent and the model picked, no external plugins
+/// (`--pure`), JSON events on stdout and only the ERROR lines of its log on
+/// stderr, in `dir`. The prompt goes on stdin, never as an argument; no
+/// session continued, forked or shared and nothing approved by itself (no
+/// `--auto`).
+fn opencode_args(model: &str, dir: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["run", "--pure", "--format", "json", "--print-logs", "--log-level", "ERROR", "--agent", OPENCODE_AGENT, "-m", model, "--dir"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    args.push(dir.into());
+    args
+}
+
+/// The OpenCode the user installed. For the npm shim (`opencode.cmd`), the
+/// program it starts (`node_modules\opencode-ai\bin\opencode.exe` beside
+/// it) when it is there, so no cmd.exe reads the arguments.
+fn find_opencode() -> Option<PathBuf> {
+    let found = ai::find_program(&["opencode.exe", "opencode.cmd"])?;
+    if ai::is_exe(&found) {
+        return Some(found);
+    }
+    let real = found.with_file_name("node_modules").join("opencode-ai").join("bin").join("opencode.exe");
+    Some(if real.is_file() { real } else { found })
+}
+
+fn opencode_model(s: &AiSettings) -> Result<&str, String> {
+    if s.opencode_model.is_empty() {
+        return Err("OpenCode 모델이 비어 있어요. 설정에서 모델을 골라 주세요".into());
+    }
+    if !opencode_model_ok(&s.opencode_model) {
+        return Err(BAD_OPENCODE_MODEL.into());
+    }
+    Ok(&s.opencode_model)
+}
+
+/// One `opencode run` in `dir` with `req.user` on stdin (`req.system` is our
+/// agent's prompt), watched line by line: an error in its log or an event
+/// that is no step or text of one ends it at once.
+fn opencode_run(model: &str, req: &Request, dir: &Path) -> Result<CliOut, String> {
+    if !opencode_model_ok(model) {
+        return Err(BAD_OPENCODE_MODEL.into());
+    }
+    let exe = find_opencode().ok_or(NO_OPENCODE)?;
+    let watch = |which: Stream, line: &str| match which {
+        Stream::Err => opencode_log_error(line, model),
+        Stream::Out => opencode_event_stop(line, model),
+    };
+    let cli = Cli { exe: &exe, args: &opencode_args(model, dir), env: &opencode_env(req.system), label: "OpenCode", limit: CLI_TIMEOUT, watch: Some(&watch) };
+    ai::run_cli_with(&cli, &req.user, dir)
+}
+
+pub(crate) fn opencode_ask(s: &AiSettings, req: &Request) -> Result<String, String> {
+    let model = opencode_model(s)?;
+    let dir = ScratchDir::new()?;
+    let out = opencode_run(model, req, &dir.0)?;
+    opencode_answer(&out.stdout, out.code)
+}
+
+/// `opencode models [provider]` in an empty folder without external plugins,
+/// which spends no tokens: the models OpenCode can use on this PC, and its
+/// exit code.
+fn opencode_list(provider: Option<&str>) -> Result<(Vec<String>, Option<i32>), String> {
+    let exe = find_opencode().ok_or(NO_OPENCODE)?;
+    let dir = ScratchDir::new()?;
+    let mut args: Vec<OsString> = vec!["models".into()];
+    args.extend(provider.map(OsString::from));
+    args.push("--pure".into());
+    let env = [("OPENCODE_DISABLE_AUTOUPDATE", "1".to_string()), ("OPENCODE_DISABLE_PROJECT_CONFIG", "1".to_string())];
+    let cli = Cli { exe: &exe, args: &args, env: &env, label: "OpenCode", limit: OPENCODE_LIST_TIMEOUT, watch: None };
+    let out = ai::run_cli_with(&cli, "", &dir.0)?;
+    Ok((opencode_models_of(&out.stdout), out.code))
+}
+
+pub(crate) fn opencode_models() -> Result<Vec<String>, String> {
+    let (names, code) = opencode_list(None)?;
+    if names.is_empty() && code != Some(0) {
+        return Err(format!("OpenCode 모델 목록을 읽지 못했어요 (종료 코드 {})", code.map_or("-".into(), |c| c.to_string())));
+    }
+    Ok(names)
+}
+
+/// Whether OpenCode has the model picked, from its list of the model's
+/// provider: no tokens spent. A provider it does not know lists nothing
+/// (and fails), so the model is not there either.
+pub(crate) fn opencode_test(s: &AiSettings) -> Result<String, String> {
+    let model = opencode_model(s)?;
+    let provider = model.split_once('/').map_or(model, |(p, _)| p);
+    let (names, _) = opencode_list(Some(provider))?;
+    if names.iter().any(|m| m == model) {
+        Ok(format!("OpenCode에서 {model}을(를) 쓸 수 있어요. 이 PC에서 OpenCode에 로그인한 계정으로 요청해요"))
+    } else {
+        Err(opencode_no_model(model))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +763,91 @@ mod tests {
         assert_eq!(calls, GEMINI_PAGES);
         assert!(gemini_can_generate(&json!({ "name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"] })));
         assert!(!gemini_can_generate(&json!({ "name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"] })));
+    }
+
+    #[test]
+    fn opencode_arguments_never_allow_changes() {
+        let dir = Path::new(r"C:\t\fine-file-ai-1");
+        let args: Vec<String> = opencode_args("opencode/grok-code-fast-1-free", dir).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
+        assert_eq!(args[0], "run");
+        assert!(args.contains(&"--pure".to_string()) && args.contains(&"--print-logs".to_string()));
+        assert_eq!(at("--format"), Some("json"));
+        assert_eq!(at("--log-level"), Some("ERROR"));
+        assert_eq!(at("--agent"), Some(OPENCODE_AGENT));
+        assert_eq!(at("-m"), Some("opencode/grok-code-fast-1-free"));
+        assert_eq!(at("--dir"), Some(r"C:\t\fine-file-ai-1"));
+        for never in ["--auto", "--share", "--continue", "-c", "--session", "-s", "--fork", "--attach", "--port", "--command", "--file", "-f", "--interactive", "-i"] {
+            assert!(!args.contains(&never.to_string()), "{never}");
+        }
+        // The prompt goes on stdin; nothing a .cmd shim would choke on.
+        assert!(args.iter().all(|a| !a.contains(['\r', '\n', '"']) && !a.contains(crate::ai::SYSTEM)), "{args:?}");
+
+        let env = opencode_env(crate::ai::SYSTEM);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!((get("OPENCODE_DISABLE_PROJECT_CONFIG"), get("OPENCODE_DISABLE_AUTOUPDATE")), (Some("1"), Some("1")));
+        let text = get("OPENCODE_CONFIG_CONTENT").unwrap();
+        assert!(!text.contains("allow"), "{text}");
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!((v["permission"]["*"].as_str(), v["share"].as_str(), v["autoupdate"].as_bool()), (Some("deny"), Some("disabled"), Some(false)));
+        assert_eq!(v["mcp"], json!({}));
+        let agent = &v["agent"][OPENCODE_AGENT];
+        assert_eq!((agent["mode"].as_str(), agent["prompt"].as_str(), agent["permission"]["*"].as_str()), (Some("primary"), Some(crate::ai::SYSTEM), Some("deny")));
+        for tool in OPENCODE_TOOLS {
+            assert_eq!(agent["tools"][tool], false, "{tool}");
+        }
+    }
+
+    #[test]
+    fn opencode_events_and_errors() {
+        let model = "opencode/grok-code-fast-1-free";
+        // stderr: what was measured, and other failures it must not wait 300 s for.
+        let free = r#"ERROR 2026-11-12T10:00:00 +12ms service=session level=ERROR message="stream error" error="AI_APICallError: Free usage limit reached""#;
+        assert_eq!(opencode_log_error(free, model).as_deref(), Some(FREE_LIMIT));
+        let auth = r#"level=ERROR service=llm message="stream error" error="AI_APICallError: Unauthorized: invalid x-api-key""#;
+        assert!(opencode_log_error(auth, model).unwrap().contains("opencode auth login"));
+        let missing = r#"level=ERROR service=session error="ProviderModelNotFoundError: model not found""#;
+        assert!(opencode_log_error(missing, model).unwrap().contains(model));
+        let odd = r#"level=ERROR service=llm message="stream error" error="AI_RetryError: something odd at https://x/y?key=abc""#;
+        let e = opencode_log_error(odd, model).unwrap();
+        assert!(e.contains("AI_RetryError") && !e.contains("key=abc"), "{e}");
+        assert_eq!(opencode_log_error(r#"level=ERROR service=plugin message="failed to load plugin""#, model), None);
+        assert_eq!(opencode_log_error("level=INFO service=bus message=\"stream error\"", model), None);
+
+        // stdout: a tool, a permission request, an error or anything unknown ends the run; the rest goes on.
+        for go_on in [r#"{"type":"step_start","part":{"messageID":"m1"}}"#, r#"{"type":"text","part":{"type":"text","text":"a","messageID":"m1"}}"#, r#"{"type":"reasoning","part":{}}"#, r#"{"type":"step_finish","part":{"reason":"stop","messageID":"m1"}}"#, "not json"] {
+            assert_eq!(opencode_event_stop(go_on, model), None, "{go_on}");
+        }
+        for stop in [r#"{"type":"tool_use","part":{"tool":"write"}}"#, r#"{"type":"permission.asked"}"#, r#"{"type":"patch"}"#] {
+            assert_eq!(opencode_event_stop(stop, model).as_deref(), Some(TOOL_STOP), "{stop}");
+        }
+        assert_eq!(opencode_event_stop(r#"{"type":"error","error":{"name":"APIError","data":{"message":"Free usage limit reached"}}}"#, model).as_deref(), Some(FREE_LIMIT));
+
+        // Only the last message's text, and only after a clean "stop".
+        let out = [
+            r#"{"type":"step_start","part":{"messageID":"m1"}}"#,
+            r#"{"type":"text","part":{"type":"text","text":"먼저 ","messageID":"m1"}}"#,
+            r#"{"type":"step_finish","part":{"reason":"tool-calls","messageID":"m1"}}"#,
+            r#"{"type":"step_start","part":{"messageID":"m2"}}"#,
+            r#"{"type":"text","part":{"type":"text","text":"{\"title\":","messageID":"m2"}}"#,
+            r#"{"type":"text","part":{"type":"text","text":"\"정리\"}","messageID":"m2"}}"#,
+            r#"{"type":"step_finish","part":{"reason":"stop","messageID":"m2","tokens":{"input":900,"output":20}}}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_answer(&out, Some(0)).unwrap(), "{\"title\":\"정리\"}");
+        assert!(opencode_answer(&out, Some(1)).unwrap_err().contains("종료 코드 1"));
+        assert!(opencode_answer(&out, None).is_err());
+        let cut = out.replace(r#""reason":"stop""#, r#""reason":"length""#);
+        assert_eq!(opencode_answer(&cut, Some(0)).unwrap_err(), CUT_OFF);
+        assert!(opencode_answer(r#"{"type":"text","part":{"text":"a","messageID":"m"}}"#, Some(0)).is_err());
+        let empty = r#"{"type":"step_finish","part":{"reason":"stop","messageID":"m9"}}"#;
+        assert_eq!(opencode_answer(empty, Some(0)).unwrap_err(), EMPTY_ANSWER);
+    }
+
+    #[test]
+    fn opencode_model_lists() {
+        let out = "\u{1b}[33mwarn\u{1b}[0m something\nopencode/grok-code-fast-1-free\nanthropic/claude-sonnet-5-5\n\nanthropic/claude-sonnet-5-5\nnot a model\n";
+        assert_eq!(opencode_models_of(out), ["anthropic/claude-sonnet-5-5", "opencode/grok-code-fast-1-free"]);
     }
 
     /// Needs FINE_FILE_COMPAT_URL and FINE_FILE_COMPAT_MODEL and the key saved for that address.
