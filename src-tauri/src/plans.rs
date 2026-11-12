@@ -3777,7 +3777,7 @@ mod tests {
 
     #[test]
     fn rules_text_adds_nothing_to_an_empty_plan() {
-        let (_, summary) = rules_text("cleanup", &[], 0, None, 3, 5, false);
+        let (_, summary) = rules_text("cleanup", &[], 0, None, 3, 0, false);
         assert_eq!(summary, "정리할 캐시·임시 파일을 찾지 못했어요");
     }
 

@@ -155,6 +155,9 @@ function savedScope(): ScopeId {
 const localDrives = (drives: DriveInfo[]) =>
   drives.filter((d) => (d.kind === "fixed" || d.kind === "removable") && !d.subst);
 
+/** What "컴퓨터 전체" covers: the fixed drives. A removable drive usually has no Recycle Bin; it keeps its own chip. */
+const computerDrives = (drives: DriveInfo[]) => localDrives(drives).filter((d) => d.kind === "fixed");
+
 /**
  * The 정리할 곳 used now: the one chosen, or "지금 보는 곳" while it cannot be used (the profile
  * folder not known yet, the drive gone or not indexed, no local drive indexed). The choice itself
@@ -162,7 +165,7 @@ const localDrives = (drives: DriveInfo[]) =>
  */
 function liveScope(scope: ScopeId, drives: DriveInfo[], home: string | null): ScopeId {
   if (scope === "home") return home ? scope : "here";
-  if (scope === "all") return localDrives(drives).some((d) => d.indexed) ? scope : "here";
+  if (scope === "all") return computerDrives(drives).some((d) => d.indexed) ? scope : "here";
   if (scope.startsWith("drive:")) {
     const letter = scope.slice("drive:".length);
     return localDrives(drives).some((d) => d.letter.toUpperCase() === letter && d.indexed) ? scope : "here";
@@ -447,7 +450,7 @@ export function useHelper(
 
   /**
    * A rule plan for the 정리할 곳 used now (liveScope). One folder: its plan opens, or why there is
-   * none is said. "컴퓨터 전체": one plan per indexed local drive, one drive after another (each reads
+   * none is said. "컴퓨터 전체": one plan per indexed fixed drive, one drive after another (each reads
    * that drive's index, some kinds its files), the largest of them opened at the end; the whole run
    * is one request.
    */
@@ -462,7 +465,7 @@ export function useHelper(
       const runs: RuleRun[] = [];
       patch(key, { error: null, made: null, nothing: null, runs: [], ruleKind: kind });
       try {
-        for (const d of localDrives(drives)) {
+        for (const d of computerDrives(drives)) {
           if (!d.indexed) {
             runs.push({ label: d.letter, plan: null, text: "스캔 안 함 (먼저 스캔해 주세요)", error: false });
             patch(key, { runs: [...runs] });
@@ -801,8 +804,9 @@ function ScopeChips(p: {
   onScope: (id: ScopeId) => void;
 }) {
   const local = localDrives(p.drives);
-  const ready = local.filter((d) => d.indexed).map((d) => d.letter);
-  const unscanned = local.filter((d) => !d.indexed).map((d) => d.letter);
+  const computer = computerDrives(p.drives);
+  const ready = computer.filter((d) => d.indexed).map((d) => d.letter);
+  const unscanned = computer.filter((d) => !d.indexed).map((d) => d.letter);
   const chips: { id: ScopeId; label: string; title?: string; off: boolean }[] = [
     { id: "here", label: `지금 보는 곳 · ${shown(p.target.name)}`, title: shown(p.target.path), off: false },
     {
@@ -817,7 +821,7 @@ function ScopeChips(p: {
       title: !d.indexed ? "먼저 이 드라이브를 스캔해 주세요" : d.label ? `${shown(d.label)} (${d.letter})` : undefined,
       off: !d.indexed,
     })),
-    { id: "all", label: "컴퓨터 전체", title: ready.length ? undefined : "먼저 드라이브를 스캔해 주세요", off: !ready.length },
+    { id: "all", label: "컴퓨터 전체", title: ready.length ? "고정 드라이브만 봐요. 이동식 드라이브는 따로 골라 주세요" : "먼저 드라이브를 스캔해 주세요", off: !ready.length },
   ];
   const where =
     p.scope === "here"

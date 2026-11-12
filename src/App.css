@@ -1309,6 +1309,7 @@ input {
   border: 1px solid var(--line);
   box-shadow: var(--shadow);
   overflow-wrap: anywhere;
+  white-space: pre-line;
 }
 
 .toast.error {
