@@ -61,6 +61,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 /// Steps a plan from AI or MCP keeps at most (rules make no more either).
 const MAX_STEPS: usize = 500;
+/// How many candidates a rules plan checks against the disk before it stops looking.
+const MAX_CHECKS: usize = 2000;
 /// Progress events of a run are at least this far apart (state changes
 /// excepted); the tests hear every one.
 const PROGRESS_GAP: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_millis(100) };
@@ -336,7 +338,7 @@ pub fn plan_get(id: String) -> Result<Plan, String> {
 
 /// A plan made by rules (no AI) for `path`: kind "cleanup" | "dedupe" | "shrink" | "relocate".
 #[tauri::command]
-pub async fn plan_rules(kind: String, path: String, state: tauri::State<'_, crate::AppState>) -> Result<Plan, String> {
+pub async fn plan_rules(kind: String, path: String, state: tauri::State<'_, crate::AppState>) -> Result<RulesResult, String> {
     let root = norm(&path).ok_or(BAD_PATH)?;
     let drive = crate::drive_of(&root).ok_or(BAD_PATH)?;
     let shared = state.get(&drive).ok_or(SCAN_FIRST)?;
@@ -2355,16 +2357,64 @@ mod pack {
 
 // ---- Rules ------------------------------------------------------------------------
 
+/// What `plan_rules` gives: the plan (none when no step held), the summary
+/// text, why candidates were left out, and how many were never looked at.
+#[derive(Serialize)]
+pub struct RulesResult {
+    /// None: no step held, nothing is saved.
+    pub plan: Option<Plan>,
+    pub summary: String,
+    pub dropped: Vec<Dropped>,
+    pub left: usize,
+}
+
+/// Candidates left out of a rules plan for one reason.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Dropped {
+    pub why: String,
+    pub count: usize,
+}
+
+/// What `fill_steps` made of the candidates.
+struct Filled<T> {
+    kept: Vec<T>,
+    dropped: Vec<Dropped>,
+    left: usize,
+}
+
+/// Looks at the candidates in order until `max` pass or `max_checks` have been
+/// checked; the ones that do not pass are counted by reason (most first, equal
+/// counts by reason) and the rest are never looked at (`left`).
+fn fill_steps<T>(cands: Vec<T>, max: usize, max_checks: usize, mut check: impl FnMut(&T) -> Result<(), String>) -> Filled<T> {
+    let total = cands.len();
+    let mut kept = Vec::new();
+    let mut why: HashMap<String, usize> = HashMap::new();
+    let mut seen = 0usize;
+    for c in cands {
+        if kept.len() >= max || seen >= max_checks {
+            break;
+        }
+        seen += 1;
+        match check(&c) {
+            Ok(()) => kept.push(c),
+            Err(e) => *why.entry(e).or_insert(0) += 1,
+        }
+    }
+    let mut dropped: Vec<Dropped> = why.into_iter().map(|(why, count)| Dropped { why, count }).collect();
+    dropped.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.why.cmp(&b.why)));
+    Filled { kept, dropped, left: total - seen }
+}
+
 /// A plan made by rules for the folder `root` from the index, saved as a
-/// draft. The index can be behind the disk: a step that does not hold on the
-/// disk now is left out.
-fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> Result<Plan, String> {
+/// draft unless no step holds. The index can be behind the disk: a step that
+/// does not hold on the disk now is left out, and the next candidates take its place.
+fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> Result<RulesResult, String> {
     let now = now_filetime();
     // Found before the index is locked: asking every drive takes a moment.
     let target = if kind == "relocate" { relocation_target(root) } else { None };
     let mut groups = 0usize;
     // Each step with, for a duplicate, the copy that stays.
-    let mut steps: Vec<(PlanStep, Option<Keep>)> = {
+    let steps: Vec<(PlanStep, Option<Keep>)> = {
         let ix = shared.read().unwrap_or_else(PoisonError::into_inner);
         let top = ix.find(root).ok_or(NOT_INDEXED)?;
         let flags = ix.nodes[top as usize].flags;
@@ -2399,8 +2449,11 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         }
     };
     let ctx = Ctx::now();
-    steps.retain(|(s, keep)| check(&ctx, root, s, None).is_ok() && keep.as_ref().is_none_or(|k| twin_refusal(&s.from, k).is_ok()));
-    steps.truncate(MAX_STEPS);
+    let Filled { kept: mut steps, dropped, left } = fill_steps(steps, MAX_STEPS, MAX_CHECKS, |(s, keep)| {
+        check(&ctx, root, s, None)?;
+        keep.as_ref().map_or(Ok(()), |k| twin_refusal(&s.from, k))
+    });
+    let n_dropped: usize = dropped.iter().map(|d| d.count).sum();
     let mut keeps = Vec::new();
     for ((s, keep), id) in steps.iter_mut().zip(1..) {
         s.id = id;
@@ -2410,12 +2463,15 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         }
     }
     let steps: Vec<PlanStep> = steps.into_iter().map(|(s, _)| s).collect();
-    let (title, summary) = rules_text(kind, &steps, groups, target.as_ref().map(|(d, _)| d.as_str()));
+    let (title, summary) = rules_text(kind, &steps, groups, target.as_ref().map(|(d, _)| d.as_str()), n_dropped, left);
+    if steps.is_empty() {
+        return Ok(RulesResult { plan: None, summary, dropped, left });
+    }
     let plan = Plan {
         id: new_id(),
         kind: kind.into(),
         title,
-        summary,
+        summary: summary.clone(),
         source: "rules".into(),
         root: root.into(),
         created_at: now,
@@ -2423,7 +2479,7 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         state: "draft".into(),
     };
     store.write(&PlanFile { keeps, ..PlanFile::new(plan.clone()) }).map_err(|e| e.to_string())?;
-    Ok(plan)
+    Ok(RulesResult { plan: Some(plan), summary, dropped, left })
 }
 
 /// A Recycle Bin step another part of the app found by its own rules.
@@ -2486,7 +2542,7 @@ fn rules_trash(
     Ok(plan)
 }
 
-fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str>) -> (String, String) {
+fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str>, dropped: usize, left: usize) -> (String, String) {
     let total: u64 = steps.iter().map(|s| s.size).sum();
     let n = steps.len();
     let picked = steps.iter().filter(|s| s.selected).count();
@@ -2527,6 +2583,17 @@ fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str
             },
         ),
     };
+    let mut summary = summary;
+    // With no step the reasons go to the caller as they are; saying them here too would repeat them.
+    if n > 0 {
+        if dropped > 0 {
+            summary.push_str(&format!(" 후보 {dropped}개는 확인에서 뺐어요."));
+        }
+        if left > 0 {
+            let order = if kind == "cleanup" { "큰 것부터" } else { "앞에서부터" };
+            summary.push_str(&format!(" 후보가 많아서 {order} {MAX_STEPS}개만 넣었어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요."));
+        }
+    }
     (title.to_string(), summary)
 }
 
@@ -2711,7 +2778,6 @@ fn cleanup_steps(ix: &Index, top: u32, top_path: &str, now: i64) -> Vec<PlanStep
         false
     });
     steps.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.from.cmp(&b.from)));
-    steps.truncate(MAX_STEPS);
     steps
 }
 
@@ -3640,6 +3706,58 @@ mod tests {
             }
         }
         Index::build("C:", "test", 0, raw, 1)
+    }
+
+    fn drop_of(why: &str, count: usize) -> Dropped {
+        Dropped { why: why.into(), count }
+    }
+
+    #[test]
+    fn fill_steps_refills_past_refused() {
+        let got = fill_steps((1..=10).collect(), 3, 100, |n: &i32| if n % 2 == 0 { Err("짝수".to_string()) } else { Ok(()) });
+        assert_eq!(got.kept, vec![1, 3, 5]);
+        assert_eq!(got.dropped, vec![drop_of("짝수", 2)]);
+        assert_eq!(got.left, 5);
+    }
+
+    #[test]
+    fn fill_steps_stops_at_check_limit() {
+        let got = fill_steps((1..=10).collect(), 3, 4, |_: &i32| Err("안 돼".to_string()));
+        assert!(got.kept.is_empty());
+        assert_eq!(got.dropped, vec![drop_of("안 돼", 4)]);
+        assert_eq!(got.left, 6);
+    }
+
+    #[test]
+    fn fill_steps_orders_reasons_by_count() {
+        let why = ["a", "b", "c", "b", "c", "b", "c"];
+        let got = fill_steps(why.to_vec(), 10, 100, |w: &&str| Err(w.to_string()));
+        assert_eq!(got.dropped, vec![drop_of("b", 3), drop_of("c", 3), drop_of("a", 1)]);
+    }
+
+    #[test]
+    fn rules_plan_saves_nothing_when_empty() {
+        let now = now_filetime();
+        let ix = index_of(&[(r"Users\me\AppData\Local\Temp\old.tmp", false, 5 * MB, 5 * MB, 3)], now);
+        let shared: crate::Shared = Arc::new(std::sync::RwLock::new(ix));
+        let t = Temp::new("rules-empty");
+        let store = t.store();
+        let got = rules_plan(&store, "cleanup", r"C:\Users\me", &shared).unwrap();
+        assert!(got.plan.is_none());
+        assert_eq!(got.dropped, vec![drop_of(MISSING, 1)]);
+        assert_eq!(got.summary, "정리할 캐시·임시 파일을 찾지 못했어요");
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn rules_text_says_what_was_left_out() {
+        let step = trash_step(r"C:\x\a.tmp".into(), MB, "safe", "r".into());
+        let (_, summary) = rules_text("cleanup", std::slice::from_ref(&step), 0, None, 4, 7);
+        assert!(summary.contains("후보 4개는 확인에서 뺐어요"), "{summary}");
+        assert!(summary.contains("큰 것부터 500개만 넣었어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요"), "{summary}");
+        let (_, summary) = rules_text("dedupe", std::slice::from_ref(&step), 1, None, 0, 7);
+        assert!(summary.contains("앞에서부터 500개만"), "{summary}");
+        assert!(!summary.contains("큰 것부터"), "{summary}");
     }
 
     fn froms(steps: &[PlanStep]) -> Vec<(&str, &str, bool)> {
