@@ -128,7 +128,12 @@ function errText(err: unknown): string {
 
 /** The text shown when a rule plan found nothing: the summary, then up to three reasons candidates were left out. */
 export function rulesNothingText(r: RulesResult): string {
-  return [r.summary, ...r.dropped.slice(0, 3).map((d) => `후보 ${d.count.toLocaleString()}개: ${d.why}`)].join("\n");
+  const lines = [r.summary, ...r.dropped.slice(0, 3).map((d) => `후보 ${d.count.toLocaleString()}개: ${d.why}`)];
+  // The check limit stopped it before the rest was seen: say so, or "nothing found" reads as final.
+  if (r.left > 0) {
+    lines.push(`앞쪽 후보가 모두 빠져서 나머지 후보 ${r.left.toLocaleString()}개는 확인하지 않았어요. 더 좁은 곳을 골라 다시 만들어 주세요.`);
+  }
+  return lines.join("\n");
 }
 
 // ---- 정리할 곳: where the rule plans look ----
@@ -486,7 +491,7 @@ export function useHelper(
                     text: `${r.plan.steps.length.toLocaleString()}개 · ${formatSize(stepsSize(r.plan))}`,
                     error: false,
                   }
-                : { label: d.letter, plan: null, text: rulesNothingText(r).split("\n")[0], error: false },
+                : { label: d.letter, plan: null, text: rulesNothingText(r).split("\n")[0] + (r.left > 0 ? ` (나머지 ${r.left.toLocaleString()}개는 확인하지 않았어요)` : ""), error: false },
             );
           } catch (err) {
             runs.push({ label: d.letter, plan: null, text: `만들지 못했어요: ${errText(err)}`, error: true });
