@@ -76,11 +76,11 @@ const KIND_LABEL: Record<Plan["kind"], string> = {
   dedupe: "중복 정리",
   shrink: "용량 줄이기",
   relocate: "다른 드라이브로 옮기기",
-  cleanup: "정리 후보",
+  cleanup: "캐시·임시 파일",
 };
 
 const SOURCE_LABEL: Record<Plan["source"], { label: string; title: string }> = {
-  rules: { label: "규칙", title: "AI 없이 규칙으로 만든 계획" },
+  rules: { label: "AI 없이", title: "\"정리할 것 찾기\"로 앱에 정해진 기준에 따라 만든 계획 (AI 없이)" },
   claude: { label: "Claude", title: "Claude API가 제안한 계획" },
   openai: { label: "OpenAI", title: "OpenAI API가 제안한 계획" },
   ollama: { label: "Ollama", title: "Ollama(내 PC)가 제안한 계획" },

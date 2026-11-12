@@ -87,9 +87,9 @@ export const TIPS: Record<string, string> = {
   reveal: "Windows 탐색기를 열어 이 항목을 골라 둬요",
   goParent: "이 항목이 들어 있는 폴더를 이 탭에서 열어요",
   copyPath: "전체 경로를 글자로 클립보드에 복사해요",
-  helperOpen: "옆 창의 정리 도우미가 이 폴더를 봐요. AI 설명과 정리 계획(규칙으로는 AI 없이)을 거기서 받아요",
+  helperOpen: "옆 창의 정리 도우미가 이 폴더를 봐요. AI 설명과 정리 계획(\"정리할 것 찾기\"는 AI 없이)을 거기서 받아요",
   helperOpenFile: "옆 창의 정리 도우미가 이 파일을 봐요. 무엇인지, 지워도 되는지 AI 설명을 거기서 받아요 (AI는 켜야 쓰는 선택 기능)",
-  planMenu: "규칙(AI 없이)이나 AI로 이 폴더의 정리 계획을 만들어요. 만들기만 하고, 계획 창에서 확인하고 실행해야 바뀌어요",
+  planMenu: "\"정리할 것 찾기\"(AI 없이)나 AI로 이 폴더의 정리 계획을 만들어요. 만들기만 하고, 계획 창에서 확인하고 실행해야 바뀌어요",
   more: "더 보기: 창이 좁아서 접어 둔 명령이에요 (정리 메뉴, 열 더 보기…)",
   help: "도움말 (F1): 기능 설명, 검색 문법, 문제 해결",
   drive: "이 드라이브를 열어요. 가운데 클릭하면 새 탭에서 열려요",
@@ -449,7 +449,7 @@ type AiPlanTask = "structure" | "rename";
 type RuleKind = "cleanup" | "dedupe" | "shrink" | "relocate";
 
 const RULE_ITEMS: { kind: RuleKind; label: string; note: string }[] = [
-  { kind: "cleanup", label: "정리 후보", note: "캐시·임시 파일, 오래된 설치 파일 (휴지통으로)" },
+  { kind: "cleanup", label: "캐시·임시 파일", note: "오래된 설치·압축 파일, 오래 안 쓴 큰 파일도 (휴지통으로)" },
   { kind: "dedupe", label: "중복 정리", note: "내용이 같은 파일은 하나만 남기기 (휴지통으로)" },
   { kind: "shrink", label: "용량 줄이기", note: "큰 파일을 Windows 압축으로 (언제든 풀 수 있어요)" },
   { kind: "relocate", label: "다른 드라이브로 옮기기", note: "큰 폴더를 옮기고 링크 남기기" },
@@ -471,7 +471,7 @@ const PROVIDER_NAME: Record<AiConfig["provider"], string> = {
 
 /** What AI-only buttons say while AI is off: where to turn it on. */
 const AI_OFF_HELP =
-  "AI가 꺼져 있어요. 툴바의 톱니바퀴(AI 설정)에서 쓸 AI(내 API 키, Ollama, 내가 로그인한 CLI)를 고르면 쓸 수 있어요. 규칙으로 만드는 계획은 AI 없이 동작해요";
+  "AI가 꺼져 있어요. 툴바의 톱니바퀴(AI 설정)에서 쓸 AI(내 API 키, Ollama, 내가 로그인한 CLI)를 고르면 쓸 수 있어요. \"정리할 것 찾기\"는 AI 없이 동작해요";
 
 /** Why AI requests cannot go now, in words the user can act on; null when they can. */
 function aiBlocker(s: AiState | null): string | null {
@@ -2733,7 +2733,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     const why = aiBlocker(p.ai);
     return (
       <PlanFlyout>
-        <div className="menu-label">규칙으로 (AI 없이)</div>
+        <div className="menu-label">정리할 것 찾기 (AI 없이)</div>
         {RULE_ITEMS.map((r) => (
           <button
             key={r.kind}

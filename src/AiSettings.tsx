@@ -379,7 +379,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
         {draft && (
           <>
             <p className="muted v06-lead">
-              AI는 고를 때만 쓰는 선택 기능이에요. 꺼 두어도 탐색, 검색, 크기 지도, 규칙으로 만드는 정리 계획까지 모든 기능이
+              AI는 고를 때만 쓰는 선택 기능이에요. 꺼 두어도 탐색, 검색, 크기 지도, "정리할 것 찾기"의 정리 계획까지 모든 기능이
               그대로 동작해요.
             </p>
 

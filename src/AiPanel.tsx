@@ -97,7 +97,11 @@ const FILE_ACTIONS: { id: AiTask; label: string; desc: string }[] = [
 ];
 
 const RULE_ACTIONS: { id: RuleKind; label: string; desc: string }[] = [
-  { id: "cleanup", label: "정리 후보", desc: "캐시·임시 파일처럼 지워도 될 만한 항목을 찾아요. 휴지통으로만 보내요" },
+  {
+    id: "cleanup",
+    label: "캐시·임시 파일",
+    desc: "캐시·임시 파일, 다운로드의 오래된 설치·압축 파일, 오래 안 쓴 큰 파일을 찾아요. 휴지통으로만 보내요",
+  },
   { id: "dedupe", label: "중복 정리", desc: "내용이 똑같은 파일을 하나만 남기고 휴지통으로 보내는 계획이에요" },
   { id: "shrink", label: "용량 줄이기", desc: "큰 파일을 Windows 압축으로 줄여요. 언제든 풀 수 있어요" },
   { id: "relocate", label: "다른 드라이브로 옮기기", desc: "큰 폴더를 다른 드라이브로 옮기고 원래 자리에 링크를 남겨요" },
@@ -226,7 +230,7 @@ function aiProblem(s: Settings, k: KeyStatus | null, file: boolean): string | nu
     case "off":
       return file
         ? "AI가 꺼져 있어요. AI 설정에서 쓸 AI를 고르면 쓸 수 있어요."
-        : "AI가 꺼져 있어요. AI 설정에서 쓸 AI를 고르면 쓸 수 있어요. 아래의 규칙으로 만드는 계획은 AI 없이 동작해요.";
+        : "AI가 꺼져 있어요. AI 설정에서 쓸 AI를 고르면 쓸 수 있어요. 아래의 \"정리할 것 찾기\"는 AI 없이 동작해요.";
     case "claude":
       return k && !k.claude ? "Claude API 키가 없어요. AI 설정에서 키를 넣어 주세요." : null;
     case "openai":
@@ -726,9 +730,12 @@ export function HelperPane(p: HelperPaneProps) {
 
       <section className="v06-section">
         <div className="v06-section-head">
-          <h4>규칙으로 계획 만들기</h4>
-          <span className="muted">AI 없이 이 컴퓨터에서 만들어요</span>
+          <h4>정리할 것 찾기</h4>
         </div>
+        <p className="muted v06-lead">
+          캐시·중복·큰 파일을 앱에 정해진 기준으로 찾아서 할 일 목록으로 보여 줘요. AI는 쓰지 않아요. 목록에서 "실행"을
+          눌러야 파일이 바뀌어요.
+        </p>
         <ScopeChips
           target={t}
           scope={scope}
