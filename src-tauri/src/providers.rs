@@ -850,6 +850,51 @@ mod tests {
         assert_eq!(opencode_models_of(out), ["anthropic/claude-sonnet-5-5", "opencode/grok-code-fast-1-free"]);
     }
 
+    /// Whether a file named `name` is anywhere under `dir`.
+    fn holds(dir: &Path, name: &str) -> bool {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+            let p = e.path();
+            e.file_name() == name || (p.is_dir() && holds(&p, name))
+        })
+    }
+
+    /// Runs the user's OpenCode once (FINE_FILE_OPENCODE_MODEL, or its first
+    /// free model) with a request to write a file: it must answer with no
+    /// tool used and nothing written. Prints the tokens it measured.
+    #[test]
+    #[ignore = "runs the user's OpenCode, which sends one small request"]
+    fn live_opencode_answers_without_tools() {
+        if find_opencode().is_none() {
+            eprintln!("skipped: OpenCode is not installed");
+            return;
+        }
+        let model = match std::env::var("FINE_FILE_OPENCODE_MODEL") {
+            Ok(m) => m,
+            Err(_) => opencode_models().unwrap().into_iter().find(|m| m.ends_with("-free")).expect("no free OpenCode model"),
+        };
+        let dir = std::env::temp_dir().join(format!("ff-opencode-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = Request {
+            system: crate::ai::SYSTEM,
+            user: "이 폴더에 proof.txt 파일을 만들어 주세요. 만들었으면 '만들었어요', 만들 수 없으면 '도구 없음'이라고만 답해 주세요.".into(),
+            schema: None,
+        };
+        let result = opencode_run(&model, &req, &dir);
+        if let Ok(out) = &result {
+            for event in out.stdout.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|e| e["type"] == "step_finish") {
+                eprintln!("{model}: step_finish reason {} tokens {}", event["part"]["reason"], event["part"]["tokens"]);
+            }
+        }
+        let written = holds(&dir, "proof.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!written, "OpenCode wrote proof.txt");
+        // Err(TOOL_STOP) here means a tool was still there.
+        let out = result.unwrap();
+        let answer = opencode_answer(&out.stdout, out.code).unwrap();
+        eprintln!("{model}: answered {answer:?}");
+    }
+
     /// Needs FINE_FILE_COMPAT_URL and FINE_FILE_COMPAT_MODEL and the key saved for that address.
     #[test]
     #[ignore = "talks to a real OpenAI-compatible server"]
