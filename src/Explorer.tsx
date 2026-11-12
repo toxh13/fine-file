@@ -34,7 +34,7 @@ import {
   type Risk,
 } from "./api";
 import { AdminBar, adminCanRead, adminError, ensureAdmin } from "./AdminSession";
-import { contentsNote, HelperPane, useHelper, type HelperTarget } from "./AiPanel";
+import { contentsNote, HelperPane, rulesNothingText, useHelper, type HelperTarget } from "./AiPanel";
 import { AiSettings } from "./AiSettings";
 import { Caret, FOLD_MAX, Icon, MenuButton, MenuRow, useFold } from "./CommandBar";
 import { Dialog, Duplicates } from "./Duplicates";
@@ -2602,7 +2602,9 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
     planning.current = true;
     setWorking(`${label} 계획을 만드는 중…`);
     try {
-      showPlan((await plans.rules(kind, at)).id);
+      const r = await plans.rules(kind, at);
+      if (r.plan) showPlan(r.plan.id);
+      else toast(rulesNothingText(r));
     } catch (err) {
       toast(`계획을 만들지 못했어요: ${err}`, "error");
     } finally {

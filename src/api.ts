@@ -539,11 +539,25 @@ export const aiEvents = {
     listen<FindProgress>("ai-find-progress", (e) => f(e.payload)),
 };
 
+/** A candidate the checks left out, and how many were left out for that reason. */
+export interface RulesDropped {
+  why: string;
+  count: number;
+}
+
+/** What a rule plan found: `plan` is null when nothing passed the checks and nothing was saved. */
+export interface RulesResult {
+  plan: Plan | null;
+  summary: string;
+  dropped: RulesDropped[];
+  left: number;
+}
+
 export const plans = {
   list: () => invoke<Plan[]>("plans_list"),
   get: (id: string) => invoke<Plan>("plan_get", { id }),
   rules: (kind: "cleanup" | "dedupe" | "shrink" | "relocate", path: string) =>
-    invoke<Plan>("plan_rules", { kind, path }),
+    invoke<RulesResult>("plan_rules", { kind, path }),
   update: (plan: Plan) => invoke<Plan>("plan_update", { plan }),
   execute: (id: string) => invoke<void>("plan_execute", { id }),
   undo: (id: string) => invoke<void>("plan_undo", { id }),

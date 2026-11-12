@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ai, plans, type AiPayloadPreview, type AiSettings as Settings, type KeyStatus } from "./api";
+import { ai, plans, type AiPayloadPreview, type RulesResult, type AiSettings as Settings, type KeyStatus } from "./api";
 import { tip } from "./Explorer";
 import { formatSize, pathKey, shown } from "./format";
 import { Markdown } from "./markdown";
@@ -90,6 +90,11 @@ function errText(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** The text shown when a rule plan found nothing: the summary, then up to three reasons candidates were left out. */
+export function rulesNothingText(r: RulesResult): string {
+  return [r.summary, ...r.dropped.slice(0, 3).map((d) => `후보 ${d.count.toLocaleString()}개: ${d.why}`)].join("\n");
 }
 
 /**
@@ -309,9 +314,13 @@ export function useHelper(shown: boolean, stamp: unknown, onPlan: (planId: strin
     patch(key, { error: null, made: null });
     begin(t, kind, "send");
     try {
-      const plan = await plans.rules(kind, t.path);
-      patch(key, { made: { id: plan.id, label: labelOf(kind), where: "rules" } });
-      if (alive.current) planRef.current(plan.id, t);
+      const r = await plans.rules(kind, t.path);
+      if (!r.plan) {
+        patch(key, { error: { where: "rules", text: rulesNothingText(r) } });
+      } else {
+        patch(key, { made: { id: r.plan.id, label: labelOf(kind), where: "rules" } });
+        if (alive.current) planRef.current(r.plan.id, t);
+      }
     } catch (err) {
       patch(key, { error: { where: "rules", text: `계획을 만들지 못했어요: ${errText(err)}` } });
     } finally {

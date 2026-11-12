@@ -1555,7 +1555,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
         )}
         {plan && draft && (
           <button className="btn" disabled={busy} onClick={() => setConfirm("delete")}>
-            삭제
+            계획 지우기
           </button>
         )}
         {canUndo && (
@@ -1654,7 +1654,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
           <div className="actions">
             <button onClick={() => setConfirm(null)}>취소</button>
             <button className="primary danger" autoFocus onClick={() => void remove()}>
-              삭제
+              계획 지우기
             </button>
           </div>
         </Dialog>
