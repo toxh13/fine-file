@@ -200,8 +200,11 @@ pub struct Plan {
     pub kind: String,
     pub title: String,
     pub summary: String,
-    /// "rules" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli" | "mcp"
+    /// One of `ai::PROVIDERS` (not "off"), "rules" or "mcp".
     pub source: String,
+    /// Where an OpenAI-compatible API plan came from (its host, for the screen); empty for any other source.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
     /// The folder the plan is about.
     pub root: String,
     /// FILETIME
@@ -1008,9 +1011,13 @@ fn review(plan: &mut Plan, ctx: &Ctx, keeps: &[Keep]) {
 }
 
 const KINDS: &[&str] = &["structure", "rename", "dedupe", "shrink", "relocate", "cleanup"];
-const SOURCES: &[&str] = &["rules", "claude", "openai", "ollama", "claude_cli", "codex_cli", "mcp"];
 const ACTIONS: &[&str] = &["mkdir", "move", "rename", "trash", "compress", "relocate"];
 const RISKS: &[&str] = &["safe", "caution", "danger"];
+
+/// A plan's source: a connection (`ai::PROVIDERS`, not "off"), the rules or MCP.
+fn source_ok(source: &str) -> bool {
+    source == "rules" || source == "mcp" || (source != "off" && crate::ai::PROVIDERS.contains(&source))
+}
 
 fn invalid(why: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, why.to_string())
@@ -1040,7 +1047,7 @@ fn admit(mut plan: Plan) -> io::Result<Plan> {
     if !KINDS.contains(&plan.kind.as_str()) {
         return Err(invalid(BAD_KIND));
     }
-    if !SOURCES.contains(&plan.source.as_str()) {
+    if !source_ok(&plan.source) {
         return Err(invalid(BAD_SOURCE));
     }
     // Rules write their plans themselves; one that says it is theirs is not believed.
@@ -1053,6 +1060,7 @@ fn admit(mut plan: Plan) -> io::Result<Plan> {
     }
     plan.title = clip(&plan.title, 120);
     plan.summary = clip(&plan.summary, 2000);
+    plan.via = if plan.source == "compat" { clip(&plan.via, 100) } else { String::new() };
     plan.state = "draft".into();
     if plan.created_at <= 0 {
         plan.created_at = now_filetime();
@@ -2477,6 +2485,7 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         title,
         summary: summary.clone(),
         source: "rules".into(),
+        via: String::new(),
         root: root.into(),
         created_at: now,
         steps,
@@ -2535,6 +2544,7 @@ fn rules_trash(
         title: clip(title, 120),
         summary: String::new(),
         source: "rules".into(),
+        via: String::new(),
         root,
         created_at: now_filetime(),
         steps,
@@ -3071,6 +3081,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sources_follow_the_providers() {
+        for p in crate::ai::PROVIDERS.iter().filter(|p| **p != "off") {
+            assert!(source_ok(p), "{p}");
+        }
+        assert!(source_ok("rules") && source_ok("mcp"));
+        assert!(!source_ok("off") && !source_ok("gemini_cli") && !source_ok(""));
+    }
+
+    #[test]
+    fn plans_keep_where_a_compat_plan_went() {
+        // Saved before 0.11: no "via", and none is written back.
+        let old: Plan = serde_json::from_str(r#"{"id":"ai-1","kind":"structure","title":"t","summary":"","source":"claude","root":"C:\\x","created_at":1,"steps":[],"state":"draft"}"#).unwrap();
+        assert_eq!(old.via, "");
+        assert!(!serde_json::to_string(&old).unwrap().contains("via"));
+        // Kept (clipped) for an OpenAI 호환 API plan, dropped for any other source.
+        let mut p = plan("p-via", r"C:\Users\me", "compat", Vec::new());
+        p.via = "a".repeat(300);
+        assert_eq!(admit(p).unwrap().via.chars().count(), 100);
+        let mut p = plan("p-via2", r"C:\Users\me", "mcp", Vec::new());
+        p.via = "api.deepseek.com".into();
+        assert_eq!(admit(p).unwrap().via, "");
+    }
+
     fn plan(id: &str, root: &str, source: &str, steps: Vec<PlanStep>) -> Plan {
         Plan {
             id: id.into(),
@@ -3078,6 +3112,7 @@ mod tests {
             title: "테스트".into(),
             summary: String::new(),
             source: source.into(),
+            via: String::new(),
             root: root.into(),
             created_at: 0,
             steps,

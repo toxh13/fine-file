@@ -14,6 +14,7 @@ mod places;
 mod plans;
 mod preview;
 mod programs;
+mod providers;
 mod scan;
 mod shellmenu;
 mod watch;
@@ -1685,6 +1686,7 @@ pub fn run() {
             ai::ai_get_settings,
             ai::ai_set_settings,
             ai::ai_key_status,
+            ai::ai_providers,
             ai::ai_set_key,
             ai::ai_test,
             ai::ai_judge_test,

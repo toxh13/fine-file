@@ -619,6 +619,7 @@ impl<H: Host> Server<H> {
             title,
             summary,
             source: "mcp".into(),
+            via: String::new(),
             root,
             created_at: crate::index::now_filetime(),
             steps: kept,

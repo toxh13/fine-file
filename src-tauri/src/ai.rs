@@ -1,17 +1,20 @@
 //! Optional AI connection. Everything in the app works without it.
 //!
-//! Providers: Claude API, OpenAI API (user's own keys), Ollama (local), the
-//! user's installed Claude Code CLI or Codex CLI; and a judge for risk
+//! Providers: Claude API, OpenAI API, any OpenAI-compatible API and Gemini
+//! API (user's own keys), Ollama (local), the user's installed Claude Code
+//! CLI, Codex CLI or OpenCode CLI; and a judge for risk
 //! scores and AI 검색 (judge.rs): TypeSafe jev, or a model in the user's
 //! own Ollama for those without a paid AI. Keys live in the Windows
 //! Credential Manager, never in files.
 //! Only metadata is sent (paths, names, sizes, dates, categories) — never file
 //! contents — and the user can preview exactly what would be sent: with
-//! "보내기 전에 미리 보기" on, a request goes only when its text (and where it
-//! goes) is what `ai_preview` showed lately (`previewed`).
+//! "보내기 전에 미리 보기" on, a request goes only when its text (and its
+//! provider, model and address) is what `ai_preview` showed lately (`previewed`).
 //!
 //! Settings are in `<data dir>\ai.json` (no secrets). Keys are kept under the
-//! service "fine-file" with the user "claude", "openai" or "jev"; they are
+//! service "fine-file" with the user "claude", "openai", "jev", "gemini", or
+//! "compat:<scheme://host:port>" for an OpenAI-compatible API (one key to an
+//! address: a key never goes to another one); they are
 //! never logged, never put in an error message and never handed to the UI,
 //! which only learns whether each one is there (KeyStatus).
 //!
@@ -41,7 +44,7 @@
 //!   files has nothing to do that with. Whatever either answers is checked
 //!   here as untrusted data, as above.
 
-use crate::{classify, judge};
+use crate::{classify, judge, providers};
 use crate::index::{EntryInfo, Index, now_filetime, FLAG_DELETED, FLAG_DIR, FLAG_NOT_LINK, FLAG_REPARSE};
 use crate::plans::{self, Plan, PlanStep};
 use crate::win;
@@ -57,13 +60,13 @@ use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-const PROVIDERS: [&str; 6] = ["off", "claude", "openai", "ollama", "claude_cli", "codex_cli"];
+pub(crate) const PROVIDERS: [&str; 9] = ["off", "claude", "openai", "ollama", "claude_cli", "codex_cli", "compat", "gemini", "opencode_cli"];
 const CLAUDE_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
 const EFFORTS: [&str; 3] = ["low", "medium", "high"];
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
 const KEY_SERVICE: &str = "fine-file";
-const KEY_USERS: [&str; 3] = ["claude", "openai", "jev"];
+const KEY_USERS: [&str; 5] = ["claude", "openai", "jev", "compat", "gemini"];
 const RISKS: [&str; 3] = ["safe", "caution", "danger"];
 
 const AI_OFF: &str = "AI가 꺼져 있어요. 설정에서 AI 제공자를 먼저 골라 주세요";
@@ -91,13 +94,20 @@ const RETRIES: u32 = 3;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AiSettings {
-    /// "off" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli"
+    /// One of `PROVIDERS`: "off" | "claude" | "openai" | "ollama" |
+    /// "claude_cli" | "codex_cli" | "compat" | "gemini" | "opencode_cli"
     pub provider: String,
     pub claude_model: String,
     pub openai_model: String,
     pub ollama_url: String,
     pub ollama_model: String,
     pub codex_model: String,
+    /// The OpenAI-compatible API's address (normalized, see `providers::compat_endpoint`) and model.
+    pub compat_url: String,
+    pub compat_model: String,
+    pub gemini_model: String,
+    /// OpenCode's `provider/model`.
+    pub opencode_model: String,
     /// Claude effort: "low" | "medium" | "high"
     pub effort: String,
     /// The judge features (risk badges, AI 검색), whichever engine judges.
@@ -120,6 +130,10 @@ impl Default for AiSettings {
             ollama_url: DEFAULT_OLLAMA_URL.into(),
             ollama_model: String::new(),
             codex_model: DEFAULT_CODEX_MODEL.into(),
+            compat_url: String::new(),
+            compat_model: String::new(),
+            gemini_model: String::new(),
+            opencode_model: String::new(),
             effort: "medium".into(),
             jev_enabled: false,
             judge: judge::JEV.into(),
@@ -138,6 +152,10 @@ impl AiSettings {
             &mut self.openai_model,
             &mut self.ollama_model,
             &mut self.codex_model,
+            &mut self.compat_url,
+            &mut self.compat_model,
+            &mut self.gemini_model,
+            &mut self.opencode_model,
             &mut self.judge,
             &mut self.judge_model,
         ] {
@@ -157,6 +175,9 @@ impl AiSettings {
         if !PROVIDERS.contains(&self.provider.as_str()) {
             return Err(UNKNOWN_PROVIDER.into());
         }
+        if self.provider == "opencode_cli" && !providers::OPENCODE_READY {
+            return Err("OpenCode 연결은 아직 켤 수 없어요".into());
+        }
         if !CLAUDE_MODELS.contains(&self.claude_model.as_str()) {
             return Err(format!("Claude 모델은 {} 중에서 골라 주세요", CLAUDE_MODELS.join(", ")));
         }
@@ -166,13 +187,22 @@ impl AiSettings {
         if !judge::ENGINES.contains(&self.judge.as_str()) {
             return Err("판정 엔진은 jev나 로컬 모델(Ollama) 중에서 골라 주세요".into());
         }
-        for (model, what) in [(&self.openai_model, "OpenAI"), (&self.ollama_model, "Ollama"), (&self.codex_model, "Codex"), (&self.judge_model, "판정")] {
+        for (model, what) in [(&self.openai_model, "OpenAI"), (&self.ollama_model, "Ollama"), (&self.codex_model, "Codex"), (&self.compat_model, "OpenAI 호환 API"), (&self.judge_model, "판정")] {
             if !model.is_empty() && !model_name_ok(model) {
                 return Err(format!("{what} 모델 이름에 쓸 수 없는 글자가 있어요"));
             }
         }
         if !url_ok(&self.ollama_url) {
             return Err(BAD_OLLAMA_URL.into());
+        }
+        if !self.compat_url.is_empty() {
+            self.compat_url = providers::compat_endpoint(&self.compat_url)?.base;
+        }
+        if !self.gemini_model.is_empty() && !providers::gemini_model_ok(&self.gemini_model) {
+            return Err("Gemini 모델 이름에 쓸 수 없는 글자가 있어요".into());
+        }
+        if !self.opencode_model.is_empty() && !providers::opencode_model_ok(&self.opencode_model) {
+            return Err("OpenCode 모델은 제공자/모델 모양으로 적어 주세요 (예: opencode/모델이름)".into());
         }
         if self.codex_model.is_empty() {
             self.codex_model = DEFAULT_CODEX_MODEL.into();
@@ -200,6 +230,7 @@ impl AiSettings {
             (&mut self.openai_model, ""),
             (&mut self.ollama_model, ""),
             (&mut self.codex_model, DEFAULT_CODEX_MODEL),
+            (&mut self.compat_model, ""),
             (&mut self.judge_model, ""),
         ] {
             if model.is_empty() || !model_name_ok(model) {
@@ -209,8 +240,28 @@ impl AiSettings {
         if !url_ok(&self.ollama_url) {
             self.ollama_url = d.ollama_url;
         }
+        if self.provider == "opencode_cli" && !providers::OPENCODE_READY {
+            self.provider = "off".into();
+        }
+        self.compat_url = providers::compat_endpoint(&self.compat_url).map(|e| e.base).unwrap_or_default();
+        if !providers::gemini_model_ok(&self.gemini_model) {
+            self.gemini_model.clear();
+        }
+        if !providers::opencode_model_ok(&self.opencode_model) {
+            self.opencode_model.clear();
+        }
         self
     }
+}
+
+/// The connections the settings may offer: `PROVIDERS` without OpenCode until it is ready.
+fn offered() -> Vec<&'static str> {
+    PROVIDERS.iter().copied().filter(|p| *p != "opencode_cli" || providers::OPENCODE_READY).collect()
+}
+
+#[tauri::command]
+pub fn ai_providers() -> Vec<String> {
+    offered().into_iter().map(String::from).collect()
 }
 
 /// Model names as the providers write them: `gpt-5.6-luna`, `qwen3:8b`, `hf.co/user/model:Q4_K_M`.
@@ -265,7 +316,7 @@ fn key_entry(user: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEY_SERVICE, user).map_err(|_| "Windows 자격 증명 관리자를 쓸 수 없어요".to_string())
 }
 
-fn read_key(user: &str) -> Result<Option<String>, String> {
+pub(crate) fn read_key(user: &str) -> Result<Option<String>, String> {
     match key_entry(user)?.get_password() {
         Ok(k) if !k.trim().is_empty() => Ok(Some(k)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
@@ -288,6 +339,26 @@ fn check_key(key: &str) -> Result<&str, String> {
     }
     if !key.chars().all(|c| c.is_ascii_graphic()) {
         return Err("키에 공백, 줄바꿈이나 쓸 수 없는 글자가 들어 있어요".into());
+    }
+    Ok(key)
+}
+
+/// The Credential Manager name for a provider's key: the provider's own, and
+/// for an OpenAI-compatible API one per address (`url`), so a key never goes
+/// to another address than the one it was put in for.
+fn key_user(provider: &str, url: Option<&str>) -> Result<String, String> {
+    if provider == "compat" {
+        let url = url.map(str::trim).filter(|u| !u.is_empty()).ok_or("키를 넣을 주소를 먼저 적어 주세요")?;
+        return Ok(providers::compat_key_user(&providers::compat_endpoint(url)?.origin));
+    }
+    if KEY_USERS.contains(&provider) { Ok(provider.to_string()) } else { Err("키를 저장할 수 없는 제공자예요".into()) }
+}
+
+/// `check_key`, and for the keys of an OpenAI-compatible API and Gemini 512 characters at most.
+fn checked_key<'a>(provider: &str, key: &'a str) -> Result<&'a str, String> {
+    let key = check_key(key)?;
+    if matches!(provider, "compat" | "gemini") && key.len() > 512 {
+        return Err("키가 너무 길어요. 키만 붙여 넣어 주세요".into());
     }
     Ok(key)
 }
@@ -2095,6 +2166,7 @@ fn make_plan(s: &AiSettings, kind: &str, root: &str, shared: Option<crate::Share
         title,
         summary: plan_summary(answer["summary"].as_str().unwrap_or(""), &checked),
         source: s.provider.clone(),
+        via: if s.provider == "compat" { providers::compat_endpoint(&s.compat_url).map(|e| e.host).unwrap_or_default() } else { String::new() },
         root: root.into(),
         created_at: now_filetime(),
         steps: checked.steps,
@@ -2227,36 +2299,58 @@ const PREVIEW_FRESH: Duration = Duration::from_secs(30 * 60);
 const PREVIEWS_KEPT: usize = 32;
 const NOT_PREVIEWED: &str = "보낼 내용이 미리 본 것과 달라졌거나 아직 미리 보지 않았어요. 아무것도 보내지 않았어요. 다시 미리 보고 보내 주세요";
 
-/// The requests `ai_preview` showed lately: a hash of where each goes and
-/// its exact text, and when.
+/// The requests `ai_preview` showed lately: a hash of where each goes
+/// (provider, model, address) and its exact text, and when.
 static PREVIEWED: Mutex<Vec<(blake3::Hash, Instant)>> = Mutex::new(Vec::new());
 
-fn preview_key(provider: &str, text: &str) -> blake3::Hash {
+/// The model a provider uses and the address it is reached at (compat, Ollama).
+fn destination(s: &AiSettings) -> (String, Option<String>) {
+    let model = match s.provider.as_str() {
+        "claude" | "claude_cli" => &s.claude_model,
+        "openai" => &s.openai_model,
+        "ollama" => &s.ollama_model,
+        "codex_cli" => &s.codex_model,
+        "compat" => &s.compat_model,
+        "gemini" => &s.gemini_model,
+        "opencode_cli" => &s.opencode_model,
+        _ => return (String::new(), None),
+    };
+    let url = match s.provider.as_str() {
+        "compat" => Some(s.compat_url.clone()),
+        "ollama" => Some(s.ollama_url.clone()),
+        _ => None,
+    };
+    (model.clone(), url)
+}
+
+fn preview_key(s: &AiSettings, text: &str) -> blake3::Hash {
+    let (model, url) = destination(s);
     let mut h = blake3::Hasher::new();
-    h.update(provider.as_bytes());
-    h.update(&[0]);
-    h.update(text.as_bytes());
+    for part in [s.provider.as_str(), model.as_str(), url.as_deref().unwrap_or(""), text] {
+        h.update(part.as_bytes());
+        h.update(&[0]);
+    }
     h.finalize()
 }
 
-fn remember_preview(provider: &str, text: &str) {
+fn remember_preview(s: &AiSettings, text: &str) {
     let mut list = PREVIEWED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     list.retain(|(_, at)| at.elapsed() < PREVIEW_FRESH);
     if list.len() >= PREVIEWS_KEPT {
         list.remove(0);
     }
-    list.push((preview_key(provider, text), Instant::now()));
+    list.push((preview_key(s, text), Instant::now()));
 }
 
 /// With "보내기 전에 미리 보기" on, a request goes only when exactly its text,
-/// to this provider, was previewed lately: whatever the window decided from
+/// to this provider, model and address, was previewed lately: whatever the window decided from
 /// settings it read before, nothing goes that the user was not shown (files
 /// that came or went since the preview make it another text).
 fn previewed(s: &AiSettings, req: &Request) -> Result<(), String> {
     if !s.confirm_before_send {
         return Ok(());
     }
-    let k = preview_key(&s.provider, &req.preview());
+    let k = preview_key(s, &req.preview());
     let mut list = PREVIEWED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     list.retain(|(_, at)| at.elapsed() < PREVIEW_FRESH);
     if list.iter().any(|(h, _)| *h == k) { Ok(()) } else { Err(NOT_PREVIEWED.into()) }
@@ -2269,12 +2363,17 @@ pub struct KeyStatus {
     pub claude: bool,
     pub openai: bool,
     pub jev: bool,
+    /// For the address asked about (`ai_key_status`).
+    pub compat: bool,
+    pub gemini: bool,
 }
 
 /// Exactly what an AI request would send.
 #[derive(Serialize)]
 pub struct AiPayloadPreview {
     pub provider: String,
+    pub model: String,
+    pub url: Option<String>,
     pub text: String,
     pub bytes: usize,
 }
@@ -2302,20 +2401,20 @@ pub fn ai_set_settings(settings: AiSettings) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn ai_key_status() -> KeyStatus {
+pub fn ai_key_status(compat_url: Option<String>) -> KeyStatus {
     let has = |u: &str| read_key(u).ok().flatten().is_some();
-    KeyStatus { claude: has("claude"), openai: has("openai"), jev: has("jev") }
+    let url = compat_url.unwrap_or_else(|| settings().compat_url);
+    let compat = key_user("compat", Some(&url)).is_ok_and(|u| has(&u));
+    KeyStatus { claude: has("claude"), openai: has("openai"), jev: has("jev"), compat, gemini: has("gemini") }
 }
 
-/// provider: "claude" | "openai" | "jev". None removes the key.
+/// provider: "claude" | "openai" | "jev" | "gemini" | "compat" (`url`: the
+/// address the key is for). None removes the key.
 #[tauri::command]
-pub fn ai_set_key(provider: String, key: Option<String>) -> Result<(), String> {
-    if !KEY_USERS.contains(&provider.as_str()) {
-        return Err("키를 저장할 수 없는 제공자예요".into());
-    }
-    let entry = key_entry(&provider)?;
+pub fn ai_set_key(provider: String, key: Option<String>, url: Option<String>) -> Result<(), String> {
+    let entry = key_entry(&key_user(&provider, url.as_deref())?)?;
     match key {
-        Some(key) => entry.set_password(check_key(&key)?).map_err(|_| "키를 Windows 자격 증명 관리자에 저장하지 못했어요".to_string()),
+        Some(key) => entry.set_password(checked_key(&provider, &key)?).map_err(|_| "키를 Windows 자격 증명 관리자에 저장하지 못했어요".to_string()),
         None => match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err("키를 지우지 못했어요".into()),
@@ -2360,8 +2459,9 @@ pub async fn ai_preview(task: String, path: String, state: tauri::State<'_, crat
     crate::blocking(move || {
         let req = request_for(&task, &summary_for(shared.as_ref(), &path)?)?;
         let text = req.preview();
-        remember_preview(&s.provider, &text);
-        Ok(AiPayloadPreview { provider: s.provider, bytes: text.len(), text })
+        remember_preview(&s, &text);
+        let (model, url) = destination(&s);
+        Ok(AiPayloadPreview { provider: s.provider, model, url, bytes: text.len(), text })
     })
     .await?
 }
@@ -2552,7 +2652,7 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.to_lowercase().contains("key"));
         // A file from another version: unknown values fall back, missing ones get defaults.
-        fs::write(&path, r#"{"provider":"gemini","effort":"max","claude_model":"claude-x","jev_enabled":true}"#).unwrap();
+        fs::write(&path, r#"{"provider":"mistral","effort":"max","claude_model":"claude-x","jev_enabled":true}"#).unwrap();
         let back = load_settings_from(&path);
         assert_eq!((back.provider.as_str(), back.effort.as_str(), back.claude_model.as_str()), ("off", "medium", "claude-opus-5-5"));
         assert!(back.jev_enabled && back.confirm_before_send);
@@ -2561,7 +2661,7 @@ mod tests {
         assert_eq!(load_settings_from(&path), AiSettings::default());
         // Saving refuses what the app does not know.
         assert!(AiSettings { effort: "max".into(), ..AiSettings::default() }.checked().is_err());
-        assert!(AiSettings { provider: "gemini".into(), ..AiSettings::default() }.checked().is_err());
+        assert!(AiSettings { provider: "mistral".into(), ..AiSettings::default() }.checked().is_err());
         assert!(AiSettings { ollama_url: "localhost:11434".into(), ..AiSettings::default() }.checked().is_err());
         // "localhost" is dialled as 127.0.0.1 (Windows would try ::1 first, for 2 s); nothing else changes.
         assert_eq!(dial("http://localhost:11434"), "http://127.0.0.1:11434");
@@ -2571,6 +2671,64 @@ mod tests {
         assert_eq!(dial("http://192.168.0.7:11434"), "http://192.168.0.7:11434");
         assert!(AiSettings { openai_model: "gpt 5".into(), ..AiSettings::default() }.checked().is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_providers_settings_round_trip() {
+        let dir = temp_root("providers");
+        let path = dir.join("ai.json");
+        let s = AiSettings {
+            provider: "compat".into(),
+            compat_url: " https://api.deepseek.com/ ".into(),
+            compat_model: " deepseek-chat ".into(),
+            gemini_model: "gemini-2.5-flash".into(),
+            ..AiSettings::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!((s.compat_url.as_str(), s.compat_model.as_str()), ("https://api.deepseek.com", "deepseek-chat"));
+        save_settings_to(&path, &s).unwrap();
+        assert_eq!(load_settings_from(&path), s);
+        assert!(!fs::read_to_string(&path).unwrap().to_lowercase().contains("key"));
+        assert!(AiSettings { provider: "gemini".into(), ..AiSettings::default() }.checked().is_ok());
+        // Saving refuses what could not be sent safely.
+        assert!(AiSettings { compat_url: "http://api.deepseek.com".into(), ..AiSettings::default() }.checked().is_err());
+        assert!(AiSettings { gemini_model: "models/gemini".into(), ..AiSettings::default() }.checked().is_err());
+        assert!(AiSettings { compat_model: "deep seek".into(), ..AiSettings::default() }.checked().is_err());
+        assert!(AiSettings { opencode_model: "--auto/x".into(), ..AiSettings::default() }.checked().is_err());
+        // A file edited by hand: what does not fit falls back to empty.
+        fs::write(&path, r#"{"provider":"compat","compat_url":"http://evil.example","gemini_model":"a/b","opencode_model":"x"}"#).unwrap();
+        let back = load_settings_from(&path);
+        assert_eq!((back.provider.as_str(), back.compat_url.as_str(), back.gemini_model.as_str(), back.opencode_model.as_str()), ("compat", "", "", ""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_is_offered_only_once_ready() {
+        let s = AiSettings { provider: "opencode_cli".into(), opencode_model: "opencode/grok-code-fast-1-free".into(), ..AiSettings::default() };
+        assert_eq!(s.clone().checked().is_ok(), providers::OPENCODE_READY);
+        assert_eq!(s.tidy().provider == "opencode_cli", providers::OPENCODE_READY);
+        assert_eq!(offered().contains(&"opencode_cli"), providers::OPENCODE_READY);
+        for p in ["off", "claude", "openai", "ollama", "claude_cli", "codex_cli", "compat", "gemini"] {
+            assert!(offered().contains(&p), "{p}");
+        }
+    }
+
+    #[test]
+    fn keys_are_kept_per_provider_and_per_address() {
+        assert_eq!(key_user("claude", None).unwrap(), "claude");
+        assert_eq!(key_user("gemini", Some("ignored")).unwrap(), "gemini");
+        assert_eq!(key_user("compat", Some("https://api.deepseek.com/v1")).unwrap(), "compat:https://api.deepseek.com:443");
+        assert!(key_user("compat", None).is_err());
+        assert!(key_user("compat", Some("http://api.deepseek.com")).is_err());
+        assert!(key_user("ollama", None).is_err());
+        assert!(key_user("compat:https://x.example:443", None).is_err());
+        // OpenAI 호환 API and Gemini keys: 512 characters at most (others keep 1000).
+        assert!(checked_key("gemini", &"a".repeat(512)).is_ok());
+        assert!(checked_key("gemini", &"a".repeat(513)).is_err());
+        assert!(checked_key("compat", &"a".repeat(513)).is_err());
+        assert!(checked_key("claude", &"a".repeat(900)).is_ok());
+        assert!(checked_key("compat", "sk with space").is_err());
     }
 
     #[test]
@@ -2937,7 +3095,7 @@ mod tests {
         s.confirm_before_send = true;
         let req = request_for("explain", &format!("미리 보기 시험 {}", win::random_u64())).unwrap();
         assert_eq!(previewed(&s, &req).unwrap_err(), NOT_PREVIEWED);
-        remember_preview(&s.provider, &req.preview());
+        remember_preview(&s, &req.preview());
         assert!(previewed(&s, &req).is_ok());
         // Another provider, or other text, is not what was shown.
         let mut other = s.clone();
@@ -2945,6 +3103,16 @@ mod tests {
         assert!(previewed(&other, &req).is_err());
         let changed = request_for("explain", "다른 내용").unwrap();
         assert!(previewed(&s, &changed).is_err());
+        // Another model, or another address, is not where it was shown going.
+        let mut haiku = s.clone();
+        haiku.claude_model = "claude-haiku-5-5".into();
+        assert!(previewed(&haiku, &req).is_err());
+        let mut compat = AiSettings { provider: "compat".into(), compat_url: "https://api.deepseek.com".into(), compat_model: "deepseek-chat".into(), confirm_before_send: true, ..AiSettings::default() };
+        remember_preview(&compat, &req.preview());
+        assert!(previewed(&compat, &req).is_ok());
+        assert_eq!(destination(&compat), ("deepseek-chat".to_string(), Some("https://api.deepseek.com".to_string())));
+        compat.compat_url = "https://openrouter.ai/api/v1".into();
+        assert!(previewed(&compat, &req).is_err());
         // Preview off: nothing to match.
         s.confirm_before_send = false;
         assert!(previewed(&s, &changed).is_ok());
