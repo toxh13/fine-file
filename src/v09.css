@@ -366,7 +366,8 @@
   white-space: nowrap;
 }
 
-.btn.helper-pin.on {
+.btn.helper-pin.on,
+.btn.helper-chip.on {
   border-color: var(--sel-line);
   background: var(--sel);
   color: var(--text);
@@ -393,12 +394,6 @@
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.btn.helper-chip.on {
-  border-color: var(--sel-line);
-  background: var(--sel);
-  color: var(--text);
 }
 
 .helper-scope-where {

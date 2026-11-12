@@ -249,6 +249,8 @@ export interface Helper {
   setScope: (id: ScopeId) => void;
   /** The profile folder ("홈 폴더"), once known_places answered. */
   home: string | null;
+  /** known_places answered without the profile folder, or failed. */
+  homeMissing: boolean;
   /** A rule plan for the 정리할 곳 chosen: `t` for "지금 보는 곳", `drives` for a drive or "컴퓨터 전체". */
   rule: (t: HelperTarget | null, kind: RuleKind, drives: DriveInfo[]) => void;
 }
@@ -259,12 +261,14 @@ export interface Helper {
  * goes on, and its answer is kept under its own item. `shown`: the pane shows the helper; the
  * settings are read then, and again when `stamp` changes (App read them again). `onPlan`: a plan
  * was made (rules, or an AI's) for `t` in `scope` ("here" for an AI's), maybe long after it was
- * asked for.
+ * asked for. `onSaved`: "컴퓨터 전체" saved one drive's plan (only the largest is given to `onPlan`,
+ * at the end).
  */
 export function useHelper(
   shown: boolean,
   stamp: unknown,
   onPlan: (planId: string, t: HelperTarget | null, scope: ScopeId) => void,
+  onSaved?: () => void,
 ): Helper {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [keys, setKeys] = useState<KeyStatus | null>(null);
@@ -272,15 +276,18 @@ export function useHelper(
   const [busy, setBusy] = useState<Busy | null>(null);
   const [scope, setScopeNow] = useState<ScopeId>(savedScope);
   const [home, setHome] = useState<string | null>(null);
+  const [homeMissing, setHomeMissing] = useState(false);
   // The requests read and write these as they go, past many renders; `tick` draws what they wrote.
   const busyRef = useRef<Busy | null>(null);
   const memos = useRef(new Map<string, Memo>());
   const [, setTick] = useState(0);
   const alive = useRef(true);
   const planRef = useRef(onPlan);
+  const savedRef = useRef(onSaved);
   const homeAsked = useRef(false);
   useLayoutEffect(() => {
     planRef.current = onPlan;
+    savedRef.current = onSaved;
   });
 
   useEffect(() => {
@@ -305,11 +312,15 @@ export function useHelper(
       homeAsked.current = true;
       places.known().then(
         (list) => {
+          if (!alive.current) return;
           const h = list.find((p) => p.id === "home");
-          if (alive.current && h && typeof h.path === "string") setHome(normalizePath(h.path));
+          const found = h && typeof h.path === "string" ? normalizePath(h.path) : null;
+          setHome(found);
+          setHomeMissing(!found);
         },
         () => {
           homeAsked.current = false;
+          if (alive.current) setHomeMissing(true);
         },
       );
     }
@@ -453,7 +464,8 @@ export function useHelper(
       try {
         for (const d of localDrives(drives)) {
           if (!d.indexed) {
-            runs.push({ label: d.letter, plan: null, text: "검사 안 함 (먼저 검사해 주세요)", error: false });
+            runs.push({ label: d.letter, plan: null, text: "스캔 안 함 (먼저 스캔해 주세요)", error: false });
+            patch(key, { runs: [...runs] });
             continue;
           }
           // The tab closed meanwhile: no other drive is started (no plan would be opened).
@@ -461,6 +473,8 @@ export function useHelper(
           start({ key, name, id: kind, stage: "send", at: d.letter });
           try {
             const r = await plans.rules(kind, `${d.letter}\\`);
+            // Saved: the list of plans hears of it now (the largest opens at the end).
+            if (r.plan && alive.current) savedRef.current?.();
             runs.push(
               r.plan
                 ? {
@@ -518,6 +532,7 @@ export function useHelper(
     scope,
     setScope,
     home,
+    homeMissing,
     rule: (t, kind, drives) => void rule(t, kind, drives),
   };
 }
@@ -553,9 +568,11 @@ export function HelperPane(p: HelperPaneProps) {
   const rm = h.rulesMemo(scope, t);
   // A file has no plans of its own: "지금 보는 곳" makes none for it, another 정리할 곳 does.
   const rulesOff = file && scope === "here";
-  // The request out is this item's (or this 정리할 곳's), or another's (whose answer is kept under it).
-  const here = h.busy?.key === key ? h.busy : null;
-  const hereRule = h.busy?.key === ruleKey(scope, t) ? h.busy : null;
+  // The request out is this item's AI request, a rule plan for the 정리할 곳 used now, or another
+  // (whose answer is kept under it; a rule plan for this item counts as another while a different
+  // 정리할 곳 is chosen, so the banner says what is running).
+  const here = h.busy?.key === key && !isRule(h.busy.id) ? h.busy : null;
+  const hereRule = h.busy?.key === ruleKey(scope, t) && isRule(h.busy.id) ? h.busy : null;
   const other = h.busy && !here && !hereRule ? h.busy : null;
   const waiting = h.busy !== null;
   const problem = h.settings ? aiProblem(h.settings, h.keys, file) : null;
@@ -704,7 +721,14 @@ export function HelperPane(p: HelperPaneProps) {
           <h4>규칙으로 계획 만들기</h4>
           <span className="muted">AI 없이 이 컴퓨터에서 만들어요</span>
         </div>
-        <ScopeChips target={t} scope={scope} home={h.home} drives={p.drives} onScope={h.setScope} />
+        <ScopeChips
+          target={t}
+          scope={scope}
+          home={h.home}
+          homeMissing={h.homeMissing}
+          drives={p.drives}
+          onScope={h.setScope}
+        />
         <div className="ai-actions">
           {RULE_ACTIONS.map((a) => (
             <button
@@ -727,7 +751,7 @@ export function HelperPane(p: HelperPaneProps) {
                 type="button"
                 className="btn small"
                 disabled={!canAll}
-                title={canAll ? undefined : "먼저 드라이브를 검사해 주세요"}
+                title={canAll ? undefined : "먼저 드라이브를 스캔해 주세요"}
                 onClick={() => h.setScope("all")}
               >
                 범위를 컴퓨터 전체로
@@ -772,6 +796,7 @@ function ScopeChips(p: {
   /** The one used now (liveScope). */
   scope: ScopeId;
   home: string | null;
+  homeMissing: boolean;
   drives: DriveInfo[];
   onScope: (id: ScopeId) => void;
 }) {
@@ -780,14 +805,19 @@ function ScopeChips(p: {
   const unscanned = local.filter((d) => !d.indexed).map((d) => d.letter);
   const chips: { id: ScopeId; label: string; title?: string; off: boolean }[] = [
     { id: "here", label: `지금 보는 곳 · ${shown(p.target.name)}`, title: shown(p.target.path), off: false },
-    { id: "home", label: "홈 폴더", title: p.home ? shown(p.home) : undefined, off: !p.home },
+    {
+      id: "home",
+      label: "홈 폴더",
+      title: p.home ? shown(p.home) : p.homeMissing ? "홈 폴더를 찾지 못했어요" : undefined,
+      off: !p.home,
+    },
     ...local.map((d) => ({
       id: `drive:${d.letter.toUpperCase()}` as const,
       label: d.letter,
-      title: !d.indexed ? "먼저 이 드라이브를 검사해 주세요" : d.label ? `${shown(d.label)} (${d.letter})` : undefined,
+      title: !d.indexed ? "먼저 이 드라이브를 스캔해 주세요" : d.label ? `${shown(d.label)} (${d.letter})` : undefined,
       off: !d.indexed,
     })),
-    { id: "all", label: "컴퓨터 전체", title: ready.length ? undefined : "먼저 드라이브를 검사해 주세요", off: !ready.length },
+    { id: "all", label: "컴퓨터 전체", title: ready.length ? undefined : "먼저 드라이브를 스캔해 주세요", off: !ready.length },
   ];
   const where =
     p.scope === "here"
@@ -795,7 +825,7 @@ function ScopeChips(p: {
       : p.scope === "home"
         ? shown(p.home ?? "")
         : p.scope === "all"
-          ? `${ready.join(", ")} 드라이브${unscanned.length ? ` (${unscanned.join(", ")} 검사 안 함)` : ""}`
+          ? `${ready.join(", ")} 드라이브${unscanned.length ? ` (${unscanned.join(", ")} 스캔 안 함)` : ""}`
           : `${p.scope.slice("drive:".length)}\\`;
   return (
     <>

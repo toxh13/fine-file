@@ -2571,22 +2571,28 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
   // only while the pane still shows the helper on that item and nothing is being typed (a rename
   // box, the search box, the address); else it waits under the item's "계획 열기" and in the list.
   // A plan made for another 정리할 곳 (홈 폴더, a drive, 컴퓨터 전체) opens while the pane shows
-  // the helper with that 정리할 곳 still chosen, wherever it looks.
-  const helper: Helper = useHelper(active && helperOn, p.ai, (planId, t, scope) => {
-    p.onAiChanged();
-    const there =
-      helperOn &&
-      (scope === "here"
-        ? helperTarget !== null && t !== null && pathKey(helperTarget.path) === pathKey(t.path)
-        : helper.scope === scope);
-    showPlan(
-      planId,
-      there && renaming === null && !typingNow(),
-      scope === "here" && t
-        ? `"${t.name}"의 정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`
-        : `정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`,
-    );
-  });
+  // the helper with that 정리할 곳 still chosen, wherever it looks. 컴퓨터 전체 opens only its
+  // largest plan; each drive's plan is counted in the list as it is saved.
+  const helper: Helper = useHelper(
+    active && helperOn,
+    p.ai,
+    (planId, t, scope) => {
+      p.onAiChanged();
+      const there =
+        helperOn &&
+        (scope === "here"
+          ? helperTarget !== null && t !== null && pathKey(helperTarget.path) === pathKey(t.path)
+          : helper.scope === scope);
+      showPlan(
+        planId,
+        there && renaming === null && !typingNow(),
+        scope === "here" && t
+          ? `"${t.name}"의 정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`
+          : `정리 계획을 만들었어요. 정리 도우미의 "계획 열기"나 ${PLANS_AT}에서 열 수 있어요`,
+      );
+    },
+    p.onPlansChanged,
+  );
 
   /**
    * A menu's "정리 도우미로 보기": the pane shows the helper on `e`. It is pinned there when the
