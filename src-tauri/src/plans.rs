@@ -2380,6 +2380,8 @@ struct Filled<T> {
     kept: Vec<T>,
     dropped: Vec<Dropped>,
     left: usize,
+    /// The check limit stopped it before `max` passed, with candidates left.
+    limited: bool,
 }
 
 /// Looks at the candidates in order until `max` pass or `max_checks` have been
@@ -2402,7 +2404,9 @@ fn fill_steps<T>(cands: Vec<T>, max: usize, max_checks: usize, mut check: impl F
     }
     let mut dropped: Vec<Dropped> = why.into_iter().map(|(why, count)| Dropped { why, count }).collect();
     dropped.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.why.cmp(&b.why)));
-    Filled { kept, dropped, left: total - seen }
+    let left = total - seen;
+    let limited = left > 0 && kept.len() < max;
+    Filled { kept, dropped, left, limited }
 }
 
 /// A plan made by rules for the folder `root` from the index, saved as a
@@ -2449,7 +2453,7 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         }
     };
     let ctx = Ctx::now();
-    let Filled { kept: mut steps, dropped, left } = fill_steps(steps, MAX_STEPS, MAX_CHECKS, |(s, keep)| {
+    let Filled { kept: mut steps, dropped, left, limited } = fill_steps(steps, MAX_STEPS, MAX_CHECKS, |(s, keep)| {
         check(&ctx, root, s, None)?;
         keep.as_ref().map_or(Ok(()), |k| twin_refusal(&s.from, k))
     });
@@ -2463,7 +2467,7 @@ fn rules_plan(store: &Store, kind: &str, root: &str, shared: &crate::Shared) -> 
         }
     }
     let steps: Vec<PlanStep> = steps.into_iter().map(|(s, _)| s).collect();
-    let (title, summary) = rules_text(kind, &steps, groups, target.as_ref().map(|(d, _)| d.as_str()), n_dropped, left);
+    let (title, summary) = rules_text(kind, &steps, groups, target.as_ref().map(|(d, _)| d.as_str()), n_dropped, left, limited);
     if steps.is_empty() {
         return Ok(RulesResult { plan: None, summary, dropped, left });
     }
@@ -2542,7 +2546,7 @@ fn rules_trash(
     Ok(plan)
 }
 
-fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str>, dropped: usize, left: usize) -> (String, String) {
+fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str>, dropped: usize, left: usize, limited: bool) -> (String, String) {
     let total: u64 = steps.iter().map(|s| s.size).sum();
     let n = steps.len();
     let picked = steps.iter().filter(|s| s.selected).count();
@@ -2589,7 +2593,9 @@ fn rules_text(kind: &str, steps: &[PlanStep], groups: usize, target: Option<&str
         if dropped > 0 {
             summary.push_str(&format!(" 후보 {dropped}개는 확인에서 뺐어요."));
         }
-        if left > 0 {
+        if limited {
+            summary.push_str(&format!(" 확인에서 빠지는 후보가 많아서 {MAX_CHECKS}개까지만 확인했어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요."));
+        } else if left > 0 {
             let order = if kind == "cleanup" { "큰 것부터" } else { "앞에서부터" };
             summary.push_str(&format!(" 후보가 많아서 {order} {MAX_STEPS}개만 넣었어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요."));
         }
@@ -2799,7 +2805,6 @@ fn dedupe_steps(groups: &[DupGroup]) -> Vec<(PlanStep, Keep)> {
         }
     }
     steps.sort_by(|(a, _), (b, _)| b.size.cmp(&a.size).then_with(|| a.from.cmp(&b.from)));
-    steps.truncate(MAX_STEPS);
     steps
 }
 
@@ -2874,7 +2879,7 @@ fn shrink_steps(ix: &Index, top: u32, top_path: &str, now: i64) -> Vec<PlanStep>
         false
     });
     steps.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.from.cmp(&b.1.from)));
-    steps.into_iter().take(MAX_STEPS).map(|(_, s)| s).collect()
+    steps.into_iter().map(|(_, s)| s).collect()
 }
 
 /// The other local fixed NTFS drive with the most room (`D:\`, bytes free),
@@ -3718,6 +3723,7 @@ mod tests {
         assert_eq!(got.kept, vec![1, 3, 5]);
         assert_eq!(got.dropped, vec![drop_of("짝수", 2)]);
         assert_eq!(got.left, 5);
+        assert!(!got.limited);
     }
 
     #[test]
@@ -3726,6 +3732,7 @@ mod tests {
         assert!(got.kept.is_empty());
         assert_eq!(got.dropped, vec![drop_of("안 돼", 4)]);
         assert_eq!(got.left, 6);
+        assert!(got.limited);
     }
 
     #[test]
@@ -3752,12 +3759,26 @@ mod tests {
     #[test]
     fn rules_text_says_what_was_left_out() {
         let step = trash_step(r"C:\x\a.tmp".into(), MB, "safe", "r".into());
-        let (_, summary) = rules_text("cleanup", std::slice::from_ref(&step), 0, None, 4, 7);
+        let (_, summary) = rules_text("cleanup", std::slice::from_ref(&step), 0, None, 4, 7, false);
         assert!(summary.contains("후보 4개는 확인에서 뺐어요"), "{summary}");
         assert!(summary.contains("큰 것부터 500개만 넣었어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요"), "{summary}");
-        let (_, summary) = rules_text("dedupe", std::slice::from_ref(&step), 1, None, 0, 7);
+        let (_, summary) = rules_text("dedupe", std::slice::from_ref(&step), 1, None, 0, 7, false);
         assert!(summary.contains("앞에서부터 500개만"), "{summary}");
         assert!(!summary.contains("큰 것부터"), "{summary}");
+    }
+
+    #[test]
+    fn rules_text_says_when_the_check_limit_stopped_it() {
+        let step = trash_step(r"C:\x\a.tmp".into(), MB, "safe", "r".into());
+        let (_, summary) = rules_text("cleanup", std::slice::from_ref(&step), 0, None, 4, 7, true);
+        assert!(summary.contains("확인에서 빠지는 후보가 많아서 2000개까지만 확인했어요. 나머지도 보려면 실행한 뒤 계획을 다시 만들어 주세요"), "{summary}");
+        assert!(!summary.contains("큰 것부터"), "{summary}");
+    }
+
+    #[test]
+    fn rules_text_adds_nothing_to_an_empty_plan() {
+        let (_, summary) = rules_text("cleanup", &[], 0, None, 3, 5, false);
+        assert_eq!(summary, "정리할 캐시·임시 파일을 찾지 못했어요");
     }
 
     fn froms(steps: &[PlanStep]) -> Vec<(&str, &str, bool)> {
