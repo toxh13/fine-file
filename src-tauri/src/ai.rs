@@ -1529,14 +1529,73 @@ pub(crate) struct Cli<'a> {
     pub watch: Option<Watch<'a>>,
 }
 
+/// A Windows job object holding one CLI run: the program is put in it as
+/// soon as it has started, and whatever it starts from then on is in it too
+/// (no way out: breaking away is not allowed). Ending the job ends all of
+/// them, also those whose parent has already exited, which `taskkill /T` can
+/// no longer find. Its handle is closed on every way out of `run_cli_with`
+/// (an early return, a panic), and closing it ends whatever is still in it
+/// (KILL_ON_JOB_CLOSE).
+struct RunJob(windows_sys::Win32::Foundation::HANDLE);
+
+impl RunJob {
+    /// A job holding `child`, or None when Windows refuses one (say, the app
+    /// itself runs in a job that allows no other).
+    fn holding(child: &std::process::Child) -> Option<RunJob> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: the job handle is ours (closed by Drop, also when this
+        // returns None); `child` keeps its process handle open meanwhile.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return None;
+            }
+            let job = RunJob(handle);
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+            let limited = SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, std::ptr::from_ref(&limits).cast(), size) != 0;
+            (limited && AssignProcessToJobObject(job.0, child.as_raw_handle()) != 0).then_some(job)
+        }
+    }
+
+    /// Ends every process in the job.
+    fn end(&self) {
+        // SAFETY: a job handle of ours, open until Drop.
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+impl Drop for RunJob {
+    fn drop(&mut self) {
+        // SAFETY: closed once, here. The last handle closed ends what is still in the job.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Ends `child` and everything it started (an npm shim is cmd.exe running
-/// node: the whole tree, not just cmd), and waits for it.
-fn end_tree(child: &mut std::process::Child) {
+/// node: the whole tree, not just cmd), and waits for it. With its job this
+/// reaches all of them, also after `child` has exited; without one (Windows
+/// refused it) `taskkill /T`, which finds them only while `child` runs.
+fn end_tree(child: &mut std::process::Child, job: Option<&RunJob>) {
     use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    match job {
+        Some(job) => job.end(),
+        None => {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &child.id().to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1563,7 +1622,10 @@ fn send_lines(r: impl std::io::Read + Send + 'static, which: Stream, tx: mpsc::S
 /// programs only start then) and no window, reading both outputs as they
 /// come. After `cli.limit`, or at a line `cli.watch` stops at (also one
 /// written just before the program ended), it and everything it started are
-/// ended.
+/// ended. The program runs in a job of its own (`RunJob`): when this
+/// returns, in any way, nothing it started is left running, even what
+/// outlived it. Only if Windows refuses the job does ending fall back to
+/// `taskkill /T`, which misses what outlived the program.
 pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut, String> {
     use std::io::Write;
     use std::os::windows::process::CommandExt;
@@ -1582,8 +1644,10 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
         command.env(name, value);
     }
     let mut child = command.spawn().map_err(|e| format!("{label}을(를) 실행할 수 없어요: {e}"))?;
+    // At once, before it has started anything; dropped (ending what is left) on every way out.
+    let job = RunJob::holding(&child);
     let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
-        end_tree(&mut child);
+        end_tree(&mut child, job.as_ref());
         return Err(format!("{label}을(를) 실행할 수 없어요"));
     };
     let input = input.as_bytes().to_vec();
@@ -1607,7 +1671,7 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
                         Stream::Err => err.push_str(&line),
                     }
                     if let Some(e) = stop {
-                        end_tree(&mut child);
+                        end_tree(&mut child, job.as_ref());
                         return Err(e);
                     }
                 }
@@ -1622,7 +1686,7 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
             match child.try_wait() {
                 Ok(s) => status = s,
                 Err(e) => {
-                    end_tree(&mut child);
+                    end_tree(&mut child, job.as_ref());
                     return Err(format!("{label} 실행이 실패했어요: {e}"));
                 }
             }
@@ -1633,7 +1697,7 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
         }
         // Also when it has ended but something it started still holds an output open.
         if start.elapsed() > cli.limit {
-            end_tree(&mut child);
+            end_tree(&mut child, job.as_ref());
             return Err(format!("{label}이(가) {}초 안에 답하지 않아 멈췄어요", cli.limit.as_secs()));
         }
     }
@@ -3313,6 +3377,55 @@ mod tests {
         // Unwatched, a program runs to its end and both outputs are kept.
         let out = run("echo hello & echo oops 1>&2", None).unwrap();
         assert!(out.stdout.contains("hello") && out.stderr.contains("oops") && out.code == Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_ends_what_its_program_started_also_after_the_program_exited() {
+        use std::cell::Cell;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+        let dir = temp_root("orphan");
+        let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into()));
+        // cmd starts PowerShell in the background and exits at once; PowerShell
+        // keeps the output open, says its PID half a second later, then sleeps.
+        let line = "start /b powershell -NoProfile -NonInteractive -Command Start-Sleep -Milliseconds 500; Write-Output PID=$PID; Start-Sleep 30 & exit 0";
+        let args: Vec<OsString> = ["/d", "/s", "/c", line].iter().map(OsString::from).collect();
+        // The run's result and a handle to the PowerShell it started (held, so its PID cannot be reused).
+        let run = |limit: u64, stop: bool| -> (Result<CliOut, String>, HANDLE) {
+            let seen: Cell<HANDLE> = Cell::new(std::ptr::null_mut());
+            let watch = |_: Stream, l: &str| {
+                let pid: u32 = l.trim().strip_prefix("PID=")?.parse().ok()?;
+                // SAFETY: opens a handle that the caller closes.
+                seen.set(unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) });
+                stop.then(|| "멈췄어요".to_string())
+            };
+            let cli = Cli { exe: &cmd, args: &args, env: &[], label: "시험", limit: Duration::from_secs(limit), watch: Some(&watch) };
+            (run_cli_with(&cli, "", &dir), seen.get())
+        };
+        // Whether it ends within 5 s; ended here if not, so nothing outlives the test.
+        let ended = |h: HANDLE| -> bool {
+            assert!(!h.is_null(), "PowerShell's PID was not seen");
+            // SAFETY: `h` is the handle opened above, closed here once.
+            unsafe {
+                let gone = WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+                if !gone {
+                    TerminateProcess(h, 1);
+                }
+                CloseHandle(h);
+                gone
+            }
+        };
+        let start = Instant::now();
+        // A line read after cmd exited stops the run.
+        let (result, h) = run(30, true);
+        assert_eq!(result.unwrap_err(), "멈췄어요");
+        assert!(ended(h), "PowerShell outlived a watch stop");
+        // cmd exited but PowerShell holds the output open: the limit ends the run.
+        let (result, h) = run(6, false);
+        assert!(result.unwrap_err().contains("6초"));
+        assert!(ended(h), "PowerShell outlived the time limit");
+        assert!(start.elapsed() < Duration::from_secs(25), "{:?}", start.elapsed());
         let _ = fs::remove_dir_all(&dir);
     }
 
