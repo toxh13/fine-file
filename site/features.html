@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>기능 안내, fine-file</title>
+<meta name="description" content="fine-file 화면의 단추와 기능을 실제 화면에 번호를 붙여 설명합니다.">
+<link rel="icon" href="images/icon.png">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pretendard@1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<link rel="stylesheet" href="style.css">
+<script>document.documentElement.classList.add('js');</script>
+<script src="https://toxh13.github.io/apps/switcher.js" data-app="fine-file" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">본문으로 건너뛰기</a>
+<header class="nav">
+  <div class="container nav__inner">
+    <a class="brand" href="./"><img src="images/icon.png" alt="" width="30" height="30">fine-file</a>
+    <ul class="nav__links">
+      <li class="hide-s"><a href="https://github.com/toxh13/fine-file">GitHub</a></li>
+      <li><a href="features.html" aria-current="page">기능 안내</a></li>
+      <li><a class="btn btn--primary btn--s" href="download.html">내려받기</a></li>
+    </ul>
+  </div>
+</header>
+<div class="container tour-page">
+  <nav class="toc toc--chips" aria-label="목차">
+    <p>화면별 안내</p>
+    <ol>
+      <li><a href="#main-window">주 창</a></li>
+      <li><a href="#sizemap">크기 지도</a></li>
+      <li><a href="#search">즉시 검색</a></li>
+      <li><a href="#duplicates">중복 파일 찾기</a></li>
+      <li><a href="#programs">프로그램 정리</a></li>
+      <li><a href="#details">상세 정보</a></li>
+    </ol>
+  </nav>
+  <main id="main" class="doc doc--wide">
+    <h1>기능 안내</h1>
+    <p class="lead">실제 화면에 번호를 붙였습니다. 사진 위에 마우스를 올리면 번호가 흐려지고, 설명에 올리면 그 번호만 보입니다. 화면의 폴더와 파일은 시연용 예제입니다.</p>
+
+    <section class="tour-sec" id="main-window" aria-labelledby="h-main-window">
+      <h2 id="h-main-window">주 창</h2>
+      <p class="lead">폴더를 열면 크기, 파일 수, 크기 막대가 바로 보입니다. 왼쪽에는 즐겨찾기와 드라이브 상태가 있습니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/main.png" width="1783" height="974" loading="lazy" alt="fine-file 주 창.">
+        <span class="pin" data-n="1" style="left:1.20%;top:12.07%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:1.20%;top:49.04%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:26.79%;top:7.83%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:74.61%;top:7.89%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:35.13%;top:12.45%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:40.67%;top:12.45%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:88.64%;top:12.45%" aria-hidden="true">7</span>
+        <span class="pin" data-n="8" style="left:53.44%;top:22.34%" aria-hidden="true">8</span>
+        <span class="pin" data-n="9" style="left:66.41%;top:22.46%" aria-hidden="true">9</span>
+        <span class="pin" data-n="10" style="left:70.83%;top:17.84%" aria-hidden="true">10</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>즐겨찾기</strong> 즐겨찾기: Windows 탐색기의 왼쪽 창처럼 홈, 바탕 화면, 다운로드, 문서, 사진, 음악, 동영상과 고정한 폴더로 바로 가요.</li>
+        <li data-n="2"><strong>드라이브 상태</strong> 드라이브: 남은 용량과 마지막 스캔, 실시간 반영 상태를 보여 주고, 누르면 그 드라이브를 열어요.</li>
+        <li data-n="3"><strong>주소창</strong> 주소창: 지금 폴더의 경로예요. 경로 조각을 누르면 그 폴더로 가요.</li>
+        <li data-n="4"><strong>이름 검색</strong> 스캔한 모든 드라이브에서 이름으로 바로 찾아요. 띄어쓰기로 여러 단어, * · ? 와일드카드 (Ctrl+F).</li>
+        <li data-n="5"><strong>보기 방식</strong> 보기 방식: 목록, 트리, 아이콘, 지도 중에서 골라요 (Ctrl+Shift+1~4). 탭마다 따로 기억해요.</li>
+        <li data-n="6"><strong>상세 정보</strong> 상세 정보 (Alt+P): 고른 항목의 종류, 크기, 날짜, 위치와 미리 보기를 옆 창에 보여 줘요.</li>
+        <li data-n="7"><strong>정리 메뉴</strong> 이 폴더를 정리하는 도구 모음이에요: 정리 도우미, 정리 계획, 중복 찾기, 하드 링크 찾기·풀기, 프로그램 정리.</li>
+        <li data-n="8"><strong>크기 막대</strong> 폴더마다 지금 폴더 안에서 차지하는 크기를 막대 길이로 견줘 보여 줘요.</li>
+        <li data-n="9"><strong>폴더 크기 열</strong> 폴더 크기 열: 모든 폴더 옆에 용량이 바로 보여요. 머리글을 누르면 크기순으로 정렬해요.</li>
+        <li data-n="10"><strong>파일 수 열</strong> 폴더 안에 든 파일 수예요. 하위 폴더까지 모두 세요.</li>
+      </ol>
+    </section>
+    <section class="tour-sec" id="sizemap" aria-labelledby="h-sizemap">
+      <h2 id="h-sizemap">크기 지도</h2>
+      <p class="lead">지도 보기는 지금 폴더 아래를 크기만큼의 넓이로 그립니다. 분류마다 색이 다릅니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/sizemap.png" width="1783" height="974" loading="lazy" alt="크기 지도 트리맵.">
+        <span class="pin" data-n="1" style="left:15.99%;top:23.36%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:68.44%;top:17.97%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:87.73%;top:17.97%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:15.99%;top:94.67%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:16.69%;top:17.97%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:24.26%;top:18.10%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:35.13%;top:12.45%" aria-hidden="true">7</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>크기 지도</strong> 지금 폴더 아래 4단계까지를 크기만큼의 넓이로 그려요. 칸을 누르면 그 폴더로 들어가요.</li>
+        <li data-n="2"><strong>지도 모양</strong> 아이시클·선버스트·트리맵·가지 나무 중에서 지도 모양을 골라요.</li>
+        <li data-n="3"><strong>크기 변화</strong> 크기 변화: 지난 스캔과 비교해서 커지거나 작아진 곳을 색으로 보여요.</li>
+        <li data-n="4"><strong>분류 색</strong> 시스템·프로그램·개발·게임·캐시·미디어·문서·압축·설치·개인·기타로 색이 나뉘고, 분류마다 차지하는 비율을 보여 줘요.</li>
+        <li data-n="5"><strong>위로</strong> 한 단계 위 폴더의 지도로 가요.</li>
+        <li data-n="6"><strong>폴더 합계</strong> 지도로 그린 폴더의 전체 크기와 파일 수예요.</li>
+        <li data-n="7"><strong>보기 방식</strong> 보기 방식: 목록, 트리, 아이콘, 지도 중에서 골라요 (Ctrl+Shift+1~4). 탭마다 따로 기억해요.</li>
+      </ol>
+    </section>
+    <section class="tour-sec" id="search" aria-labelledby="h-search">
+      <h2 id="h-search">즉시 검색</h2>
+      <p class="lead">검색창에 입력하면 모든 드라이브에서 바로 찾습니다. AI 검색은 고를 때만 씁니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/search.png" width="1783" height="974" loading="lazy" alt="이름 검색 결과.">
+        <span class="pin" data-n="1" style="left:74.61%;top:7.89%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:68.02%;top:7.83%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:70.69%;top:7.83%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:92.78%;top:7.83%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:43.34%;top:17.84%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:15.99%;top:21.69%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:16.97%;top:98.33%" aria-hidden="true">7</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>검색창</strong> 스캔한 모든 드라이브에서 이름으로 바로 찾아요. 띄어쓰기로 여러 단어, * · ? 와일드카드 (Ctrl+F).</li>
+        <li data-n="2"><strong>이름 검색</strong> 이름 검색 (Ctrl+F): 이름에 든 글자로 치는 대로 바로 찾아요. AI 없이 동작해요.</li>
+        <li data-n="3"><strong>AI 검색</strong> AI 검색 (Ctrl+Shift+F): 이름에 없는 말로 뜻으로 찾아요. Enter를 눌러야 찾아요.</li>
+        <li data-n="4"><strong>이 폴더만</strong> 켜면 지금 폴더 아래에서만 찾아요. 끄면 스캔한 모든 드라이브에서 찾아요.</li>
+        <li data-n="5"><strong>위치 열</strong> 찾은 항목이 들어 있는 폴더예요.</li>
+        <li data-n="6"><strong>검색 결과</strong> 모든 드라이브의 파일 이름을 메모리에서 찾아, 입력하는 즉시 결과가 바뀌어요.</li>
+        <li data-n="7"><strong>결과 수·걸린 시간</strong> 찾은 항목 수와 검색에 걸린 시간이에요.</li>
+      </ol>
+    </section>
+    <section class="tour-sec" id="duplicates" aria-labelledby="h-duplicates">
+      <h2 id="h-duplicates">중복 파일 찾기</h2>
+      <p class="lead">정리 메뉴의 중복 파일 찾기는 내용이 똑같은 파일을 묶어 보여 줍니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/duplicates.png" width="1783" height="974" loading="lazy" alt="중복 파일 찾기 창.">
+        <span class="pin" data-n="1" style="left:19.00%;top:14.51%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:64.73%;top:14.51%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:73.56%;top:14.51%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:19.00%;top:20.73%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:19.00%;top:25.42%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:19.00%;top:33.89%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:73.70%;top:38.00%" aria-hidden="true">7</span>
+        <span class="pin" data-n="8" style="left:55.82%;top:93.84%" aria-hidden="true">8</span>
+        <span class="pin" data-n="9" style="left:65.36%;top:93.84%" aria-hidden="true">9</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>찾을 폴더</strong> 이 폴더 아래에서 내용이 똑같은 파일을 찾아요. 스캔한 드라이브에서만 찾을 수 있어요.</li>
+        <li data-n="2"><strong>최소 크기</strong> 이보다 작은 파일은 건너뛰어요.</li>
+        <li data-n="3"><strong>다시 찾기</strong> 크기가 같은 파일을 먼저 고르고, 앞부분과 전체 내용을 차례로 비교해서 내용이 똑같은 파일만 보여 줘요.</li>
+        <li data-n="4"><strong>찾은 결과 요약</strong> 중복 묶음 수와, 하나씩만 남기면 비는 용량이에요.</li>
+        <li data-n="5"><strong>자동 선택</strong> 묶음마다 남길 파일 하나를 정하고 나머지를 골라 줘요.</li>
+        <li data-n="6"><strong>중복 묶음</strong> 내용이 똑같은 파일 묶음이에요. 크기와 낭비되는 용량이 머리에 보여요.</li>
+        <li data-n="7"><strong>위치 보기</strong> 그 파일이 있는 폴더를 열어 보여 줘요.</li>
+        <li data-n="8"><strong>하드 링크로 합치기</strong> 같은 내용을 한 번만 저장하고 모든 경로에서 그대로 열리게 합쳐요. 원래 사본은 휴지통으로 가요.</li>
+        <li data-n="9"><strong>휴지통으로</strong> 고른 사본을 휴지통으로 보내요. 영구 삭제는 하지 않아요.</li>
+      </ol>
+    </section>
+    <section class="tour-sec" id="programs" aria-labelledby="h-programs">
+      <h2 id="h-programs">프로그램 정리</h2>
+      <p class="lead">설치된 프로그램을 크기와 마지막 사용 시점으로 살펴보고 정리합니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/programs.png" width="1783" height="974" loading="lazy" alt="프로그램 정리 창.">
+        <span class="pin" data-n="1" style="left:14.10%;top:93.84%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:14.10%;top:12.20%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:24.40%;top:12.20%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:19.28%;top:38.25%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:27.07%;top:38.25%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:14.10%;top:43.00%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:39.55%;top:53.27%" aria-hidden="true">7</span>
+        <span class="pin" data-n="8" style="left:48.25%;top:53.92%" aria-hidden="true">8</span>
+        <span class="pin" data-n="9" style="left:75.53%;top:53.66%" aria-hidden="true">9</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>합계</strong> 목록의 프로그램 수와, 크기를 아는 것만 합친 전체 크기예요.</li>
+        <li data-n="2"><strong>설치된 프로그램</strong> 이 컴퓨터에 설치된 프로그램의 크기와 마지막으로 쓴 때를 보여 줘요.</li>
+        <li data-n="3"><strong>남은 찌꺼기</strong> 지운 프로그램이 남긴 폴더를 찾아요.</li>
+        <li data-n="4"><strong>오래 안 쓴 것</strong> 6개월 넘게 쓰지 않았거나, 쓴 기록 없이 6개월보다 전에 설치한 프로그램만 보여요.</li>
+        <li data-n="5"><strong>프로그램 찾기</strong> 이름이나 게시자로 프로그램을 찾아요.</li>
+        <li data-n="6"><strong>사용 기록 더 정확히</strong> 관리자 모드(UAC 창 한 번)로 Windows 미리 읽기(Prefetch) 기록을 읽어요.</li>
+        <li data-n="7"><strong>크기 (스캔 기준)</strong> 설치 폴더를 스캔한 결과로 잰 크기예요.</li>
+        <li data-n="8"><strong>마지막 사용</strong> Windows가 남긴 실행 기록으로 짐작한 값이에요. 마우스를 올리면 근거가 보여요.</li>
+        <li data-n="9"><strong>제거</strong> 프로그램이 Windows에 등록한 제거 명령을 그대로 실행해요. fine-file이 폴더를 직접 지우지는 않아요.</li>
+      </ol>
+    </section>
+    <section class="tour-sec" id="details" aria-labelledby="h-details">
+      <h2 id="h-details">상세 정보</h2>
+      <p class="lead">고른 항목의 정보를 옆 창에 보여 줍니다. 정리 도우미 탭으로 오갈 수 있습니다.</p>
+      <figure class="tour">
+        <div class="tour__tools">
+          <button type="button" class="btn btn--ghost btn--s" data-pins-toggle aria-pressed="false">번호 숨기기</button>
+          <button type="button" class="btn btn--ghost btn--s" data-zoom>크게 보기</button>
+        </div>
+        <div class="tour__stage">
+        <img src="images/details.png" width="1783" height="974" loading="lazy" alt="상세 정보 옆 창.">
+        <span class="pin" data-n="1" style="left:75.32%;top:17.84%" aria-hidden="true">1</span>
+        <span class="pin" data-n="2" style="left:40.67%;top:12.45%" aria-hidden="true">2</span>
+        <span class="pin" data-n="3" style="left:81.28%;top:17.65%" aria-hidden="true">3</span>
+        <span class="pin" data-n="4" style="left:81.63%;top:45.96%" aria-hidden="true">4</span>
+        <span class="pin" data-n="5" style="left:96.63%;top:42.49%" aria-hidden="true">5</span>
+        <span class="pin" data-n="6" style="left:15.99%;top:28.11%" aria-hidden="true">6</span>
+        <span class="pin" data-n="7" style="left:32.12%;top:12.45%" aria-hidden="true">7</span>
+        <span class="pin" data-n="8" style="left:26.86%;top:98.33%" aria-hidden="true">8</span>
+        </div>
+      </figure>
+      <ol class="tour__legend">
+        <li data-n="1"><strong>상세 정보 창</strong> 고른 항목의 종류, 크기, 파일 수, 날짜, 위치를 옆 창에 보여 줘요.</li>
+        <li data-n="2"><strong>상세 정보 버튼</strong> 상세 정보 (Alt+P): 고른 항목의 종류, 크기, 날짜, 위치와 미리 보기를 옆 창에 보여 줘요.</li>
+        <li data-n="3"><strong>정리 도우미 탭</strong> 고른 항목이나 지금 폴더를 AI로 설명하고 정리 계획을 만드는 옆 창이에요.</li>
+        <li data-n="4"><strong>차지 비율</strong> 고른 항목이 지금 폴더에서 차지하는 비율이에요.</li>
+        <li data-n="5"><strong>경로 복사</strong> 전체 경로를 글자로 클립보드에 복사해요.</li>
+        <li data-n="6"><strong>고른 항목</strong> 목록에서 고른 항목이에요. 상세 정보 창이 이 항목을 따라 바뀌어요.</li>
+        <li data-n="7"><strong>휴지통으로</strong> 휴지통으로 보내요 (Delete). 영구 삭제는 하지 않아요.</li>
+        <li data-n="8"><strong>선택 요약</strong> 고른 항목 수와 크기예요.</li>
+      </ol>
+    </section>
+  </main>
+</div>
+<dialog class="lightbox" aria-label="크게 보기">
+  <div class="lightbox__bar"><p data-lightbox-title>크게 보기</p><button type="button" class="btn btn--ghost btn--s" data-close>닫기</button></div>
+</dialog>
+
+<footer class="footer">
+  <div class="container footer__grid">
+    <div>
+      <a class="brand" href="./"><img src="images/icon.png" alt="" width="30" height="30">fine-file</a>
+      <ul class="footer__links">
+        <li><a href="features.html">기능 안내</a></li>
+        <li><a href="download.html">내려받기</a></li>
+        <li><a href="https://github.com/toxh13/fine-file">소스 코드 (GitHub)</a></li>
+        <li><a href="https://github.com/toxh13/fine-file/issues">문제 알리기</a></li>
+        <li><a href="https://toxh13.github.io/apps/">김선호의 다른 앱</a></li>
+      </ul>
+    </div>
+    <div>
+      <p>fine-file은 무료 오픈소스이며 아무런 보증이 없습니다. 라이선스는 MIT 또는 Apache-2.0 중 고를 수 있습니다.</p>
+      <p>파일과 폴더 정보는 이 PC 밖으로 보내지 않습니다. 업데이트 확인은 GitHub에서 최신 버전 정보만 받아 오고, AI 검색은 고를 때만 찾는 말과 후보의 이름·경로·날짜 같은 정보를 보냅니다(파일 내용은 보내지 않음).</p>
+      <p>Windows는 Microsoft의 상표입니다. fine-file은 Microsoft와 관계가 없습니다.</p>
+    </div>
+  </div>
+</footer>
+<script src="site.js"></script>
+</body>
+</html>
