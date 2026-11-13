@@ -727,3 +727,12 @@
   text-overflow: ellipsis;
   font-size: 12px;
 }
+
+/* The OpenAI-compatible address quick picks: small chips that wrap, like the helper chips. */
+.ai-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-top: 8px;
+}

@@ -86,6 +86,9 @@ const SOURCE_LABEL: Record<Plan["source"], { label: string; title: string }> = {
   ollama: { label: "Ollama", title: "Ollama(내 PC)가 제안한 계획" },
   claude_cli: { label: "CLI", title: "Claude Code CLI가 제안한 계획" },
   codex_cli: { label: "CLI", title: "Codex CLI가 제안한 계획" },
+  compat: { label: "호환 API", title: "OpenAI 호환 API가 제안한 계획" },
+  gemini: { label: "Gemini", title: "Gemini API가 제안한 계획" },
+  opencode_cli: { label: "OpenCode", title: "OpenCode가 제안한 계획" },
   mcp: { label: "MCP", title: "Claude 앱이 MCP로 제안한 계획" },
 };
 
@@ -147,8 +150,9 @@ function dirOf(p: string): string {
 
 const isAiSource = (s: Plan["source"]) => s !== "rules";
 
-function SourceTag({ source }: { source: Plan["source"] }) {
-  const s = SOURCE_LABEL[source] ?? { label: source, title: source };
+function SourceTag({ source, via }: { source: Plan["source"]; via?: string }) {
+  const base = SOURCE_LABEL[source] ?? { label: source, title: source };
+  const s = source === "compat" && via ? { ...base, title: `OpenAI 호환 API(${via})가 제안한 계획` } : base;
   const kind = source === "rules" ? "rules" : source === "mcp" ? "mcp" : "ai";
   return (
     <span className={`v06-src src-${kind}`} title={s.title}>
@@ -1197,7 +1201,7 @@ function OnePlan({ planId, onClose, onNavigate }: PlanViewProps) {
     <Dialog className="v04-dialog plan-view" title={plan ? `정리 계획: ${shown(plan.title)}` : "정리 계획"} onClose={onClose}>
       <div className="dlg-head">
         <h3 title={plan ? shown(plan.title) : undefined}>{plan ? shown(plan.title || KIND_LABEL[plan.kind] || "정리 계획") : "정리 계획"}</h3>
-        {plan && <SourceTag source={plan.source} />}
+        {plan && <SourceTag source={plan.source} via={plan.via} />}
         {plan && <StateTag state={progress?.state === "running" ? "running" : plan.state} />}
         <button className="dlg-close" aria-label="닫기" onClick={onClose}>
           ✕
@@ -1779,7 +1783,7 @@ export function PlansInbox({ onOpen, onClose }: { onOpen(id: string): void; onCl
                   <button className={`inbox-item${mcpDraft ? " mcp-draft" : ""}`} title={title} onClick={() => onOpen(p.id)}>
                     <span className="inbox-top">
                       <span className="inbox-title">{title}</span>
-                      <SourceTag source={p.source} />
+                      <SourceTag source={p.source} via={p.via} />
                       <StateTag state={p.state} />
                       {mcpDraft && <span className="v06-mcp-flag">확인 필요</span>}
                     </span>

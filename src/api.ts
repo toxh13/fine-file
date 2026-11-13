@@ -360,7 +360,29 @@ export const v05 = {
 
 // ---- v0.6: AI (optional) and optimization plans ----------------------------------
 
-export type AiProvider = "off" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli";
+export type AiProvider = "off" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli" | "compat" | "gemini" | "opencode_cli";
+
+/** The one name of each connection, for every screen that shows it. */
+export const PROVIDER_LABEL: Record<AiProvider, string> = {
+  off: "꺼짐",
+  claude: "Claude API",
+  openai: "OpenAI API",
+  ollama: "Ollama",
+  claude_cli: "Claude Code CLI",
+  codex_cli: "Codex CLI",
+  compat: "OpenAI 호환 API",
+  gemini: "Gemini API",
+  opencode_cli: "OpenCode",
+};
+
+/** The host of an address ("" when it cannot be read). */
+export function hostOf(url: string): string {
+  try {
+    return new URL(url.trim()).host;
+  } catch {
+    return "";
+  }
+}
 
 /**
  * v0.10: what judges for the 위험도 badges, AI 검색 and the plan's second check: "jev" (TypeSafe
@@ -375,6 +397,11 @@ export interface AiSettings {
   ollama_url: string;
   ollama_model: string;
   codex_model: string;
+  /** OpenAI-compatible API: its address (the key is kept per address), and the model. */
+  compat_url: string;
+  compat_model: string;
+  gemini_model: string;
+  opencode_model: string;
   effort: "low" | "medium" | "high";
   /** The judge features' master switch ("AI 판정 쓰기"): 위험도 badges, AI 검색, the plan's second check. */
   jev_enabled: boolean;
@@ -385,16 +412,63 @@ export interface AiSettings {
   confirm_before_send: boolean;
 }
 
+export type KeyName = "claude" | "openai" | "jev" | "compat" | "gemini";
+
 export interface KeyStatus {
   claude: boolean;
   openai: boolean;
   jev: boolean;
+  /** For the address asked about (`ai.keyStatus`). */
+  compat: boolean;
+  gemini: boolean;
 }
 
 export interface AiPayloadPreview {
   provider: string;
+  model: string;
+  /** Where it goes, for the connections that have an address. */
+  url: string | null;
   text: string;
   bytes: number;
+}
+
+/** Where a preview goes: the connection's name, its model and its address (what there is), joined by " · ". */
+export function payloadWhere(p: AiPayloadPreview): string {
+  const name = PROVIDER_LABEL[p.provider as AiProvider] ?? p.provider;
+  return [name, p.model, p.url].filter((x) => !!x).join(" · ");
+}
+
+/** Whether two previews would send the same thing to the same place (connection, model, address, text). */
+export function samePayload(a: AiPayloadPreview, b: AiPayloadPreview): boolean {
+  return a.provider === b.provider && a.model === b.model && a.url === b.url && a.text === b.text;
+}
+
+/**
+ * What the chosen connection still lacks, as one sentence (the caller adds where to fix it); null
+ * when nothing is missing or it needs nothing. `k` null: the keys are not known yet, so not checked.
+ */
+export function aiMissing(s: AiSettings, k: KeyStatus | null): string | null {
+  const blank = (v: string | undefined) => !(v ?? "").trim();
+  switch (s.provider) {
+    case "claude":
+      return k && !k.claude ? "Claude API 키가 없어요." : null;
+    case "openai":
+      if (k && !k.openai) return "OpenAI API 키가 없어요.";
+      return blank(s.openai_model) ? "OpenAI 모델 이름이 비어 있어요." : null;
+    case "ollama":
+      return blank(s.ollama_model) ? "Ollama 모델 이름이 비어 있어요." : null;
+    case "compat":
+      if (blank(s.compat_url)) return "OpenAI 호환 API 주소가 비어 있어요.";
+      if (k && !k.compat && !isLocalUrl(s.compat_url)) return `OpenAI 호환 API 키가 없어요 (${hostOf(s.compat_url)}).`;
+      return blank(s.compat_model) ? "OpenAI 호환 API 모델이 비어 있어요." : null;
+    case "gemini":
+      if (k && !k.gemini) return "Gemini API 키가 없어요.";
+      return blank(s.gemini_model) ? "Gemini 모델이 비어 있어요." : null;
+    case "opencode_cli":
+      return blank(s.opencode_model) ? "OpenCode 모델이 비어 있어요." : null;
+    default:
+      return null;
+  }
 }
 
 export interface Risk {
@@ -473,7 +547,9 @@ export interface Plan {
   kind: PlanKind;
   title: string;
   summary: string;
-  source: "rules" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli" | "mcp";
+  source: "rules" | "claude" | "openai" | "ollama" | "claude_cli" | "codex_cli" | "compat" | "gemini" | "opencode_cli" | "mcp";
+  /** The host of the address a "compat" plan came from. */
+  via?: string;
   root: string;
   created_at: number;
   steps: PlanStep[];
@@ -491,9 +567,16 @@ export interface PlanProgress {
 export const ai = {
   getSettings: () => invoke<AiSettings>("ai_get_settings"),
   setSettings: (settings: AiSettings) => invoke<void>("ai_set_settings", { settings }),
-  keyStatus: () => invoke<KeyStatus>("ai_key_status"),
-  /** provider: "claude" | "openai" | "jev"; null removes the key. */
-  setKey: (provider: "claude" | "openai" | "jev", key: string | null) => invoke<void>("ai_set_key", { provider, key }),
+  /** The connections offered on this build (OpenCode is hidden until it is ready). */
+  providers: () => invoke<AiProvider[]>("ai_providers"),
+  /** Which keys are saved; the compat key is for `compatUrl` (null: the saved address; never ""). */
+  keyStatus: (compatUrl?: string | null) => invoke<KeyStatus>("ai_key_status", { compatUrl: compatUrl ?? null }),
+  /** Saves (null removes) a key; the compat key belongs to `url`. Rejects (Korean) for a key or address it cannot use. */
+  setKey: (provider: KeyName, key: string | null, url?: string | null) =>
+    invoke<void>("ai_set_key", { provider, key, url: url ?? null }),
+  /** The models a connection lists; compat sends only that address's key. Rejects (Korean) when it does not answer or the key is missing. */
+  models: (provider: "compat" | "gemini" | "opencode_cli", url?: string | null) =>
+    invoke<string[]>("ai_models", { provider, url: url ?? null }),
   test: (provider: string) => invoke<string>("ai_test", { provider }),
   preview: (task: "explain" | "structure" | "rename", path: string) =>
     invoke<AiPayloadPreview>("ai_preview", { task, path }),

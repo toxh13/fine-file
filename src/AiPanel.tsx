@@ -9,6 +9,11 @@ import {
   type RulesResult,
   type AiSettings as Settings,
   type KeyStatus,
+  PROVIDER_LABEL,
+  aiMissing,
+  hostOf,
+  payloadWhere,
+  samePayload,
 } from "./api";
 import { tip } from "./Explorer";
 import { formatSize, normalizePath, pathKey, shown } from "./format";
@@ -111,15 +116,6 @@ const isRule = (id: Busy["id"]) => RULE_ACTIONS.some((a) => a.id === id);
 const labelOf = (id: Busy["id"]) =>
   RULE_ACTIONS.find((a) => a.id === id)?.label ?? AI_ACTIONS.find((a) => a.id === id)?.label ?? "정리";
 
-const PROVIDER_LABEL: Record<Settings["provider"], string> = {
-  off: "끔",
-  claude: "Claude API",
-  openai: "OpenAI API",
-  ollama: "Ollama (내 PC)",
-  claude_cli: "Claude Code CLI",
-  codex_cli: "Codex CLI",
-};
-
 function errText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
@@ -203,7 +199,9 @@ const stepsSize = (plan: Plan) => plan.steps.reduce((sum, s) => sum + s.size, 0)
 export function contentsNote(provider: string): string {
   return provider === "codex_cli"
     ? "앱은 파일 내용을 보내지 않지만, Codex CLI는 스스로 도구를 써서 이 PC의 파일을 읽고 그 내용을 OpenAI로 보낼 수 있어요. AI 설정의 Codex 주의를 확인해 주세요."
-    : "파일 내용은 보내지 않아요.";
+    : provider === "opencode_cli"
+      ? "파일 내용은 보내지 않아요. OpenCode에 로그인한 제공자로 가요. 무료 모델은 한도가 있고, 보낸 내용을 어떻게 쓰는지는 모델마다 달라요."
+      : "파일 내용은 보내지 않아요.";
 }
 
 /** Where a request would go, for the line over the AI buttons. */
@@ -219,6 +217,12 @@ function providerLine(s: Settings): string {
       return s.ollama_model ? `${name} · ${s.ollama_model}` : name;
     case "codex_cli":
       return `${name} · ${s.codex_model || "gpt-5.6-luna"}`;
+    case "compat":
+      return [name, s.compat_model.trim(), hostOf(s.compat_url)].filter((x) => x).join(" · ");
+    case "gemini":
+      return s.gemini_model.trim() ? `${name} · ${s.gemini_model.trim()}` : name;
+    case "opencode_cli":
+      return s.opencode_model.trim() ? `${name} · ${s.opencode_model.trim()}` : name;
     default:
       return name;
   }
@@ -231,15 +235,10 @@ function aiProblem(s: Settings, k: KeyStatus | null, file: boolean): string | nu
       return file
         ? "AI가 꺼져 있어요. AI 설정에서 쓸 AI를 고르면 쓸 수 있어요."
         : "AI가 꺼져 있어요. AI 설정에서 쓸 AI를 고르면 쓸 수 있어요. 아래의 \"정리할 것 찾기\"는 AI 없이 동작해요.";
-    case "claude":
-      return k && !k.claude ? "Claude API 키가 없어요. AI 설정에서 키를 넣어 주세요." : null;
-    case "openai":
-      if (k && !k.openai) return "OpenAI API 키가 없어요. AI 설정에서 키를 넣어 주세요.";
-      return s.openai_model.trim() ? null : "OpenAI 모델 이름이 비어 있어요. AI 설정에서 적어 주세요.";
-    case "ollama":
-      return s.ollama_model.trim() ? null : "Ollama 모델 이름이 비어 있어요. AI 설정에서 적어 주세요.";
-    default:
-      return null;
+    default: {
+      const m = aiMissing(s, k);
+      return m && `${m} AI 설정에서 넣어 주세요.`;
+    }
   }
 }
 
@@ -447,7 +446,7 @@ export function useHelper(
         return;
       }
       if (!alive.current || memoOf(key).preview !== shownNow) return;
-      if (again.text !== shownNow.payload.text || again.provider !== shownNow.payload.provider) {
+      if (!samePayload(again, shownNow.payload)) {
         patch(key, { preview: { task: shownNow.task, payload: again, changed: true } });
         return;
       }
@@ -942,7 +941,7 @@ function SendBox(p: {
         <div className="v06-warn">그사이 보낼 내용이나 보낼 곳이 바뀌어서 보내지 않았어요. 바뀐 내용을 다시 확인해 주세요.</div>
       )}
       <p className="muted">
-        {p.label} · 보낼 곳: <b>{PROVIDER_LABEL[payload.provider as Settings["provider"]] ?? payload.provider}</b> ·{" "}
+        {p.label} · 보낼 곳: <b>{payloadWhere(payload)}</b> ·{" "}
         {formatSize(payload.bytes)}. 아래 내용이 그대로 가요. {contentsNote(payload.provider)}
       </p>
       <pre className="v06-code ai-preview-text">{shown(payload.text)}</pre>

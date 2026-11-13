@@ -3,6 +3,7 @@ import {
   ai,
   aiEvents,
   api,
+  aiMissing,
   JEV_SHOW,
   JUDGE_NAME,
   judgeModel,
@@ -11,8 +12,11 @@ import {
   judgeTarget,
   methodNote,
   ops,
+  payloadWhere,
   places,
   plans,
+  PROVIDER_LABEL,
+  samePayload,
   v04,
   v05,
   v07,
@@ -460,15 +464,6 @@ const AI_ITEMS: { task: AiPlanTask; label: string; note: string }[] = [
   { task: "rename", label: "이름 정리 (AI)", note: "이름을 한 가지 규칙으로 맞추는 계획" },
 ];
 
-const PROVIDER_NAME: Record<AiConfig["provider"], string> = {
-  off: "꺼짐",
-  claude: "Claude API",
-  openai: "OpenAI API",
-  ollama: "Ollama",
-  claude_cli: "Claude Code CLI",
-  codex_cli: "Codex CLI",
-};
-
 /** What AI-only buttons say while AI is off: where to turn it on. */
 const AI_OFF_HELP =
   "AI가 꺼져 있어요. 툴바의 톱니바퀴(AI 설정)에서 쓸 AI(내 API 키, Ollama, 내가 로그인한 CLI)를 고르면 쓸 수 있어요. \"정리할 것 찾기\"는 AI 없이 동작해요";
@@ -478,9 +473,8 @@ function aiBlocker(s: AiState | null): string | null {
   if (!s) return "AI 설정을 읽지 못했어요. 툴바의 톱니바퀴(AI 설정)을 열어 확인해 주세요";
   const { settings, keys } = s;
   if (settings.provider === "off") return AI_OFF_HELP;
-  if (settings.provider === "claude" && !keys.claude) return "Claude API 키가 없어요. 툴바의 톱니바퀴(AI 설정)에서 키를 넣어 주세요";
-  if (settings.provider === "openai" && !keys.openai) return "OpenAI API 키가 없어요. 툴바의 톱니바퀴(AI 설정)에서 키를 넣어 주세요";
-  return null;
+  const m = aiMissing(settings, keys);
+  return m && `${m} 툴바의 톱니바퀴(AI 설정)에서 넣어 주세요`;
 }
 
 /**
@@ -2705,7 +2699,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         return;
       }
       if (dialogRef.current !== d) return;
-      if (again.text !== d.payload.text || again.provider !== d.payload.provider) {
+      if (!samePayload(again, d.payload)) {
         setDialog({ ...d, payload: again, changed: true });
         return;
       }
@@ -2747,7 +2741,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
         ))}
         <hr />
         <div className="menu-label">
-          AI로 {p.ai && p.ai.settings.provider !== "off" ? `(${PROVIDER_NAME[p.ai.settings.provider]})` : "(꺼짐)"}
+          AI로 {p.ai && p.ai.settings.provider !== "off" ? `(${PROVIDER_LABEL[p.ai.settings.provider]})` : "(꺼짐)"}
         </div>
         {AI_ITEMS.map((a) => (
           <button key={a.task} className={why ? "off" : undefined} title={why ?? a.note} onClick={() => aiPlan(a.task, at)}>
@@ -3743,7 +3737,7 @@ export function Explorer({ ref, ...p }: ExplorerProps) {
           )}
           <p className="muted">
             {AI_ITEMS.find((a) => a.task === dialog.task)?.label} · 보낼 곳:{" "}
-            <b>{PROVIDER_NAME[dialog.payload.provider as AiConfig["provider"]] ?? dialog.payload.provider}</b> ·{" "}
+            <b>{payloadWhere(dialog.payload)}</b> ·{" "}
             {formatSize(dialog.payload.bytes)}. 아래 내용이 그대로 가요. {contentsNote(dialog.payload.provider)}
           </p>
           <pre className="v06-code ai-preview-text">{shown(dialog.payload.text)}</pre>

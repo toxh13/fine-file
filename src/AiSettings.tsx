@@ -1,12 +1,22 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { ai, isLocalUrl, judgeModel, judgeOf, type AiProvider, type AiSettings as Settings, type JudgeEngine, type KeyStatus } from "./api";
+import {
+  ai,
+  hostOf,
+  isLocalUrl,
+  judgeModel,
+  judgeOf,
+  type AiProvider,
+  type AiSettings as Settings,
+  type JudgeEngine,
+  type KeyName,
+  type KeyStatus,
+} from "./api";
 import { Dialog } from "./Duplicates";
 import { shown } from "./format";
 import "./components.css";
 import "./v04.css";
 import "./v06.css";
 
-type KeyName = "claude" | "openai" | "jev";
 type Notice = { text: string; error?: boolean };
 
 const DEFAULT_CLAUDE = "claude-opus-5-5";
@@ -20,6 +30,17 @@ const PROVIDERS: { id: AiProvider; label: string; note: string }[] = [
   { id: "ollama", label: "Ollama (내 PC)", note: "이 컴퓨터에서 실행" },
   { id: "claude_cli", label: "Claude Code CLI", note: "내가 설치·로그인한 claude" },
   { id: "codex_cli", label: "Codex CLI", note: "내가 설치·로그인한 codex" },
+  { id: "compat", label: "OpenAI 호환 API", note: "DeepSeek 등 · 주소와 내 키" },
+  { id: "gemini", label: "Gemini API", note: "내 Google AI Studio 키" },
+  { id: "opencode_cli", label: "OpenCode", note: "내가 설치·로그인한 opencode" },
+];
+
+/** Quick picks for the OpenAI-compatible address ("직접 입력" empties it). */
+const COMPAT_PRESETS: { label: string; url: string }[] = [
+  { label: "DeepSeek", url: "https://api.deepseek.com" },
+  { label: "OpenRouter", url: "https://openrouter.ai/api/v1" },
+  { label: "Groq", url: "https://api.groq.com/openai/v1" },
+  { label: "LM Studio (이 PC)", url: "http://localhost:1234/v1" },
 ];
 
 /** v0.10: who judges for the 위험도 badges, AI 검색 and the plan's second check. */
@@ -124,6 +145,7 @@ function KeyField({
   label,
   placeholder,
   has,
+  url,
   onChanged,
 }: {
   name: KeyName;
@@ -131,6 +153,8 @@ function KeyField({
   placeholder: string;
   /** Whether a key is saved; undefined while not known. */
   has: boolean | undefined;
+  /** The address the key belongs to (compat only). */
+  url?: string;
   onChanged(): void;
 }) {
   const [value, setValue] = useState("");
@@ -149,7 +173,7 @@ function KeyField({
     setBusy(true);
     setMsg(null);
     try {
-      await ai.setKey(name, key);
+      await ai.setKey(name, key, url);
       if (!alive.current) return;
       setValue("");
       setMsg({ text: key ? "키를 저장했어요" : "키를 지웠어요" });
@@ -197,6 +221,95 @@ function KeyField({
 }
 
 /**
+ * A model name with the models the connection lists (`ai.models`) to pick from. `auto`: the list is
+ * read a moment after (provider, url) changes, once per pair (`cache` keeps it while the window is
+ * open); the button always reads again. The newest read wins.
+ */
+function ModelField(p: {
+  value: string;
+  placeholder: string;
+  onChange(v: string): void;
+  provider: "compat" | "gemini" | "opencode_cli";
+  url: string | null;
+  auto: boolean;
+  cache: Map<string, string[]>;
+  tag?: (m: string) => string | undefined;
+}) {
+  const { provider, url, auto, cache } = p;
+  const listId = useId();
+  const [list, setList] = useState<string[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const req = useRef(0);
+  const alive = useRef(true);
+  const cacheKey = `${provider}|${url ?? ""}`;
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const load = useCallback(() => {
+    const r = ++req.current;
+    setBusy(true);
+    setErr(null);
+    ai.models(provider, url)
+      .then(
+        (l) => {
+          if (!alive.current || r !== req.current) return;
+          const sorted = [...l].sort();
+          cache.set(cacheKey, sorted);
+          setList(sorted);
+        },
+        (e) => {
+          if (!alive.current || r !== req.current) return;
+          setList(null);
+          setErr(errText(e));
+        },
+      )
+      .finally(() => alive.current && r === req.current && setBusy(false));
+  }, [provider, url, cache, cacheKey]);
+
+  useEffect(() => {
+    const hit = cache.get(cacheKey) ?? null;
+    req.current++; // an answer still on its way for another address is dropped
+    setList(hit);
+    setErr(null);
+    setBusy(false);
+    if (!auto || hit) return;
+    const t = setTimeout(load, 400);
+    return () => clearTimeout(t);
+  }, [cacheKey, auto, cache, load]);
+
+  return (
+    <div className="judge-models">
+      <label className="field">
+        <span>모델</span>
+        <input
+          value={p.value}
+          list={listId}
+          spellCheck={false}
+          placeholder={p.placeholder}
+          onChange={(e) => p.onChange(e.target.value)}
+        />
+        <datalist id={listId}>
+          {(list ?? []).map((m) => (
+            <option key={m} value={m} label={p.tag?.(m)} />
+          ))}
+        </datalist>
+      </label>
+      <button type="button" className="btn small" disabled={busy} onClick={load}>
+        목록 불러오기
+      </button>
+      <span className="muted">
+        {busy ? "모델 목록을 읽는 중…" : err ? `모델 목록을 읽지 못했어요: ${shown(err)}` : list ? `모델 ${list.length}개` : ""}
+      </span>
+    </div>
+  );
+}
+
+/**
  * `onSaved`: settings or a key were saved (the window stays open): whoever keeps a copy of them
  * reads them again now, so what is sent next goes where they now say (위험도 that is on, a search).
  */
@@ -205,6 +318,12 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
   const [saved, setSaved] = useState<Settings | null>(null);
   const [draft, setDraft] = useState<Settings | null>(null);
   const [keys, setKeys] = useState<KeyStatus | null>(null);
+  // The address `keys.compat` was read for ("" when the saved one): another address shows "확인 중".
+  const [keysFor, setKeysFor] = useState("");
+  // The connections this build offers (null: not read, or it failed).
+  const [offered, setOffered] = useState<AiProvider[] | null>(null);
+  const modelCache = useRef(new Map<string, string[]>());
+  const addressInput = useRef<HTMLInputElement>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -222,12 +341,24 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
 
   const dirty = !!draft && !!saved && JSON.stringify(draft) !== JSON.stringify(saved);
 
-  const loadKeys = useCallback(() => {
-    ai.keyStatus().then(
-      (k) => alive.current && setKeys(k),
-      (err) => alive.current && setNotice({ text: `저장한 키를 확인하지 못했어요: ${errText(err)}`, error: true }),
+  const keysReq = useRef(0);
+  /** `compatUrl`: the address whose key is asked about (null: the saved one; never ""). The newest read wins. */
+  const loadKeys = useCallback((compatUrl?: string | null) => {
+    const r = ++keysReq.current;
+    ai.keyStatus(compatUrl || null).then(
+      (k) => {
+        if (!alive.current || r !== keysReq.current) return;
+        setKeys(k);
+        setKeysFor(compatUrl ?? "");
+      },
+      (err) =>
+        alive.current &&
+        r === keysReq.current &&
+        setNotice({ text: `저장한 키를 확인하지 못했어요: ${errText(err)}`, error: true }),
     );
   }, []);
+  // As of the last render: keyChanged is made once.
+  const compatUrlNow = useRef<string | null>(null);
   // As of the last render: the callbacks below are made once.
   const savedHook = useRef(onSaved);
   useEffect(() => {
@@ -235,7 +366,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
   });
   /** A key was saved or removed: read again here, and by whoever keeps a copy (onSaved). */
   const keyChanged = useCallback(() => {
-    loadKeys();
+    loadKeys(compatUrlNow.current);
     savedHook.current?.();
   }, [loadKeys]);
 
@@ -250,6 +381,10 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
       (err) => alive.current && setLoadError(errText(err)),
     );
     loadKeys();
+    ai.providers().then(
+      (l) => alive.current && setOffered(l),
+      () => undefined, // the list stays unread: everything but OpenCode is shown
+    );
     return () => {
       alive.current = false;
     };
@@ -302,6 +437,17 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
     return () => clearTimeout(t);
   }, [judgeUrl, loadModels]);
 
+  // The compat key is per address: read for the one shown, and again a moment after it changes.
+  const compatUrl = draft?.provider === "compat" ? draft.compat_url.trim() : null;
+  useEffect(() => {
+    compatUrlNow.current = compatUrl;
+  });
+  useEffect(() => {
+    if (compatUrl === null) return;
+    const t = setTimeout(() => loadKeys(compatUrl || null), 400);
+    return () => clearTimeout(t);
+  }, [compatUrl, loadKeys]);
+
   /** True when what the page shows is what is saved. */
   const save = async (): Promise<boolean> => {
     if (!draft || !saved) return false;
@@ -313,6 +459,10 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
       ollama_url: draft.ollama_url.trim(),
       ollama_model: draft.ollama_model.trim(),
       codex_model: draft.codex_model.trim(),
+      compat_url: draft.compat_url.trim(),
+      compat_model: draft.compat_model.trim(),
+      gemini_model: draft.gemini_model.trim(),
+      opencode_model: draft.opencode_model.trim(),
       judge: judgeOf(draft),
       judge_model: (draft.judge_model ?? "").trim(),
     };
@@ -357,6 +507,10 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
   const close = () => (dirty ? setAskClose(true) : onClose());
 
   const p = draft?.provider ?? "off";
+  // As the backend lists them; the saved one stays visible even if it is not offered (no empty page).
+  const providerOptions = PROVIDERS.filter((o) =>
+    offered ? offered.includes(o.id) || o.id === "off" || o.id === saved?.provider : o.id !== "opencode_cli",
+  );
   const judge: JudgeEngine = draft ? judgeOf(draft) : "jev";
   const testLine = (provider: string) =>
     tested?.provider === provider && <span className={tested.error ? "ai-test-bad" : "ai-test-ok"}>{tested.text}</span>;
@@ -386,7 +540,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
             <section className="v06-section first">
               <h4>쓸 AI</h4>
               <div className="ai-providers" role="radiogroup" aria-label="쓸 AI">
-                {PROVIDERS.map((o) => (
+                {providerOptions.map((o) => (
                   <label key={o.id} className={`ai-provider${p === o.id ? " on" : ""}`}>
                     <input type="radio" name={group} checked={p === o.id} onChange={() => pick(o.id)} />
                     <span className="ai-provider-main">
@@ -518,6 +672,119 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
                     않아서, 직접 넣은 공급자로만 쓰고 있었다면 실패하거나 기본 공급자(OpenAI)로 갈 수 있어요. 셸 명령·웹 검색 같은 도구
                     기능도 끄고 남는 것은 읽기 전용 샌드박스에서 돌게 하지만, Codex가 가진 도구를 앱이 모두 끈다고 보장할 수 없어요.
                     Codex가 그 샌드박스 안에서 이 PC의 파일을 읽고 그 내용을 OpenAI로 보낼 수 있다고 생각하고 써 주세요.
+                  </div>
+                </>
+              )}
+
+              {p === "compat" && (
+                <>
+                  <div className="ai-presets" role="group" aria-label="주소 빠른 선택">
+                    {COMPAT_PRESETS.map((o) => (
+                      <button
+                        key={o.label}
+                        type="button"
+                        className={`btn small helper-chip${draft.compat_url.trim() === o.url ? " on" : ""}`}
+                        onClick={() => set("compat_url", o.url)}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      className="btn small helper-chip"
+                      onClick={() => {
+                        set("compat_url", "");
+                        addressInput.current?.focus();
+                      }}
+                    >
+                      직접 입력
+                    </button>
+                  </div>
+                  <div className="ai-fields">
+                    <label className="field">
+                      <span>주소</span>
+                      <input
+                        ref={addressInput}
+                        value={draft.compat_url}
+                        spellCheck={false}
+                        placeholder="https://api.deepseek.com"
+                        onChange={(e) => set("compat_url", e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  {draft.compat_url.trim() && !isLocalUrl(draft.compat_url) && !/^https:\/\//i.test(draft.compat_url.trim()) && (
+                    <div className="v06-warn">https:// 주소만 쓸 수 있어요. http:// 는 이 PC 주소(localhost)만 돼요.</div>
+                  )}
+                  {draft.compat_url.trim() && !isLocalUrl(draft.compat_url) && hostOf(draft.compat_url) && (
+                    <p className="v06-note">폴더 정보가 {hostOf(draft.compat_url)}(으)로 가요.</p>
+                  )}
+                  <ModelField
+                    value={draft.compat_model}
+                    placeholder="모델 이름"
+                    onChange={(v) => set("compat_model", v)}
+                    provider="compat"
+                    url={draft.compat_url.trim() || null}
+                    auto={!!draft.compat_url.trim()}
+                    cache={modelCache.current}
+                  />
+                  {hostOf(draft.compat_url) ? (
+                    <>
+                      <KeyField
+                        key={draft.compat_url.trim()}
+                        name="compat"
+                        url={draft.compat_url.trim()}
+                        label="API 키 (이 주소용)"
+                        placeholder="sk-…"
+                        has={keysFor === draft.compat_url.trim() ? keys?.compat : undefined}
+                        onChanged={keyChanged}
+                      />
+                      <p className="v06-note">
+                        키는 이 주소({hostOf(draft.compat_url)})에만 써요. 주소를 바꾸면 그 주소의 키를 따로 넣어요.
+                        {isLocalUrl(draft.compat_url) ? " 이 PC 주소라 키 없이도 돼요." : ""}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="v06-note">{draft.compat_url.trim() ? "올바른 주소를 넣어 주세요." : "주소를 먼저 넣어 주세요."}</p>
+                  )}
+                </>
+              )}
+
+              {p === "gemini" && (
+                <>
+                  <ModelField
+                    value={draft.gemini_model}
+                    placeholder="모델 이름"
+                    onChange={(v) => set("gemini_model", v)}
+                    provider="gemini"
+                    url={null}
+                    auto={!!keys?.gemini}
+                    cache={modelCache.current}
+                  />
+                  <KeyField name="gemini" label="Gemini API 키" placeholder="AIza…" has={keys?.gemini} onChanged={keyChanged} />
+                  <p className="v06-note">
+                    Google AI Studio에서 만든 API 키를 넣어 주세요. 요금과 무료 한도는 그 Google 계정을 따라요.
+                  </p>
+                </>
+              )}
+
+              {p === "opencode_cli" && (
+                <>
+                  <ModelField
+                    value={draft.opencode_model}
+                    placeholder="제공자/모델"
+                    onChange={(v) => set("opencode_model", v)}
+                    provider="opencode_cli"
+                    url={null}
+                    auto={true}
+                    cache={modelCache.current}
+                    tag={(m) => (m.endsWith("-free") ? "무료 · 한도 있음" : undefined)}
+                  />
+                  <p className="v06-note">
+                    직접 설치하고 로그인한 OpenCode(<code>opencode</code> 명령)를 불러요. 모델은 제공자/모델 모양이에요.
+                  </p>
+                  <div className="v06-warn">
+                    OpenCode는 그 프로그램이 내 계정으로 실행돼요. 앱은 도구가 하나도 없는 전용 설정으로 실행하고, 도구를 쓰려 하면 바로
+                    멈추지만, OpenCode가 이 PC에서 내 계정 권한으로 돈다는 점은 알고 써 주세요.
                   </div>
                 </>
               )}
