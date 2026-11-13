@@ -81,6 +81,7 @@ const RISKS: [&str; 3] = ["safe", "caution", "danger"];
 
 const AI_OFF: &str = "AI가 꺼져 있어요. 설정에서 AI 제공자를 먼저 골라 주세요";
 const UNKNOWN_PROVIDER: &str = "알 수 없는 AI 제공자예요";
+const OPENCODE_OFF: &str = "OpenCode 연결은 아직 켤 수 없어요";
 const BAD_PATH: &str = "경로가 올바르지 않아요 (C:\\... 처럼 드라이브 문자로 시작하는 경로만 써요)";
 pub(crate) const CUT_OFF: &str = "AI의 답이 너무 길어 중간에 끊겼어요. 더 작은 폴더에서 다시 해 보세요";
 pub(crate) const EMPTY_ANSWER: &str = "AI의 답이 비어 있어요";
@@ -186,7 +187,7 @@ impl AiSettings {
             return Err(UNKNOWN_PROVIDER.into());
         }
         if self.provider == "opencode_cli" && !providers::OPENCODE_READY {
-            return Err("OpenCode 연결은 아직 켤 수 없어요".into());
+            return Err(OPENCODE_OFF.into());
         }
         if !CLAUDE_MODELS.contains(&self.claude_model.as_str()) {
             return Err(format!("Claude 모델은 {} 중에서 골라 주세요", CLAUDE_MODELS.join(", ")));
@@ -1131,16 +1132,13 @@ fn status_error(label: &str, status: u16, body: &str, secrets: &[&str]) -> Strin
     }
 }
 
-/// Where a redirect points: the host of an absolute address, the (short) text of any other.
-fn redirect_error(label: &str, location: Option<&str>) -> String {
-    let to = match location {
-        Some(l) => match tauri::Url::parse(l.trim()).ok().and_then(|u| u.host_str().map(String::from)) {
-            Some(host) => host,
-            None => clean_text(l, 80),
-        },
-        None => "알 수 없는 곳".to_string(),
-    };
-    format!("{label}: 주소가 다른 곳으로 넘겨요: {to}. 따라가지 않고 멈췄어요. 설정에서 주소를 확인해 주세요")
+/// A redirect, told without where it points: that text is the server's, and
+/// may hold anything (a key in a query, a message). Only the host of an
+/// absolute address is named.
+fn redirect_error(label: &str, status: u16, location: Option<&str>) -> String {
+    let host = location.and_then(|l| tauri::Url::parse(l.trim()).ok()).and_then(|u| u.host_str().map(|h| clean_text(h, 80)));
+    let to = host.map_or(String::new(), |h| format!(" (→ {h})"));
+    format!("{label}: 주소가 다른 곳으로 넘겨요 ({status}){to}. 따라가지 않고 멈췄어요. 설정에서 주소를 확인해 주세요")
 }
 
 fn transport_error(label: &str, e: &ureq::Error) -> String {
@@ -1171,7 +1169,7 @@ fn exchange(label: &str, secrets: &[&str], send: &mut dyn FnMut() -> Result<Repl
         match send() {
             Ok(r) if (200..300).contains(&r.status) => return Ok(r.body),
             // Only a strict agent gets one: it is never followed, nor waited for.
-            Ok(r) if (300..400).contains(&r.status) => return Err(redirect_error(label, r.location.as_deref())),
+            Ok(r) if (300..400).contains(&r.status) => return Err(redirect_error(label, r.status, r.location.as_deref())),
             Ok(r) if again && (r.status == 429 || r.status >= 500) => {
                 sleep(r.retry_after.map_or(wait, |s| Duration::from_secs(s.min(30))));
             }
@@ -1600,20 +1598,34 @@ fn end_tree(child: &mut std::process::Child, job: Option<&RunJob>) {
     let _ = child.wait();
 }
 
-/// Sends `r` line by line (at most MAX_CLI_OUTPUT in all) to `tx` from a
-/// thread of its own, which ends at the end of the output, at the cap
-/// (dropping the pipe, so the program cannot wait on a full one) or when
-/// nobody listens any more.
-fn send_lines(r: impl std::io::Read + Send + 'static, which: Stream, tx: mpsc::Sender<(Stream, String)>) {
+/// What a reader thread tells `run_cli_with`.
+enum Piece {
+    Line(Stream, String),
+    /// The output went on past the cap.
+    TooMuch,
+}
+
+/// Sends `r` line by line (at most `cap` bytes in all) to `tx` from a thread
+/// of its own, which ends at the end of the output, at the cap (dropping the
+/// pipe, so the program cannot wait on a full one) or when nobody listens any
+/// more. With `tell`, output that goes on past the cap is told as `TooMuch`.
+fn send_lines(r: impl std::io::Read + Send + 'static, which: Stream, tx: mpsc::Sender<Piece>, cap: u64, tell: bool) {
     use std::io::{BufRead, BufReader};
     std::thread::spawn(move || {
-        let mut r = BufReader::new(r.take(MAX_CLI_OUTPUT));
+        let mut r = BufReader::new(r.take(cap));
         let mut line = Vec::new();
         while matches!(r.read_until(b'\n', &mut line), Ok(n) if n > 0) {
-            if tx.send((which, String::from_utf8_lossy(&line).into_owned())).is_err() {
-                break;
+            if tx.send(Piece::Line(which, String::from_utf8_lossy(&line).into_owned())).is_err() {
+                return;
             }
             line.clear();
+        }
+        if tell && r.get_ref().limit() == 0 {
+            // At the cap: one more byte tells whether the output really went on.
+            let mut more = [0u8; 1];
+            if matches!(r.into_inner().into_inner().read(&mut more), Ok(n) if n > 0) {
+                let _ = tx.send(Piece::TooMuch);
+            }
         }
     });
 }
@@ -1627,6 +1639,13 @@ fn send_lines(r: impl std::io::Read + Send + 'static, which: Stream, tx: mpsc::S
 /// outlived it. Only if Windows refuses the job does ending fall back to
 /// `taskkill /T`, which misses what outlived the program.
 pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut, String> {
+    run_cli_capped(cli, input, dir, MAX_CLI_OUTPUT)
+}
+
+/// `run_cli_with` keeping at most `cap` bytes of each output. A watched run
+/// that writes more is ended with an error saying so (nothing it says after
+/// the cap could be seen by the watch); an unwatched one just stops being read.
+fn run_cli_capped(cli: &Cli, input: &str, dir: &Path, cap: u64) -> Result<CliOut, String> {
     use std::io::Write;
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1655,8 +1674,9 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
         let _ = stdin.write_all(&input);
     });
     let (tx, rx) = mpsc::channel();
-    send_lines(stdout, Stream::Out, tx.clone());
-    send_lines(stderr, Stream::Err, tx);
+    let watched = cli.watch.is_some();
+    send_lines(stdout, Stream::Out, tx.clone(), cap, watched);
+    send_lines(stderr, Stream::Err, tx, cap, watched);
     let (mut out, mut err) = (String::new(), String::new());
     let mut status = None;
     let mut reading = true;
@@ -1664,7 +1684,11 @@ pub(crate) fn run_cli_with(cli: &Cli, input: &str, dir: &Path) -> Result<CliOut,
     loop {
         if reading {
             match rx.recv_timeout(CLI_TICK) {
-                Ok((which, line)) => {
+                Ok(Piece::TooMuch) => {
+                    end_tree(&mut child, job.as_ref());
+                    return Err(format!("{label}이(가) 너무 많은 출력을 내서 멈췄어요"));
+                }
+                Ok(Piece::Line(which, line)) => {
                     let stop = cli.watch.and_then(|watch| watch(which, line.trim_end_matches(['\r', '\n'])));
                     match which {
                         Stream::Out => out.push_str(&line),
@@ -1905,7 +1929,7 @@ fn ask(s: &AiSettings, req: &Request) -> Result<String, String> {
         }
         "opencode_cli" => {
             if !providers::OPENCODE_READY {
-                return Err("OpenCode 연결은 아직 켤 수 없어요".into());
+                return Err(OPENCODE_OFF.into());
             }
             providers::opencode_ask(s, req)
         }
@@ -2015,7 +2039,8 @@ fn test_provider(provider: &str, s: &AiSettings) -> Result<String, String> {
             let key = need_key("gemini", "Gemini API")?;
             providers::gemini_test(s, &key).map_err(|e| scrub(e, &key))
         }
-        // Spends no tokens, so it works before the connection may be switched on.
+        // Refused before anything is started while the connection may not be switched on.
+        "opencode_cli" if !providers::OPENCODE_READY => Err(OPENCODE_OFF.into()),
         "opencode_cli" => providers::opencode_test(s),
         "jev" => {
             let key = need_key("jev", "jev")?;
@@ -2707,16 +2732,21 @@ pub async fn ai_ollama_models(url: Option<String>) -> Result<Vec<String>, String
 #[tauri::command]
 pub async fn ai_models(provider: String, url: Option<String>) -> Result<Vec<String>, String> {
     let saved = settings();
-    crate::blocking(move || match provider.as_str() {
-        "compat" => providers::compat_models(&url.unwrap_or(saved.compat_url)),
+    crate::blocking(move || models_for(&provider, url, &saved)).await?
+}
+
+/// `ai_models` for a provider and the address typed (None: the saved one).
+fn models_for(provider: &str, url: Option<String>, saved: &AiSettings) -> Result<Vec<String>, String> {
+    match provider {
+        "compat" => providers::compat_models(&url.unwrap_or_else(|| saved.compat_url.clone())),
         "gemini" => {
             let key = need_key("gemini", "Gemini API")?;
             providers::gemini_models(&key).map_err(|e| scrub(e, &key))
         }
+        "opencode_cli" if !providers::OPENCODE_READY => Err(OPENCODE_OFF.into()),
         "opencode_cli" => providers::opencode_models(),
         _ => Err("모델 목록을 읽을 수 없는 연결이에요".to_string()),
-    })
-    .await?
+    }
 }
 
 /// task: "explain" | "structure" | "rename"
@@ -3381,6 +3411,41 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_run_ends_with_an_error_at_the_output_cap() {
+        let dir = temp_root("cap");
+        let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into()));
+        // Prints well past a 64-byte cap, then would run for 30 s.
+        let line = "echo 0123456789012345678901234567890123456789& echo 0123456789012345678901234567890123456789& echo 0123456789012345678901234567890123456789& ping -n 30 127.0.0.1 >nul";
+        let args: Vec<OsString> = ["/d", "/s", "/c", line].iter().map(OsString::from).collect();
+        let quiet = |_: Stream, _: &str| None;
+        let run = |watch: Option<Watch<'_>>| {
+            run_cli_capped(&Cli { exe: &cmd, args: &args, env: &[], label: "시험", limit: Duration::from_secs(60), watch }, "", &dir, 64)
+        };
+        let start = Instant::now();
+        let err = run(Some(&quiet)).unwrap_err();
+        assert!(err.contains("너무 많은 출력"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+        // Output exactly at the cap is no overflow, and an unwatched run keeps what it got.
+        let ok = run_cli_capped(&Cli { exe: &cmd, args: &["/d", "/s", "/c", "echo hi"].map(OsString::from), env: &[], label: "시험", limit: Duration::from_secs(60), watch: Some(&quiet) }, "", &dir, 4);
+        assert!(ok.is_ok(), "{ok:?}");
+        let out = run(None).unwrap();
+        assert!(out.stdout.len() <= 64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_is_refused_before_anything_is_spawned() {
+        if providers::OPENCODE_READY {
+            return;
+        }
+        // The refusal is the one the other hidden paths give, not what a spawned opencode would say.
+        let s = AiSettings::default();
+        assert_eq!(test_provider("opencode_cli", &s).unwrap_err(), OPENCODE_OFF);
+        assert_eq!(models_for("opencode_cli", None, &s).unwrap_err(), OPENCODE_OFF);
+        assert_eq!(models_for("opencode_cli", Some("https://x.example".into()), &s).unwrap_err(), OPENCODE_OFF);
+    }
+
+    #[test]
     fn a_run_ends_what_its_program_started_also_after_the_program_exited() {
         use std::cell::Cell;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -3787,9 +3852,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(calls, 1);
-        assert!(e.contains("주소가 다른 곳으로 넘겨요") && e.contains("evil.example"), "{e}");
-        assert!(redirect_error("X", None).contains("알 수 없는 곳"));
-        assert!(redirect_error("X", Some("/v2/chat")).contains("/v2/chat"));
+        assert!(e.contains("주소가 다른 곳으로 넘겨요") && e.contains("307") && e.contains("evil.example"), "{e}");
+        // Never the path or query of where it points (it may hold anything), only its host.
+        assert!(!e.contains("collect"), "{e}");
+        let e = redirect_error("X", 302, Some("https://user:pw@evil.example/a?key=sk-secret#frag"));
+        assert!(e.contains("evil.example") && !e.contains("sk-secret") && !e.contains("pw") && !e.contains("/a"), "{e}");
+        for odd in [None, Some("/v2/chat?token=abc"), Some("not a url at all")] {
+            let e = redirect_error("X", 301, odd);
+            assert!(e.contains("주소가 다른 곳으로 넘겨요") && e.contains("301"), "{e}");
+            assert!(!e.contains("v2") && !e.contains("token") && !e.contains("not a url"), "{e}");
+        }
     }
 
     #[test]

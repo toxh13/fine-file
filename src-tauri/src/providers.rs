@@ -381,15 +381,17 @@ fn opencode_no_model(model: &str) -> String {
     format!("OpenCode에 이 모델이 없어요 ({model}). 설정에서 목록을 다시 불러와 골라 주세요")
 }
 
-/// The first word ending in `Error` in `text` (letters and `_` before it),
-/// as `[A-Za-z_]+Error` would find it.
-fn error_kind(text: &str) -> Option<&str> {
-    text.split(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
-        .find_map(|word| word.rfind("Error").filter(|&at| at > 0).map(|at| &word[..at + "Error".len()]))
+/// The error names OpenCode reports that are shown as they are; any other
+/// name (which the log text could fill with anything) is not.
+const OPENCODE_ERRORS: [&str; 4] = ["AI_APICallError", "AI_RetryError", "ProviderModelNotFoundError", "InitError"];
+
+/// The first name of `OPENCODE_ERRORS` that `text` holds.
+fn error_kind(text: &str) -> Option<&'static str> {
+    OPENCODE_ERRORS.iter().copied().find(|name| text.contains(name))
 }
 
 /// A Korean message for an error OpenCode reported. Known ones in words of
-/// our own; any other by its kind alone, never its text (which may hold an
+/// our own; any other by a known kind alone (or a fixed sentence), never its text (which may hold an
 /// address, a key or a file name).
 fn opencode_error_text(raw: &str, model: &str) -> String {
     let low = raw.to_lowercase();
@@ -403,8 +405,10 @@ fn opencode_error_text(raw: &str, model: &str) -> String {
     } else if says(&["modelnotfound", "model not found"]) {
         opencode_no_model(model)
     } else {
-        let kind: String = error_kind(raw).unwrap_or("알 수 없는 오류").chars().take(60).collect();
-        format!("OpenCode 오류예요 ({kind})")
+        match error_kind(raw) {
+            Some(kind) => format!("OpenCode 오류예요 ({kind})"),
+            None => "OpenCode가 오류를 냈어요. 설정에서 모델과 로그인을 확인하고 다시 해 주세요".into(),
+        }
     }
 }
 
@@ -811,6 +815,12 @@ mod tests {
         let odd = r#"level=ERROR service=llm message="stream error" error="AI_RetryError: something odd at https://x/y?key=abc""#;
         let e = opencode_log_error(odd, model).unwrap();
         assert!(e.contains("AI_RetryError") && !e.contains("key=abc"), "{e}");
+        // A name that is not a known one is not shown, whatever the text says.
+        let unknown = r#"level=ERROR service=llm message="stream error" error="Leaky_sk_abc123Error: boom""#;
+        let e = opencode_log_error(unknown, model).unwrap();
+        assert!(!e.contains("sk_abc123") && !e.contains("Leaky") && e.contains("OpenCode가 오류를 냈어요"), "{e}");
+        let e = opencode_event_stop(r#"{"type":"error","error":{"name":"SecretKeyError","data":{"message":"x"}}}"#, model).unwrap();
+        assert!(!e.contains("SecretKeyError") && e.contains("OpenCode가 오류를 냈어요"), "{e}");
         assert_eq!(opencode_log_error(r#"level=ERROR service=plugin message="failed to load plugin""#, model), None);
         assert_eq!(opencode_log_error("level=INFO service=bus message=\"stream error\"", model), None);
 
