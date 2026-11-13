@@ -615,5 +615,8 @@
   .helper-to {
     order: 3;
     flex-basis: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
   }
 }

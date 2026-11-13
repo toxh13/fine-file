@@ -822,7 +822,7 @@ function ruleDesc(a: (typeof RULE_ACTIONS)[number], scope: ScopeId, busy: Busy |
   if (busy?.id === a.id) return busy.at ? `${busy.at} ${a.label} 계획을 만드는 중…` : "만드는 중…";
   if (a.id === "relocate" && scope === "all") return "컴퓨터 전체에서는 쓸 수 없어요. 드라이브를 골라 주세요";
   // Files of the same size are read to compare: on a whole drive that takes a while, and it cannot be stopped.
-  if (a.id === "dedupe" && (scope === "all" || scope.startsWith("drive:"))) return `${a.desc}. 드라이브 전체는 몇 분 걸릴 수 있어요.`;
+  if (a.id === "dedupe" && (scope === "all" || scope.startsWith("drive:"))) return `드라이브 전체는 몇 분 걸릴 수 있어요 · ${a.desc}`;
   return a.desc;
 }
 

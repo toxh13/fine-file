@@ -390,6 +390,13 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
     };
   }, [loadKeys]);
 
+  // The address typed is whole (https, or http on this PC) and either this PC or one with a saved key:
+  // only then is its model list read by itself (the button may still try any address).
+  const compatAddr = draft?.compat_url.trim() ?? "";
+  const compatHasKey = keysFor === compatAddr ? !!keys?.compat : false;
+  const compatReadable =
+    !!hostOf(compatAddr) && (isLocalUrl(compatAddr) ? /^https?:\/\//i.test(compatAddr) : /^https:\/\//i.test(compatAddr) && compatHasKey);
+
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setDraft((d) => (d ? { ...d, [k]: v } : d));
 
   const pick = (p: AiProvider) =>
@@ -724,7 +731,7 @@ export function AiSettings({ onClose, onSaved }: { onClose(): void; onSaved?: ()
                     onChange={(v) => set("compat_model", v)}
                     provider="compat"
                     url={draft.compat_url.trim() || null}
-                    auto={!!draft.compat_url.trim()}
+                    auto={compatReadable}
                     cache={modelCache.current}
                   />
                   {hostOf(draft.compat_url) ? (
