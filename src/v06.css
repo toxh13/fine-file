@@ -470,46 +470,6 @@
 }
 
 /* ---- AI panel ---- */
-.ai-actions {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-  gap: 6px;
-}
-
-.ai-action {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  text-align: left;
-}
-
-.ai-action:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: var(--hover);
-}
-
-.ai-action b {
-  font-weight: 600;
-}
-
-.ai-action .muted {
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.ai-action.busy,
-.ai-action.busy:disabled {
-  border-color: var(--accent);
-  background: var(--sel);
-  opacity: 1;
-}
-
 .ai-wait {
   margin-top: 8px;
   font-size: 12px;

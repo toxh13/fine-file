@@ -649,12 +649,75 @@ export function HelperPane(p: HelperPaneProps) {
 
       <section className="v06-section">
         <div className="v06-section-head">
+          <h4>
+            정리할 것 찾기 <span className="helper-tag">AI 없이</span>
+          </h4>
+        </div>
+        <p className="muted v06-lead">
+          캐시·중복·큰 파일을 앱에 정해진 기준으로 찾아서 할 일 목록으로 보여 줘요. AI는 쓰지 않아요. 목록에서 "실행"을
+          눌러야 파일이 바뀌어요.
+        </p>
+        <ScopeChips
+          target={t}
+          scope={scope}
+          home={h.home}
+          homeMissing={h.homeMissing}
+          drives={p.drives}
+          onScope={h.setScope}
+        />
+        <ul className="helper-list" aria-label="정리할 것 찾기">
+          {RULE_ACTIONS.map((a) => (
+            <HelperRow
+              key={a.id}
+              name={a.label}
+              desc={ruleDesc(a, scope, hereRule)}
+              busy={hereRule?.id === a.id}
+              disabled={waiting || rulesOff || (a.id === "relocate" && scope === "all")}
+              onClick={() => h.rule(t, a.id, p.drives)}
+            />
+          ))}
+        </ul>
+        {rulesOff && (
+          <p className="v06-note">
+            정리 계획은 폴더에서 만들어요. 이 파일이 든 폴더의 메뉴에서 "정리 계획 만들기"를 골라 주세요.
+          </p>
+        )}
+        {rm.error?.where === "rules" && (
+          <InSight of={rm.error} className="v04-error">
+            {shown(rm.error.text)}
+          </InSight>
+        )}
+        {rm.nothing !== null && (
+          <InSight of={rm.nothing} className="helper-nothing" role="status">
+            <p>{shown(rm.nothing)}</p>
+            {scope !== "all" && rm.ruleKind !== "relocate" && (
+              <button
+                type="button"
+                className="btn small"
+                disabled={!canAll}
+                title={canAll ? undefined : "먼저 드라이브를 스캔해 주세요"}
+                onClick={() => h.setScope("all")}
+              >
+                범위를 컴퓨터 전체로
+              </button>
+            )}
+          </InSight>
+        )}
+        {rm.runs && <RuleRuns runs={rm.runs} kind={rm.ruleKind} onOpenPlan={p.onOpenPlan} />}
+        {made(rm, "rules")}
+      </section>
+
+      <section className="v06-section">
+        <div className="v06-section-head helper-ai-head">
           <h4>AI에게 묻기</h4>
           {h.settings && h.settings.provider !== "off" && (
-            <span className="muted" title={providerLine(h.settings)}>
+            <span className="muted helper-to" title={providerLine(h.settings)}>
               보낼 곳: {providerLine(h.settings)}
             </span>
           )}
+          <button type="button" className="btn small" onClick={p.onSettings}>
+            AI 설정
+          </button>
         </div>
         {h.loadError && (
           <div className="v06-callout">
@@ -672,27 +735,26 @@ export function HelperPane(p: HelperPaneProps) {
             </button>
           </div>
         )}
-        <div className="ai-actions">
+        <ul className="helper-list" aria-label="AI에게 묻기">
           {actions.map((a) => (
-            <button
+            <HelperRow
               key={a.id}
-              className={`ai-action${here?.id === a.id ? " busy" : ""}`}
-              disabled={aiOff || waiting}
-              onClick={() => h.ask(t, a.id)}
-            >
-              <b>{a.label}</b>
-              <span className="muted">
-                {here?.id !== a.id
+              name={a.label}
+              desc={
+                here?.id !== a.id
                   ? a.desc
                   : here.stage === "preview"
                     ? "보낼 내용을 만드는 중…"
                     : here.stage === "check"
                       ? "보낼 내용을 확인하는 중…"
-                      : "AI에게 묻는 중…"}
-              </span>
-            </button>
+                      : "AI에게 묻는 중…"
+              }
+              busy={here?.id === a.id}
+              disabled={aiOff || waiting}
+              onClick={() => h.ask(t, a.id)}
+            />
           ))}
-        </div>
+        </ul>
         {here?.stage === "send" && !isRule(here.id) && (
           <div className="muted ai-wait">
             AI에게 묻는 중이에요. 몇십 초 걸릴 수 있어요. 다른 곳으로 가거나 옆 창을 닫아도 계속 묻고,{" "}
@@ -725,73 +787,33 @@ export function HelperPane(p: HelperPaneProps) {
             </p>
           </>
         )}
-      </section>
-
-      <section className="v06-section">
-        <div className="v06-section-head">
-          <h4>정리할 것 찾기</h4>
-        </div>
-        <p className="muted v06-lead">
-          캐시·중복·큰 파일을 앱에 정해진 기준으로 찾아서 할 일 목록으로 보여 줘요. AI는 쓰지 않아요. 목록에서 "실행"을
-          눌러야 파일이 바뀌어요.
-        </p>
-        <ScopeChips
-          target={t}
-          scope={scope}
-          home={h.home}
-          homeMissing={h.homeMissing}
-          drives={p.drives}
-          onScope={h.setScope}
-        />
-        <div className="ai-actions">
-          {RULE_ACTIONS.map((a) => (
-            <button
-              key={a.id}
-              className={`ai-action${hereRule?.id === a.id ? " busy" : ""}`}
-              disabled={waiting || rulesOff || (a.id === "relocate" && scope === "all")}
-              onClick={() => h.rule(t, a.id, p.drives)}
-            >
-              <b>{a.label}</b>
-              <span className="muted">{ruleDesc(a, scope, hereRule)}</span>
-            </button>
-          ))}
-        </div>
-        {rm.error?.where === "rules" && (
-          <InSight of={rm.error} className="v04-error">
-            {shown(rm.error.text)}
-          </InSight>
+        {!file && (
+          <p className="v06-note">AI가 만든 계획도 계획 창에서 확인하고 "실행"을 눌러야 파일이 바뀌어요.</p>
         )}
-        {rm.nothing !== null && (
-          <InSight of={rm.nothing} className="helper-nothing" role="status">
-            <p>{shown(rm.nothing)}</p>
-            {scope !== "all" && rm.ruleKind !== "relocate" && (
-              <button
-                type="button"
-                className="btn small"
-                disabled={!canAll}
-                title={canAll ? undefined : "먼저 드라이브를 스캔해 주세요"}
-                onClick={() => h.setScope("all")}
-              >
-                범위를 컴퓨터 전체로
-              </button>
-            )}
-          </InSight>
-        )}
-        {rm.runs && <RuleRuns runs={rm.runs} kind={rm.ruleKind} onOpenPlan={p.onOpenPlan} />}
-        {made(rm, "rules")}
       </section>
-
-      <p className="v06-note">
-        {rulesOff
-          ? '정리 계획은 폴더에서 만들어요. 이 파일이 든 폴더의 메뉴에서 "정리 계획 만들기"를 골라 주세요.'
-          : '여기서는 계획을 만들기만 해요. 계획 창에서 단계를 확인하고 "실행"을 눌러야 파일이 바뀌고, 실행한 뒤에도 되돌릴 수 있어요.'}
-      </p>
-      <div className="helper-foot">
-        <button className="btn" onClick={p.onSettings}>
-          AI 설정…
-        </button>
-      </div>
     </div>
+  );
+}
+
+/** One line of a helper list: the name, what it does (cut by CSS only, the whole text stays in the DOM), and a chevron. */
+function HelperRow(p: { name: string; desc: string; busy: boolean; disabled: boolean; onClick(): void }) {
+  return (
+    <li>
+      <button
+        type="button"
+        className={"helper-row" + (p.busy ? " busy" : "")}
+        disabled={p.disabled}
+        aria-busy={p.busy}
+        title={p.desc}
+        onClick={p.onClick}
+      >
+        <b>{p.name}</b>
+        <span className="helper-row-desc">{p.desc}</span>
+        <span className="helper-row-go" aria-hidden="true">
+          ›
+        </span>
+      </button>
+    </li>
   );
 }
 

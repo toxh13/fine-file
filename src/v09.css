@@ -319,6 +319,7 @@
 /* ---- 정리 도우미, in the side pane: what it looks at, then its sections; the pane scrolls as one ---- */
 .details-scroll.helper {
   padding: 12px 14px 16px;
+  container-type: inline-size;
 }
 
 .helper-target {
@@ -511,8 +512,108 @@
   margin-top: 10px;
 }
 
-.helper-foot {
-  flex: none;
+/* One-line lists: name, what it does (cut by CSS only), chevron. */
+.helper-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.helper-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.helper-row {
   display: flex;
-  margin-top: 12px;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+}
+
+.helper-row:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.helper-row.busy,
+.helper-row.busy:disabled {
+  background: var(--sel);
+  opacity: 1;
+}
+
+.helper-row b {
+  flex: none;
+  font-weight: 600;
+}
+
+.helper-row-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.helper-row-go {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.helper-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.details-scroll.helper .helper-ai-head {
+  flex-wrap: nowrap;
+}
+
+.helper-to {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helper-ai-head .btn {
+  flex: none;
+  margin-left: auto;
+}
+
+@container (max-width: 300px) {
+  .helper-row {
+    flex-wrap: wrap;
+  }
+
+  .helper-row-desc {
+    order: 3;
+    flex-basis: 100%;
+    white-space: normal;
+  }
+
+  .details-scroll.helper .helper-ai-head {
+    flex-wrap: wrap;
+  }
+
+  .helper-to {
+    order: 3;
+    flex-basis: 100%;
+  }
 }
