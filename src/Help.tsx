@@ -645,15 +645,15 @@ const SECTIONS: Section[] = [
       {
         id: "ai",
         title: "AI 기능",
-        keys: "Claude OpenAI Ollama Codex CLI MCP API 키 정리 도우미 jev",
+        keys: "Claude OpenAI Ollama Codex CLI Gemini DeepSeek 호환 MCP API 키 정리 도우미 jev",
         blocks: [
           "AI는 켜야만 쓰는 선택 기능이고, 처음에는 꺼져 있어요. 꺼진 채로도 앱의 모든 기능과 \"정리할 것 찾기\"의 정리 계획이 그대로 동작해요.",
           {
             list: [
-              "**켜기**: 툴바의 톱니바퀴(AI 설정)에서 Claude API, OpenAI API, Ollama(내 PC), Claude Code CLI, Codex CLI 중에 골라요.",
+              "**켜기**: 툴바의 톱니바퀴(AI 설정)에서 Claude API, OpenAI API, OpenAI 호환 API(DeepSeek 등, 주소와 키), Gemini API, Ollama(내 PC), Claude Code CLI, Codex CLI 중에 골라요.",
               "**하는 일**: 폴더·파일 설명(무엇인지, 지워도 되는지), 구조 정리·이름 정리 계획. 옆 창의 **정리 도우미**(`Alt+H`)에서 써요. AI가 낸 계획도 같은 안전 규칙으로 다시 확인하고, 실행은 늘 직접 해요.",
               "**보내는 것**: 경로, 이름, 크기, 날짜, 분류 같은 정보만 보내고, 파일 내용은 앱이 읽어 보내지 않아요(Codex CLI는 스스로 파일을 읽을 수 있어요).",
-              "**보내기 전에 미리 보기**(처음에 켜져 있어요): 보낼 내용을 글자 그대로 보여 주고 \"보내기\"를 눌러야 보내요.",
+              "**보내기 전에 미리 보기**(처음에 켜져 있어요): 보낼 내용을 글자 그대로 보여 주고 \"보내기\"를 눌러야 보내요. 연결·모델·주소도 함께 보이고, 미리 본 뒤 바꾸면 다시 미리 봐야 해요.",
               "API 키는 Windows 자격 증명 관리자에 저장해요. Claude Pro·Max 같은 구독은 이 앱 안에서 쓸 수 없고, MCP로 Claude 앱에 연결해 쓸 수 있어요.",
               "**답 보기**: AI의 설명은 제목·목록·굵게·표 같은 서식을 살려 보여 줘요. 링크는 누를 수 없는 글자로(주소도 함께) 보여 주고, 그림은 불러오지 않아요. CLI가 덧붙이는 색 코드나 \"tokens used\" 같은 줄은 빼요. 경로와 파일 이름(밑줄·괄호가 든 이름도)은 적힌 그대로 보여요.",
               "**AI 판정**: AI와 따로 켜는 위험도 배지와 AI 검색이에요. jev(유료)나 무료 로컬 모델(Ollama)로 판정해요(아래 \"AI 판정: 위험도와 AI 검색\").",
