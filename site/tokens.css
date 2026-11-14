@@ -8,11 +8,11 @@
   --color-error: oklch(52% 0.19 27); --color-success: oklch(50% 0.12 150);
   --container: 1200px; --gutter: 64px; --gap-columns: 32px; --section-gap-s: 120px; --section-gap: 144px; --section-gap-l: 176px;
   --z-base: 1; --z-raised: 10; --z-dropdown: 100; --z-sticky: 200; --z-sticky-nav: 300; --z-modal: 400; --z-toast: 500; --z-tooltip: 600;
-  --color-paper: oklch(99.4% 0.003 265); --color-paper-2: oklch(97.2% 0.009 265); --color-paper-3: oklch(93.8% 0.016 265);
-  --color-ink: oklch(23% 0.025 265); --color-ink-2: oklch(36% 0.025 265); --color-muted: oklch(48% 0.02 265);
-  --color-rule: oklch(89% 0.012 265);
-  --color-accent: oklch(52% 0.2 259); --color-accent-ink: oklch(99% 0.005 265); --color-focus: oklch(52% 0.2 259); --color-accent-soft: oklch(94% 0.035 259); --color-amber: oklch(80% 0.16 75); --color-shadow: oklch(30% 0.05 265 / 0.14);
-  --font-display: "Pretendard Variable", Pretendard, "Malgun Gothic", ui-sans-serif, system-ui, sans-serif; --font-body: "Pretendard Variable", Pretendard, "Malgun Gothic", ui-sans-serif, system-ui, sans-serif; --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace; --font-outlier: var(--font-body);
-  --radius-card: 12px; --radius-shot: 10px; --radius-pill: 999px; --rule-hair: 1px; --shadow-card: none;
+  --color-paper: #f2ece1; --color-paper-2: #ebe3d4; --color-paper-3: #e2d8c6;
+  --color-ink: #1c1915; --color-ink-2: #3a342c; --color-muted: #6a6257;
+  --color-rule: #cfc6b6;
+  --color-accent: #9a5a00; --color-accent-ink: #f2ece1; --color-focus: #1c1915; --color-accent-soft: #f3d7a6; --color-amber: #f5a623; --color-shadow: rgb(28 25 21 / 0.16);
+  --font-display: "Noto Serif KR", "Nanum Myeongjo", Batang, serif; --font-display-sans: "Pretendard Variable", Pretendard, "Malgun Gothic", ui-sans-serif, system-ui, sans-serif; --font-body: "Pretendard Variable", Pretendard, "Malgun Gothic", ui-sans-serif, system-ui, sans-serif; --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace; --font-outlier: var(--font-body);
+  --radius-card: 0px; --radius-shot: 0px; --radius-pill: 999px; --rule-hair: 1px; --shadow-card: none;
   --tracking-display: -0.02em;
 }
